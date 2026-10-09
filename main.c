@@ -11,7 +11,6 @@
 #define CSFM_IMPLEMENTATION
 #include "csfm.h"
 
-#define BUFFER_SIZE 5 * 1034 * 1024
 
 typedef struct {
     long cycles;
@@ -66,24 +65,24 @@ int main(void)
         return 1;
     }
 
-    uint8_t output_buffer[BUFFER_SIZE] = {0};
 
-    size_t size = (size_t)statbuf.st_size;
-    uint8_t *filebuf = malloc(size);
-
-    if (filebuf == NULL)
+    uint32_t input_size = (uint32_t)statbuf.st_size;
+    uint32_t output_size = input_size * 5;
+    uint8_t *input_buffer = malloc(input_size);
+    uint8_t *output_buffer = malloc(output_size);
+    if (input_buffer == NULL || output_buffer == NULL)
     {
         printf("Error: `malloc` failed\n");
         return 1;
     }
 
-    if (read(fd, filebuf, size) == -1)
+    if (read(fd, input_buffer, input_size) == -1)
     {
         printf("Error: `read` failed\n");
         return 1;
     }
     getTime(&end);
-    printTimeData(start, end, size);
+    printTimeData(start, end, input_size);
 
     if (close(fd) == -1)
     {
@@ -94,7 +93,9 @@ int main(void)
     printf("\nTokenizing file:\n");
     getTime(&start);
     uint32_t output_buffer_length = 0; 
-    USFM_TokenArray tokens = USFM_Tokenize(filebuf, size, output_buffer, BUFFER_SIZE, &output_buffer_length);
+    USFM_TokenArrayResult result = USFM_Tokenize(input_buffer, input_size, output_buffer, output_size,
+        &output_buffer_length);
+    assert(result.type == CSFM_OK);
     getTime(&end);
     
     /*
@@ -142,10 +143,10 @@ int main(void)
         }
     }
     */
-    float tokens_per_byte = (float)tokens.length / (float)size;
-    printf("# tokens: %d\n", tokens.length);
+    float tokens_per_byte = (float)result.tokens.length / (float)input_size;
+    printf("# tokens: %d\n", result.tokens.length);
     printf("tokens/byte: %.2f\n", tokens_per_byte);
-    printTimeData(start, end, size);
+    printTimeData(start, end, input_size);
 
     // printf("\nParsing file:\n");
     // getTime(&start);
@@ -173,7 +174,8 @@ int main(void)
     // CSFM_NodeArray_deallocate(&parseResult.tree);
     // CSFM_TokenArray_deallocate(&tokenResult.tokens);
     // USFM_Arena_Deinitialize(&arena);
-    free(filebuf);
+    free(input_buffer);
+    free(output_buffer);
 
     return 0;
 }

@@ -52,6 +52,11 @@
 #include <stdbool.h>
 
 typedef enum {
+    CSFM_OK,
+    CSFM_OUT_OF_MEMORY,
+} CSFM_Result;
+
+typedef enum {
     USFM_TOKEN_UNKNOWN,
     USFM_TOKEN_WHITESPACE,
     USFM_TOKEN_NEWLINE,
@@ -79,6 +84,11 @@ typedef struct {
     uint32_t length;
     uint32_t capacity;
 } USFM_TokenArray;
+
+typedef struct {
+    USFM_TokenArray tokens;
+    CSFM_Result type;
+} USFM_TokenArrayResult;
 
 typedef enum {
 // CSFM_CODEGEN_DATA marker_type start
@@ -230,7 +240,7 @@ typedef enum {
 // CSFM_CODEGEN_DATA marker_type end
 } USFM_MarkerType;
 
-USFM_TokenArray USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
+USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
     uint8_t *output_buffer, uint32_t output_size, uint32_t *output_buffer_length);
 
 #endif // CSFM_HEADER
@@ -556,18 +566,22 @@ USFM_Marker *USFM_MarkerMap_Generate(const char **markers, size_t *length)
 }
 #endif
 
-USFM_TokenArray USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
+USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
     uint8_t *output_buffer, uint32_t output_size, uint32_t *output_buffer_length)
 {
-    USFM_TokenArray tokens = {
-        .buffer = (USFM_Token *)output_buffer,
-        .length = 0,
-        .capacity = output_size / sizeof(USFM_Token),
+    USFM_TokenArrayResult result = {
+        .tokens = {
+            .buffer = (USFM_Token *)output_buffer,
+            .length = 0,
+            .capacity = output_size / sizeof(USFM_Token),
+        },
+        .type = CSFM_OK,
     };
     if (input_buffer == NULL || output_buffer == NULL)
     {
-        tokens.capacity = 0;
-        return tokens;
+        result.tokens.capacity = 0;
+        result.type = CSFM_OUT_OF_MEMORY;
+        return result;
     }
 
     // TODO(mattg): Convert the tokenization into a function which returns one token at a time.
@@ -676,10 +690,15 @@ USFM_TokenArray USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
         {
             if (i > 0)
             {
-                if (tokens.length < tokens.capacity)
+                if (result.tokens.length < result.tokens.capacity)
                 {
-                    tokens.buffer[tokens.length] = previous;
-                    tokens.length++;
+                    result.tokens.buffer[result.tokens.length] = previous;
+                    result.tokens.length++;
+                }
+                else
+                {
+                    result.type = CSFM_OUT_OF_MEMORY;
+                    break;
                 }
             }
             previous = token;
@@ -687,18 +706,22 @@ USFM_TokenArray USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
         previous_c = c;
         i++;
     }
-    if (tokens.length < tokens.capacity)
+    if (result.tokens.length < result.tokens.capacity)
     {
-        tokens.buffer[tokens.length] = previous;
-        tokens.length++;
+        result.tokens.buffer[result.tokens.length] = previous;
+        result.tokens.length++;
     }
-    tokens.capacity = tokens.length;
+    else
+    {
+        result.type = CSFM_OUT_OF_MEMORY;
+    }
+    result.tokens.capacity = result.tokens.length;
     if (output_buffer_length != NULL)
     {
-        *output_buffer_length = tokens.capacity * sizeof(USFM_Token);
+        *output_buffer_length = result.tokens.capacity * sizeof(USFM_Token);
     }
 
-    return tokens;
+    return result;
 }
 
 #endif // CSFM_IMPLEMENTATION
