@@ -40,5 +40,5 @@ case "$MODE" in
         ;;
 esac
 
-$CC "${CFLAGS[@]}" main.c -o csfm
+$CC "${CFLAGS[@]}" main.c -o usfm
 

@@ -15,5 +15,5 @@ CFLAGS=(
     -fsanitize=undefined
 )
 
-$CC "${CFLAGS[@]}" codegen.c -o csfm_codegen
+$CC "${CFLAGS[@]}" codegen.c -o codegen
 

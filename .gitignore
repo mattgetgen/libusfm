@@ -1,2 +1,6 @@
-csfm
-csfm_codegen
+# binaries
+usfm
+codegen
+
+# codegen output
+usfm_copy.h

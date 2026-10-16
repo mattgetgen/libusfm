@@ -8,8 +8,8 @@
 #include <time.h>
 #include <x86intrin.h>
 
-#define CSFM_IMPLEMENTATION
-#include "csfm.h"
+#define USFM_IMPLEMENTATION
+#include "usfm.h"
 
 
 typedef struct {
@@ -95,7 +95,7 @@ int main(void)
     uint32_t output_buffer_length = 0; 
     USFM_TokenArrayResult result = USFM_Tokenize(input_buffer, input_size, output_buffer, output_size,
         &output_buffer_length);
-    assert(result.type == CSFM_OK);
+    assert(result.type == USFM_OK);
     getTime(&end);
     
     /*
@@ -151,13 +151,13 @@ int main(void)
     // printf("\nParsing file:\n");
     // getTime(&start);
     //
-    // CSFM_ParseResult parseResult = CSFM_Parse((uint8_t *)filebuf, size);
+    // USFM_ParseResult parseResult = USFM_Parse((uint8_t *)filebuf, size);
     //
     // getTime(&end);
     //
     // // for (uint32_t i = 0; i < parseResult.tree.length; i++) {
-    // //     CSFM_Node node = CSFM_NodeArray_get(parseResult.tree, i);
-    // //     CSFM_Node_print(node, parseResult.input);
+    // //     USFM_Node node = USFM_NodeArray_get(parseResult.tree, i);
+    // //     USFM_Node_print(node, parseResult.input);
     // // }
     // uint32_t numNodes = parseResult.tree.length;
     // printf("\n# nodes: %d\n", numNodes);
@@ -171,8 +171,8 @@ int main(void)
     //     tokensPerByte, nodesPerByte, nodesPerToken
     // );
     //
-    // CSFM_NodeArray_deallocate(&parseResult.tree);
-    // CSFM_TokenArray_deallocate(&tokenResult.tokens);
+    // USFM_NodeArray_deallocate(&parseResult.tree);
+    // USFM_TokenArray_deallocate(&tokenResult.tokens);
     // USFM_Arena_Deinitialize(&arena);
     free(input_buffer);
     free(output_buffer);

@@ -1,4 +1,4 @@
-/* csmf - alpha - USFM Parser
+/* usmf - alpha - USFM Parser
    by Matthew Getgen
 
    SECURITY
@@ -39,22 +39,23 @@
      SOFTWARE.
  */
 
-#ifndef CSFM_HEADER
-#define CSFM_HEADER
+#ifndef USFM_HEADER
+#define USFM_HEADER
 
-#define CSFM_VERSION_MAJOR 0
-#define CSFM_VERSION_MINOR 0
-#define CSFM_VERSION_PATCH 0
-#define CSFM_VERSION "0.0.0-dev"
+#define USFM_VERSION_MAJOR 0
+#define USFM_VERSION_MINOR 0
+#define USFM_VERSION_PATCH 0
+#define USFM_VERSION "0.0.0-dev"
 
 #include <assert.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
 typedef enum {
-    CSFM_OK,
-    CSFM_OUT_OF_MEMORY,
-} CSFM_Result;
+    USFM_OK,
+    USFM_OUT_OF_MEMORY,
+} USFM_Result;
 
 typedef enum {
     USFM_TOKEN_UNKNOWN,
@@ -87,11 +88,11 @@ typedef struct {
 
 typedef struct {
     USFM_TokenArray tokens;
-    CSFM_Result type;
+    USFM_Result type;
 } USFM_TokenArrayResult;
 
 typedef enum {
-// CSFM_CODEGEN_DATA marker_type start
+// USFM_CODEGEN_DATA marker_type start
     USFM_MARKER_UNKNOWN,
     USFM_MARKER_ID,
     USFM_MARKER_USFM,
@@ -237,17 +238,17 @@ typedef enum {
     USFM_MARKER_CAT,
     USFM_MARKER_PERIPH,
     USFM_MARKER_CLOSE,
-// CSFM_CODEGEN_DATA marker_type end
+// USFM_CODEGEN_DATA marker_type end
 } USFM_MarkerType;
 
 USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
     uint8_t *output_buffer, uint32_t output_size, uint32_t *output_buffer_length);
 
-#endif // CSFM_HEADER
+#endif // USFM_HEADER
 
 
-#ifdef CSFM_IMPLEMENTATION
-#define CSFM_IMPLEMENTATION
+#ifdef USFM_IMPLEMENTATION
+#define USFM_IMPLEMENTATION
 
 typedef enum {
     CLASS_OTHER,
@@ -262,7 +263,7 @@ typedef enum {
     CLASS_DIGIT,
 } USFM_CharacterClass;
 
-#if CSFM_CODEGEN
+#if USFM_CODEGEN
 void USFM_CharacterClass_Generate(uint8_t *characters)
 {
     characters[' '] = CLASS_WHITESPACE;
@@ -288,12 +289,12 @@ void USFM_CharacterClass_Generate(uint8_t *characters)
 }
 #endif
 
-// CSFM_CODEGEN character_class start
-/* CSFM_CODEGEN_COMMENT --------------------------------------------------- *
+// USFM_CODEGEN character_class start
+/* USFM_CODEGEN_COMMENT --------------------------------------------------- *
  * NOTE: This code is generated via codegen. Please do not modify manually!
  * Last generated: 2026-09-16 00:18:17 GMT
  * Hash: 6f585606
- * CSFM_CODEGEN_COMMENT --------------------------------------------------- */
+ * USFM_CODEGEN_COMMENT --------------------------------------------------- */
 static const USFM_CharacterClass USFM_CharacterClass_From_Character[256] = {
     [9] = CLASS_WHITESPACE,
     [10] = CLASS_LINE_FEED,
@@ -366,7 +367,7 @@ static const USFM_CharacterClass USFM_CharacterClass_From_Character[256] = {
     [121] = CLASS_LETTER,
     [122] = CLASS_LETTER,
 };
-// CSFM_CODEGEN character_class end
+// USFM_CODEGEN character_class end
 
 static const USFM_TokenType USFM_TokenType_From_CharacterClass[10] = {
     [CLASS_OTHER] = USFM_TOKEN_UNKNOWN,
@@ -381,12 +382,12 @@ static const USFM_TokenType USFM_TokenType_From_CharacterClass[10] = {
     [CLASS_DIGIT] = USFM_TOKEN_NUMBER,
 };
 
-// CSFM_CODEGEN marker_text start
-/* CSFM_CODEGEN_COMMENT --------------------------------------------------- *
+// USFM_CODEGEN marker_text start
+/* USFM_CODEGEN_COMMENT --------------------------------------------------- *
  * NOTE: This code is generated via codegen. Please do not modify manually!
  * Last generated: 2026-09-16 00:18:17 GMT
  * Hash: 5910522e
- * CSFM_CODEGEN_COMMENT --------------------------------------------------- */
+ * USFM_CODEGEN_COMMENT --------------------------------------------------- */
 static const char *USFM_MarkerText_From_MarkerType[145] = {
     "",
     "id",
@@ -534,7 +535,7 @@ static const char *USFM_MarkerText_From_MarkerType[145] = {
     "periph",
     "*",
 };
-// CSFM_CODEGEN marker_text end
+// USFM_CODEGEN marker_text end
 
 typedef struct {
     const char *str;
@@ -556,7 +557,7 @@ typedef struct {
 //     return hash;
 // }
 
-#if CSFM_CODEGEN
+#if USFM_CODEGEN
 USFM_Marker *USFM_MarkerMap_Generate(const char **markers, size_t *length)
 {
     // TODO(mattg): allocate a USFM_Marker buffer, resizing it if necessary to make a perfect hash
@@ -575,12 +576,12 @@ USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length
             .length = 0,
             .capacity = output_size / sizeof(USFM_Token),
         },
-        .type = CSFM_OK,
+        .type = USFM_OK,
     };
     if (input_buffer == NULL || output_buffer == NULL)
     {
         result.tokens.capacity = 0;
-        result.type = CSFM_OUT_OF_MEMORY;
+        result.type = USFM_OUT_OF_MEMORY;
         return result;
     }
 
@@ -697,7 +698,7 @@ USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length
                 }
                 else
                 {
-                    result.type = CSFM_OUT_OF_MEMORY;
+                    result.type = USFM_OUT_OF_MEMORY;
                     break;
                 }
             }
@@ -713,7 +714,7 @@ USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length
     }
     else
     {
-        result.type = CSFM_OUT_OF_MEMORY;
+        result.type = USFM_OUT_OF_MEMORY;
     }
     result.tokens.capacity = result.tokens.length;
     if (output_buffer_length != NULL)
@@ -724,4 +725,4 @@ USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length
     return result;
 }
 
-#endif // CSFM_IMPLEMENTATION
+#endif // USFM_IMPLEMENTATION

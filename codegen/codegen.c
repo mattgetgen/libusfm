@@ -1,9 +1,12 @@
-#define CSFM_IMPLEMENTATION
-#define CSFM_CODEGEN 1
+#define USFM_IMPLEMENTATION
+#define USFM_CODEGEN 1
 #define _POSIX_C_SOURCE 1
-#include "../csfm.h"
+#include "../usfm.h"
 
 #include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -61,8 +64,8 @@ CodeGen_ParseResult CodeGen_Comment_Parse(char *input, size_t *index,
 {
     assert(*index == index_at_line_start);
     comment->index_start = *index;
-    const char *codegen_comment_start = "// CSFM_CODEGEN ";
-    const char *codegen_data_comment_start = "// CSFM_CODEGEN_DATA ";
+    const char *codegen_comment_start = "// USFM_CODEGEN ";
+    const char *codegen_data_comment_start = "// USFM_CODEGEN_DATA ";
     if (memcmp(&input[*index], codegen_comment_start, strlen(codegen_comment_start)) == 0)
     {
         *index += strlen(codegen_comment_start);
@@ -183,11 +186,11 @@ void CodeGen_CommentBlock_GetHash(char *input, CodeGen_CommentBlock *block)
 
 void CodeGen_GenerationComments_Serialize(CodeGen_WriteBuffer *buffer, uint64_t content_hash)
 {
-    const char *start = "/* CSFM_CODEGEN_COMMENT --------------------------------------------------- *\n";
+    const char *start = "/* USFM_CODEGEN_COMMENT --------------------------------------------------- *\n";
     const char *note  = " * NOTE: This code is generated via codegen. Please do not modify manually!\n";
     const char *date  = " * Last generated: %F %T %Z\n";
     const char *hash  = " * Hash: %x\n";
-    const char *end   = " * CSFM_CODEGEN_COMMENT --------------------------------------------------- */\n";
+    const char *end   = " * USFM_CODEGEN_COMMENT --------------------------------------------------- */\n";
     CodeGen_WriteBuffer_Append(buffer, start, strlen(start));
     CodeGen_WriteBuffer_Append(buffer, note, strlen(note));
 
@@ -435,8 +438,8 @@ int main(int argc, char **argv)
             }
         }
     }
-    const char *input_path = "../csfm.h";
-    const char *output_path = overwrite ? input_path : "../csfm_copy.h";
+    const char *input_path = "../usfm.h";
+    const char *output_path = overwrite ? input_path : "../usfm_copy.h";
     printf("Writing to %s\n", output_path);
     int fd = open(input_path, O_RDONLY);
     assert(fd != -1);
