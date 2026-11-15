@@ -118,6 +118,34 @@ static void test_every_role_is_handled(void)
     CHECK_EQ(bad, 0);
 }
 
+/* Reference: linear scan of the rows. */
+static uint32_t linear_find(const char *name, uint32_t length)
+{
+    size_t count = sizeof USFM_MarkerRows / sizeof USFM_MarkerRows[0];
+    for (size_t i = 0; i < count; i++) {
+        if (USFM_MarkerRows[i].name_length == length &&
+            memcmp(USFM_MarkerRows[i].name, name, length) == 0) return (uint32_t)i;
+    }
+    return USFM_ROW_NONE;
+}
+
+static void test_lookup_matches_linear_scan(void)
+{
+    /* Every name of 1-3 lowercase letters (18,278 names), hits and misses. */
+    char name[3];
+    uint32_t mismatches = 0;
+    for (uint32_t length = 1; length <= 3; length++) {
+        uint32_t total = 1;
+        for (uint32_t k = 0; k < length; k++) total *= 26;
+        for (uint32_t n = 0; n < total; n++) {
+            uint32_t v = n;
+            for (uint32_t k = 0; k < length; k++) { name[k] = (char)('a' + v % 26); v /= 26; }
+            if (usfm__marker_find(name, length) != linear_find(name, length)) mismatches++;
+        }
+    }
+    CHECK_EQ(mismatches, 0);
+}
+
 static void run_markers_tests(void)
 {
     RUN(test_every_row_finds_itself);
@@ -128,5 +156,6 @@ static void run_markers_tests(void)
     RUN(test_byte_classes);
     RUN(test_role_spot_checks);
     RUN(test_lookup_respects_length);
+    RUN(test_lookup_matches_linear_scan);
     RUN(test_every_role_is_handled);
 }

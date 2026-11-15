@@ -1218,10 +1218,13 @@ USFM_API const char *USFM_DiagnosticCode_GetMessage(uint16_t code)
 
 /* ===== Marker lookup ===== */
 
-/* Returns the USFM_MarkerRows index of an exact key, or USFM_ROW_NONE. */
+/* Returns the USFM_MarkerRows index of an exact key, or USFM_ROW_NONE.
+ * Names are compared with a byte loop, not memcmp: they are at most
+ * USFM_MARKER_NAME_MAX bytes, and a memcmp call in this hot path costs
+ * more than the compare (about 2% of parse instructions on WEB). */
 static uint32_t usfm__marker_find(const char *name, uint32_t length)
 {
-    uint32_t slot, index;
+    uint32_t slot, index, i;
     const USFM_MarkerRow *row;
     if (length == 0 || length > USFM_MARKER_NAME_MAX) return USFM_ROW_NONE;
     slot = usfm__marker_slot(usfm__marker_hash(name, length),
@@ -1229,8 +1232,9 @@ static uint32_t usfm__marker_find(const char *name, uint32_t length)
     index = USFM_MarkerSlots[slot];
     if (index == 0) return USFM_ROW_NONE;
     row = &USFM_MarkerRows[index - 1];
-    if (row->name_length != length || memcmp(row->name, name, length) != 0) {
-        return USFM_ROW_NONE;
+    if (row->name_length != length) return USFM_ROW_NONE;
+    for (i = 0; i < length; i++) {      /* bounded: length <= NAME_MAX */
+        if (row->name[i] != name[i]) return USFM_ROW_NONE;
     }
     return index - 1;
 }
