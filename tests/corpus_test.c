@@ -12,6 +12,27 @@
 #include "../usfm.h"
 #include "check.h"
 
+/* TEXT nodes whose flag disagrees with their text, per flag. */
+typedef struct FlagMismatches {
+    unsigned long long loose_ws, nbsp, escape;
+} FlagMismatches;
+
+static void count_flag_mismatches(const USFM_Ast *ast, FlagMismatches *m)
+{
+    uint32_t count, input_length, i;
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    const char *input = USFM_Ast_GetInput(ast, &input_length);
+    for (i = 0; i < count; i++) {
+        uint8_t have, want;
+        if (nodes[i].kind != USFM_AST_TEXT) continue;
+        have = USFM_FLAGS(nodes[i].level_flags);
+        want = check_text_flags(input, nodes[i].span);
+        if ((have ^ want) & USFM_TF_HAS_LOOSE_WS) m->loose_ws++;
+        if ((have ^ want) & USFM_TF_HAS_NBSP) m->nbsp++;
+        if ((have ^ want) & USFM_TF_HAS_ESCAPE) m->escape++;
+    }
+}
+
 typedef struct Counts {
     unsigned long long books, chapters, verses, paragraphs, chars, notes, milestones;
 } Counts;
@@ -70,6 +91,7 @@ int main(int argc, char **argv)
     const char *dir = argc > 1 ? argv[1] : "build/corpus/WEB";
     const Counts expected = { 83, 1402, 38058, 34753, 685197, 2218, 0 };
     Counts total;
+    FlagMismatches mismatches;
     unsigned long long diag_totals[USFM_DIAGNOSTIC_CODE_COUNT];
     unsigned long long dropped_total = 0;
     char *names[256];
@@ -79,6 +101,7 @@ int main(int argc, char **argv)
     FILE *csv = fopen("build/corpus/libusfm-web.csv", "w");
     struct dirent *e;
     memset(&total, 0, sizeof total);
+    memset(&mismatches, 0, sizeof mismatches);
     memset(diag_totals, 0, sizeof diag_totals);
     if (d == NULL) {
         fprintf(stderr, "cannot open %s\n", dir);
@@ -111,6 +134,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "%s: parse failed: %s\n", names[i], err.msg);
             failures++;
         } else {
+            count_flag_mismatches(ast, &mismatches);
             if (check_ast(ast) != 0) {
                 fprintf(stderr, "%s: invariants failed\n", names[i]);
                 failures++;
@@ -161,6 +185,9 @@ int main(int argc, char **argv)
             }
         }
     }
+    printf("Text flag mismatches: %llu loose-ws, %llu nbsp, %llu escape\n",
+           mismatches.loose_ws, mismatches.nbsp, mismatches.escape);
+    if (mismatches.loose_ws + mismatches.nbsp + mismatches.escape != 0) failures++;
     if (memcmp(&total, &expected, sizeof total) != 0) {
         printf("Expected:   %llu books, %llu chapters, %llu verses, %llu paragraphs\n"
                "            %llu char styles, %llu notes, %llu milestones\n",

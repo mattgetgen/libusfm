@@ -71,6 +71,37 @@ static void test_parse_trailing_whitespace(void)
         "    TEXT \"b\"\n");
 }
 
+/* Text flags of the n-th TEXT node (0-based), or 0xFF if there is none. */
+static uint8_t text_flags(const char *usfm, uint32_t n)
+{
+    USFM_Ast *ast = parse_with_version(usfm, USFM_VERSION_AUTO);
+    uint32_t count, i, seen = 0;
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    uint8_t flags = 0xFF;
+    for (i = 0; i < count; i++) {
+        if (nodes[i].kind != USFM_AST_TEXT) continue;
+        if (seen++ == n) {
+            flags = USFM_Node_GetFlags(&nodes[i]);
+            break;
+        }
+    }
+    USFM_Ast_Free(ast);
+    return flags;
+}
+
+/* Trimming trailing whitespace recomputes HAS_LOOSE_WS from what is left. */
+static void test_parse_trim_recomputes_loose_ws(void)
+{
+    CHECK_EQ(text_flags("\\p a\n\\p b", 0), 0);
+    CHECK_EQ(text_flags("\\p a \t\r\n\\v 1 b", 0), 0);
+    CHECK_EQ(text_flags("\\p a\tb\n\\p c", 0), USFM_TF_HAS_LOOSE_WS);
+    CHECK_EQ(text_flags("\\p a\nb\n", 0), USFM_TF_HAS_LOOSE_WS);
+    CHECK_EQ(text_flags("\\p a~b\n\\p c", 0), USFM_TF_HAS_NBSP);
+    CHECK_EQ(text_flags("\\p a\\/b\n", 0), USFM_TF_HAS_ESCAPE);
+    /* Not trimmed (followed by a char marker): the flag stays. */
+    CHECK_EQ(text_flags("\\p a\n\\w b\\w*", 0), USFM_TF_HAS_LOOSE_WS);
+}
+
 static void test_parse_headers(void)
 {
     CHECK_TREE("\\id GEN\n\\h Genesis\n\\toc1 The First Book\n\\mt1 Genesis\n",
@@ -224,6 +255,7 @@ static void run_parser_tests(void)
     RUN(test_parse_poetry_and_headings);
     RUN(test_parse_implied_paragraph);
     RUN(test_parse_trailing_whitespace);
+    RUN(test_parse_trim_recomputes_loose_ws);
     RUN(test_parse_headers);
     RUN(test_parse_number_and_code_diagnostics);
     RUN(test_parse_book_code_and_tables);

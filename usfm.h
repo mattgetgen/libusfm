@@ -1530,6 +1530,27 @@ static int usfm__is_blank(const char *in, USFM_Span s)
     return 1;
 }
 
+/* The text flags of a span, as the scanner computes them for a TEXT
+ * token. Used off the hot path: after trimming, and for text made from
+ * other tokens. Bounded by the span length. */
+static uint8_t usfm__text_flags(const char *in, USFM_Span s)
+{
+    uint32_t i = s.offset, end = s.offset + s.length;
+    uint8_t flags = 0;
+    while (i < end) {
+        char c = in[i];
+        if (c == '\\' && usfm__is_escape(in, end, i)) {
+            flags |= USFM_TF_HAS_ESCAPE;
+            i += 2;
+            continue;
+        }
+        if (c == '~') flags |= USFM_TF_HAS_NBSP;
+        else if (c == '\r' || c == '\n' || c == '\t') flags |= USFM_TF_HAS_LOOSE_WS;
+        i++;
+    }
+    return flags;
+}
+
 static int usfm__next(USFM_Parser *p, USFM_ScanToken *t)
 {
     uint8_t top;
@@ -1630,7 +1651,8 @@ static uint32_t usfm__open_tok(USFM_Parser *p, uint8_t kind, const USFM_ScanToke
 {
     uint32_t node = usfm__open(p, kind, t->tok.span, t->tok.marker, level_flags, frame_flags);
     if (node == USFM_NIL && !p->failed) {
-        usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE, 0);
+        usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
+                     usfm__text_flags(p->ast->input, t->tok.span));
     }
     return node;
 }
@@ -1692,7 +1714,9 @@ static uint32_t usfm__find_kind(const USFM_Parser *p, uint8_t kind)
 
 /* Trims trailing whitespace from the last TEXT node if it belongs to the
  * open top container, removing the node if nothing is left. Called
- * before paragraph-level markers, \v and the end of input. */
+ * before paragraph-level markers, \v and the end of input. The scanner
+ * set HAS_LOOSE_WS from the untrimmed text, so it is recomputed from
+ * what is left (only whitespace is trimmed: the other flags stay). */
 static void usfm__trim_last_text(USFM_Parser *p)
 {
     USFM_Ast *ast = p->ast;
@@ -1705,7 +1729,11 @@ static void usfm__trim_last_text(USFM_Parser *p)
         if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
         n->span.length--;
     }
-    if (n->span.length == 0) ast->node_count--;
+    if (n->span.length == 0) {
+        ast->node_count--;
+    } else if (n->level_flags & USFM_TF_HAS_LOOSE_WS) {
+        n->level_flags = usfm__text_flags(ast->input, n->span);
+    }
 }
 
 /* Inline content with no paragraph open gets an implied \p. */
@@ -1914,8 +1942,12 @@ static void usfm__on_text(USFM_Parser *p, const USFM_ScanToken *t)
         return;                         /* layout whitespace between blocks */
     }
     usfm__ensure_inline(p, t->tok.span.offset);
+    /* An unclaimed ARGUMENT or stray ATTRIBUTES token has no text flags
+     * from the scanner; compute them (rare). */
     usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
-                 (uint8_t)(t->tok.level_flags & USFM_TEXT_FLAGS_COOK));
+                 t->tok.kind == USFM_TOK_TEXT
+                     ? (uint8_t)(t->tok.level_flags & USFM_TEXT_FLAGS_COOK)
+                     : usfm__text_flags(p->ast->input, t->tok.span));
 }
 
 static void usfm__on_optbreak(USFM_Parser *p, const USFM_ScanToken *t)

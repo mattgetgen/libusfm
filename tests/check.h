@@ -12,14 +12,39 @@
     return 1; \
 } while (0)
 
+/* The text flags a TEXT node with this span must carry, computed
+ * independently of the scanner: HAS_ESCAPE for a backslash followed by
+ * one of \\ / | ~ " (the pair is consumed, so an escaped ~ is not an
+ * NBSP), HAS_NBSP for any other ~, HAS_LOOSE_WS for CR, LF or TAB. */
+static uint8_t check_text_flags(const char *input, USFM_Span span)
+{
+    uint32_t i = span.offset, end = span.offset + span.length;
+    uint8_t flags = 0;
+    while (i < end) {
+        char c = input[i];
+        if (c == '\\' && i + 1 < end &&
+            (input[i + 1] == '\\' || input[i + 1] == '/' || input[i + 1] == '|' ||
+             input[i + 1] == '~' || input[i + 1] == '"')) {
+            flags |= USFM_TF_HAS_ESCAPE;
+            i += 2;
+            continue;
+        }
+        if (c == '~') flags |= USFM_TF_HAS_NBSP;
+        else if (c == '\r' || c == '\n' || c == '\t') flags |= USFM_TF_HAS_LOOSE_WS;
+        i++;
+    }
+    return flags;
+}
+
 static int check_ast(const USFM_Ast *ast)
 {
     uint32_t count, input_length, chapter_count, verse_count, diag_count, i;
     const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    const char *input;
     const USFM_ChapterEntry *chapters = USFM_Ast_GetChapters(ast, &chapter_count);
     const USFM_VerseEntry *verses = USFM_Ast_GetVerses(ast, &verse_count);
     const USFM_Diagnostic *diags = USFM_Ast_GetDiagnostics(ast, &diag_count);
-    USFM_Ast_GetInput(ast, &input_length);
+    input = USFM_Ast_GetInput(ast, &input_length);
 
     if (count == 0) CHECK_AST_FAIL("no nodes");
     if (nodes[0].kind != USFM_AST_BOOK || nodes[0].parent != USFM_NIL || nodes[0].end != count)
@@ -33,6 +58,11 @@ static int check_ast(const USFM_Ast *ast)
         if (n->end <= i || n->end > count) CHECK_AST_FAIL("node %u end %u", i, n->end);
         if (k == USFM_AST_TEXT && n->span.length == 0)
             CHECK_AST_FAIL("TEXT node %u has length 0", i);
+        if (k == USFM_AST_TEXT && (uint64_t)n->span.offset + n->span.length <= input_length &&
+            USFM_FLAGS(n->level_flags) != check_text_flags(input, n->span))
+            CHECK_AST_FAIL("TEXT node %u flags 0x%02x, its text needs 0x%02x", i,
+                           (unsigned)USFM_FLAGS(n->level_flags),
+                           (unsigned)check_text_flags(input, n->span));
         if (n->end < count &&
             nodes[n->end].span.offset < (uint64_t)n->span.offset + n->span.length)
             CHECK_AST_FAIL("node %u (span %u+%u) overlaps next node %u at offset %u", i,

@@ -50,6 +50,30 @@ static void test_depth_limit(void)
     USFM_Ast_Free(ast);
 }
 
+/* Text made from an overflowing marker or its unclaimed argument still
+ * carries exact text flags (check_ast verifies them). */
+static void test_depth_limit_text_flags(void)
+{
+    /* A marker span that ends in a TAB; a note caller with a ~. */
+    static const char *spans[2] = { "\\+nd\tx", "\\+nd x" };
+    static const char *tails[2] = { "", "\\f ~1 \\ft y\\f*" };
+    for (int t = 0; t < 2; t++) {
+        char input[1024];
+        size_t used = 0;
+        USFM_Ast *ast;
+        used += (size_t)snprintf(input + used, sizeof input - used, "\\c 1\n\\p ");
+        for (int i = 0; i < 70; i++) {
+            used += (size_t)snprintf(input + used, sizeof input - used, "%s", spans[t]);
+        }
+        used += (size_t)snprintf(input + used, sizeof input - used, "%s", tails[t]);
+        ast = parse_with_version(input, USFM_VERSION_AUTO);
+        CHECK(ast != NULL);
+        if (ast == NULL) continue;
+        CHECK_EQ(check_ast(ast), 0);
+        USFM_Ast_Free(ast);
+    }
+}
+
 static void test_verse_closes_heading(void)
 {
     CHECK_TREE("\\c 1\n\\s1 Head \\v 1 x",
@@ -69,5 +93,6 @@ static void run_versions_tests(void)
     RUN(test_usfm_line_selects_version);
     RUN(test_unsupported_version);
     RUN(test_depth_limit);
+    RUN(test_depth_limit_text_flags);
     RUN(test_verse_closes_heading);
 }
