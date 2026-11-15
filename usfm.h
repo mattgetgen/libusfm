@@ -542,6 +542,49 @@ USFM_STATIC_ASSERT(node_size,       sizeof(USFM_Node) == 20);
 USFM_STATIC_ASSERT(diagnostic_size, sizeof(USFM_Diagnostic) == 12);
 USFM_STATIC_ASSERT(chapter_size,    sizeof(USFM_ChapterEntry) == 20);
 USFM_STATIC_ASSERT(verse_size,      sizeof(USFM_VerseEntry) == 16);
+USFM_STATIC_ASSERT(verse_ref_size,  sizeof(USFM_VerseRef) == 8);
+USFM_STATIC_ASSERT(verse_item_size, sizeof(USFM_VerseItem) == 24);
+USFM_STATIC_ASSERT(node_offsets,    offsetof(USFM_Node, span) == 8 &&
+                                    offsetof(USFM_Node, marker) == 16 &&
+                                    offsetof(USFM_Node, kind) == 18);
+USFM_STATIC_ASSERT(chapter_offsets, offsetof(USFM_ChapterEntry, node) == 4 &&
+                                    offsetof(USFM_ChapterEntry, first_verse) == 12);
+USFM_STATIC_ASSERT(verse_offsets,   offsetof(USFM_VerseEntry, node) == 8 &&
+                                    offsetof(USFM_VerseEntry, end_node) == 12);
+USFM_STATIC_ASSERT(verse_ref_offsets, offsetof(USFM_VerseRef, verse_last) == 4 &&
+                                      offsetof(USFM_VerseRef, segment_last) == 7);
+USFM_STATIC_ASSERT(verse_item_offsets, offsetof(USFM_VerseItem, node) == 4 &&
+                                       offsetof(USFM_VerseItem, style) == 12 &&
+                                       offsetof(USFM_VerseItem, text) == 16);
+/* Structs holding pointers: the same rules on 32-bit (wasm32) and 64-bit
+ * targets, written in terms of the pointer size P. Function pointers are
+ * assumed to be the size of void *. */
+#define USFM__P sizeof(void *)
+USFM_STATIC_ASSERT(err_layout,      sizeof(USFM_Err) == USFM__P + 8 &&
+                                    offsetof(USFM_Err, code) == USFM__P &&
+                                    offsetof(USFM_Err, pos) == USFM__P + 4);
+USFM_STATIC_ASSERT(config_layout,   sizeof(USFM_Config) == 2 * USFM__P &&
+                                    offsetof(USFM_Config, reserved) == 1 &&
+                                    offsetof(USFM_Config, custom) == USFM__P);
+USFM_STATIC_ASSERT(alc_layout,      sizeof(USFM_Alc) == 4 * USFM__P &&
+                                    offsetof(USFM_Alc, resize) == USFM__P &&
+                                    offsetof(USFM_Alc, dealloc) == 2 * USFM__P &&
+                                    offsetof(USFM_Alc, ctx) == 3 * USFM__P);
+/* ast, then three u32s, padded to a multiple of P. */
+USFM_STATIC_ASSERT(verse_iter_layout,
+                   sizeof(USFM_VerseIter) == (USFM__P + 12 + USFM__P - 1) / USFM__P * USFM__P &&
+                   offsetof(USFM_VerseIter, position) == USFM__P &&
+                   offsetof(USFM_VerseIter, end) == USFM__P + 4 &&
+                   offsetof(USFM_VerseIter, flags) == USFM__P + 8);
+USFM_STATIC_ASSERT(chapter_iter_layout,
+                   sizeof(USFM_ChapterIter) == USFM__P + 8 &&
+                   offsetof(USFM_ChapterIter, position) == USFM__P &&
+                   offsetof(USFM_ChapterIter, end) == USFM__P + 4);
+USFM_STATIC_ASSERT(chapter_verse_iter_layout,
+                   sizeof(USFM_ChapterVerseIter) == USFM__P + 8 &&
+                   offsetof(USFM_ChapterVerseIter, position) == USFM__P &&
+                   offsetof(USFM_ChapterVerseIter, end) == USFM__P + 4);
+#undef USFM__P
 
 #ifdef __cplusplus
 }
