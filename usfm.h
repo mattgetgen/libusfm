@@ -1194,11 +1194,16 @@ static void usfm__classify(const char *name, uint32_t length, USFM_ScanToken *t)
         }
     }
     if (i != length) return;
+    if (level > 15u) return;            /* doesn't fit the 4-bit level */
     row = usfm__marker_find(name, base);
     if (row == USFM_ROW_NONE) return;
+    if (flags != 0 && USFM_MarkerRows[row].role != USFM_ROLE_CHAR &&
+        USFM_MarkerRows[row].role != USFM_ROLE_MILESTONE) {
+        return;                         /* -s / -e only on char / milestone */
+    }
     t->row = (uint16_t)row;
     t->tok.marker = USFM_MarkerRows[row].marker;
-    t->tok.level_flags |= (uint8_t)((level > 15u ? 15u : level) | flags);
+    t->tok.level_flags |= (uint8_t)(level | flags);
 }
 
 /* ===== Scanner ===== */
@@ -1348,7 +1353,9 @@ static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
         /* Attributes run to the next marker; escapes don't end them. */
         while (i < len) {
             if (in[i] == '\\') {
-                if (!usfm__is_escape(in, len, i)) break;
+                /* \= is an escape here only (field guide section 1). */
+                if (!usfm__is_escape(in, len, i) &&
+                    !(i + 1 < len && in[i + 1] == '=')) break;
                 i += 2;
                 continue;
             }
@@ -1376,6 +1383,8 @@ static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
             continue;
         }
         if (b == '\\') {
+            /* \" is accepted as an escape in text too, as in attributes:
+             * deliberate and harmless, since \" can't start a marker. */
             if (!usfm__is_escape(in, len, i)) break;
             flags |= USFM_TF_HAS_ESCAPE;
             i += 2;

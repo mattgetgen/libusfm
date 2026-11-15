@@ -76,6 +76,32 @@ static void test_scan_crlf_and_bom(void)
     CHECK_STR(scan("\xEF\xBB\xBF\\id GEN", 0), "M:id A\"GEN\"");
 }
 
+static void test_scan_milestone_suffix_roles(void)
+{
+    CHECK_STR(scan("\\p-s x", 0), "M:?p-s T\"x\"");
+    CHECK_STR(scan("\\qt-s x", 0), "M:qt-s T\"x\"");
+}
+
+static void test_scan_level_over_15_is_unknown(void)
+{
+    CHECK_STR(scan("\\q16 x", 0), "M:?q16 T\"x\"");
+    CHECK_STR(scan("\\tc12 x", 0), "M:tc12 T\"x\"");
+}
+
+static void test_scan_attribute_escapes(void)
+{
+    CHECK_STR(scan("\\w x|id=\"a\\=b\"\\w*", 1),
+              "M:w T\"x\" @\"|id=\\\"a\\=b\\\"\" E:w");
+}
+
+static void test_scan_edge_cases(void)
+{
+    CHECK_STR(scan("\\+", 0), "M:+?");
+    CHECK_STR(scan("a\r", 0), "T\"a\\r\"/w");
+    CHECK_STR(scan("\xEF\xBB", 0), "T\"\xEF\xBB\"");
+    CHECK_STR(scan("\\q- x", 0), "M:?q- T\"x\"");
+}
+
 static void run_scanner_tests(void)
 {
     RUN(test_scan_id_line);
@@ -89,4 +115,8 @@ static void run_scanner_tests(void)
     RUN(test_scan_arguments);
     RUN(test_scan_periph_argument_line);
     RUN(test_scan_crlf_and_bom);
+    RUN(test_scan_milestone_suffix_roles);
+    RUN(test_scan_level_over_15_is_unknown);
+    RUN(test_scan_attribute_escapes);
+    RUN(test_scan_edge_cases);
 }
