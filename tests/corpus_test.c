@@ -144,6 +144,24 @@ static uint64_t checksum_ast(uint64_t h, const USFM_Ast *ast)
     return h;
 }
 
+#if USFM__USE_BLOCKS
+/* Classifies every whole 64-byte block of `data` with the SIMD and the
+ * scalar classifier; returns the number of blocks whose masks differ. */
+static unsigned long long classifier_mismatches(const char *data, uint32_t length)
+{
+    unsigned long long bad = 0;
+    uint32_t base;
+    for (base = 0; base + 64u <= length; base += 64u) {     /* bounded by length */
+        USFM_BlockMasks a, b;
+        usfm__classify_block(data + base, &a);
+        usfm__classify_block_scalar(data + base, &b);
+        if (a.backslash != b.backslash || a.pipe != b.pipe || a.slash != b.slash ||
+            a.nbsp != b.nbsp || a.loose_ws != b.loose_ws) bad++;
+    }
+    return bad;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : "build/corpus/WEB";
@@ -157,6 +175,7 @@ int main(int argc, char **argv)
     int failures = 0;
     uint64_t checksum = 0xcbf29ce484222325ull;
     unsigned long long scan_diffs = 0;
+    unsigned long long block_diffs = 0;
     DIR *d = opendir(dir);
     FILE *csv = fopen("build/corpus/libusfm-web.csv", "w");
     struct dirent *e;
@@ -190,6 +209,9 @@ int main(int argc, char **argv)
             failures++;
             continue;
         }
+#if USFM__USE_BLOCKS
+        block_diffs += classifier_mismatches(data, length);
+#endif
         scan_diffs += (unsigned long long)(scan_compare(data, length, 0u, scan_diffs == 0) +
                                            scan_compare(data, length, 1u, scan_diffs == 0) +
                                            scan_compare(data, length, 7u + (uint32_t)i, scan_diffs == 0));
@@ -264,8 +286,9 @@ int main(int argc, char **argv)
     if (mismatches.loose_ws + mismatches.nbsp + mismatches.escape != 0) failures++;
     printf("SIMD path: %s\n", USFM__SIMD_PATH);
     printf("Scanner differences: %llu\n", scan_diffs);
+    printf("Classifier differences: %llu\n", block_diffs);
     printf("AST checksum: %016llx\n", (unsigned long long)checksum);
-    if (scan_diffs != 0) failures++;
+    if (scan_diffs != 0 || block_diffs != 0) failures++;
     if (memcmp(&total, &expected, sizeof total) != 0) {
         printf("Expected:   %llu books, %llu chapters, %llu verses, %llu paragraphs\n"
                "            %llu char styles, %llu notes, %llu milestones\n",
