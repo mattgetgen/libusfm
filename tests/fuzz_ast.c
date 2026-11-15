@@ -1,0 +1,160 @@
+/* libFuzzer harness. Input layout: byte 0 picks the USFM version
+ * (% 5), byte 1 picks flags: bit 0 = COPY_INPUT, bit 7 = fail the
+ * allocator after (byte1 & 0x3F) calls. The rest is the USFM text.
+ *
+ * Every parse must either return NULL with USFM_ERR_NOMEM (and have
+ * freed everything), or return a tree whose invariants hold. Any
+ * crash, sanitizer report, leak or broken invariant is a finding.
+ *
+ * Built with -DUSFM_FUZZ_REPLAY, it gets a main() that runs each file
+ * given on the command line, so seeds and crash files replay under gcc. */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define USFM_IMPLEMENTATION
+#include "../usfm.h"
+#include "check.h"
+
+typedef struct FuzzAlc {
+    size_t   live_bytes;
+    uint32_t calls_left;
+} FuzzAlc;
+
+/* Each block carries its requested size in an 8-byte header, which keeps
+ * the returned pointer 8-byte aligned. Sized frees and resizes are
+ * checked against it. */
+#define FUZZ_ALC_HEADER 8u
+
+static void *fuzz_alloc(void *ctx, size_t size)
+{
+    FuzzAlc *f = (FuzzAlc *)ctx;
+    unsigned char *base;
+    uint64_t stored = (uint64_t)size;
+    if (size % 8 != 0) abort();
+    if (f->calls_left == 0) return NULL;
+    if (f->calls_left != UINT32_MAX) f->calls_left--;
+    base = (unsigned char *)malloc(size + FUZZ_ALC_HEADER);
+    if (!base) return NULL;
+    memcpy(base, &stored, sizeof stored);
+    f->live_bytes += size;
+    return base + FUZZ_ALC_HEADER;
+}
+
+static void *fuzz_resize(void *ctx, void *ptr, size_t old_size, size_t new_size)
+{
+    FuzzAlc *f = (FuzzAlc *)ctx;
+    unsigned char *base, *p;
+    uint64_t stored;
+    if (ptr == NULL) abort();
+    base = (unsigned char *)ptr - FUZZ_ALC_HEADER;
+    memcpy(&stored, base, sizeof stored);
+    if (stored != (uint64_t)old_size) abort();
+    if (old_size % 8 != 0 || new_size % 8 != 0) abort();
+    if (f->calls_left == 0) return NULL;
+    if (f->calls_left != UINT32_MAX) f->calls_left--;
+    p = (unsigned char *)realloc(base, new_size + FUZZ_ALC_HEADER);
+    if (!p) return NULL;
+    stored = (uint64_t)new_size;
+    memcpy(p, &stored, sizeof stored);
+    f->live_bytes = f->live_bytes - old_size + new_size;
+    return p + FUZZ_ALC_HEADER;
+}
+
+static void fuzz_dealloc(void *ctx, void *ptr, size_t size)
+{
+    FuzzAlc *f = (FuzzAlc *)ctx;
+    unsigned char *base;
+    uint64_t stored;
+    if (ptr == NULL) abort();
+    base = (unsigned char *)ptr - FUZZ_ALC_HEADER;
+    memcpy(&stored, base, sizeof stored);
+    if (stored != (uint64_t)size) abort();
+    if (size % 8 != 0 || size > f->live_bytes) abort();
+    f->live_bytes -= size;
+    free(base);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    USFM_Config config;
+    FuzzAlc state;
+    USFM_Alc alc;
+    USFM_Err err;
+    USFM_Ast *ast;
+    uint32_t flags;
+    if (size < 2 || size - 2 > USFM_INPUT_MAX) return 0;
+    memset(&config, 0, sizeof config);
+    config.version = (uint8_t)(data[0] % 5);
+    flags = (data[1] & 0x01) ? USFM_PARSE_COPY_INPUT : USFM_PARSE_DEFAULT;
+    state.live_bytes = 0;
+    state.calls_left = (data[1] & 0x80) ? (uint32_t)(data[1] & 0x3F) : UINT32_MAX;
+    alc.alloc = fuzz_alloc;
+    alc.resize = fuzz_resize;
+    alc.dealloc = fuzz_dealloc;
+    alc.ctx = &state;
+
+    ast = USFM_Ast_ParseOpts((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
+                             &alc, &err);
+    if (ast == NULL) {
+        if (err.code != USFM_ERR_NOMEM || state.live_bytes != 0) abort();
+        return 0;
+    }
+    if (err.code != USFM_OK && err.code != USFM_ERR_NOMEM) abort();
+    if (check_ast(ast) != 0) abort();
+    {
+        /* Exercise the iterators on every verse. */
+        USFM_ChapterIter chapters;
+        USFM_ChapterEntry chapter;
+        uint32_t verse_count, i;
+        const USFM_VerseEntry *verses = USFM_Ast_GetVerses(ast, &verse_count);
+        for (i = 0; i < verse_count; i++) {
+            USFM_VerseIter it;
+            USFM_VerseItem item;
+            USFM_VerseIter_Init(&it, ast, &verses[i],
+                                USFM_VI_INCLUDE_NOTES | USFM_VI_REPORT_BREAKS |
+                                USFM_VI_REPORT_NOTES | USFM_VI_INCLUDE_HEADINGS);
+            while (USFM_VerseIter_Next(&it, &item)) {
+                if (item.node >= ast->node_count) abort();
+            }
+            USFM_Ast_FindVerse(ast, verses[i].ref.chapter, verses[i].ref.verse_first, NULL);
+        }
+        USFM_ChapterIter_Init(&chapters, ast);
+        while (USFM_ChapterIter_Next(&chapters, &chapter)) {
+            USFM_Ast_FindChapter(ast, chapter.number, NULL);
+        }
+    }
+    USFM_Ast_Free(ast);
+    if (state.live_bytes != 0) abort();
+    return 0;
+}
+
+#ifdef USFM_FUZZ_REPLAY
+int main(int argc, char **argv)
+{
+    int i;
+    for (i = 1; i < argc; i++) {
+        FILE *f = fopen(argv[i], "rb");
+        uint8_t *data;
+        long size;
+        if (f == NULL) {
+            fprintf(stderr, "cannot open %s\n", argv[i]);
+            return 1;
+        }
+        fseek(f, 0, SEEK_END);
+        size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        data = (uint8_t *)malloc(size > 0 ? (size_t)size : 1);
+        if (data == NULL || (size > 0 && fread(data, 1, (size_t)size, f) != (size_t)size)) {
+            fprintf(stderr, "cannot read %s\n", argv[i]);
+            return 1;
+        }
+        fclose(f);
+        LLVMFuzzerTestOneInput(data, (size_t)size);
+        free(data);
+    }
+    printf("fuzz replay: %d inputs ok\n", argc - 1);
+    return 0;
+}
+#endif
