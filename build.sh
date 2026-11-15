@@ -37,26 +37,52 @@ run_codegen() {
     fi
 }
 
-# Unpack the WEB corpus once (and again whenever the archive changes).
+# Unpack every tests/corpus/*.tar.gz into build/corpus (again whenever
+# its archive changes) and list the corpus names in CORPORA.
+CORPORA=()
 unpack_corpus() {
+    local archive name
     mkdir -p build/corpus
-    if [[ ! -f build/corpus/WEB.stamp || tests/corpus/WEB.tar.gz -nt build/corpus/WEB.stamp ]]; then
-        rm -rf build/corpus/WEB
-        tar -xzf tests/corpus/WEB.tar.gz -C build/corpus
-        touch build/corpus/WEB.stamp
-    fi
+    CORPORA=()
+    for archive in tests/corpus/*.tar.gz; do
+        name=$(basename "$archive" .tar.gz)
+        if [[ ! -f "build/corpus/$name.stamp" || "$archive" -nt "build/corpus/$name.stamp" ]]; then
+            rm -rf "build/corpus/$name"
+            tar -xzf "$archive" -C build/corpus
+            touch "build/corpus/$name.stamp"
+        fi
+        CORPORA+=("$name")
+    done
 }
 
-# Every path must produce the same AST checksum on WEB.
-check_checksums() {
-    local distinct
-    distinct=$(cut -d' ' -f2 build/checksums.txt | sort -u | wc -l)
-    if [[ "$distinct" -ne 1 ]]; then
-        echo "checksums DIFFER across paths:" >&2
-        cat build/checksums.txt >&2
+# run_corpus PATH CORPUS COMMAND...: runs one corpus test, prints a one-line
+# summary (the full log on failure) and records the AST checksum.
+run_corpus() {
+    local path="$1" corpus="$2" log="build/corpus_$1_$2.log" checksum
+    shift 2
+    if ! "$@" > "$log" 2>&1; then
+        cat "$log" >&2
+        echo "$path $corpus: corpus test FAILED" >&2
         exit 1
     fi
-    echo "checksums: identical across $(wc -l < build/checksums.txt) paths"
+    checksum=$(grep '^AST checksum' "$log" | cut -d' ' -f3)
+    echo "$path $corpus: $(grep '^Scanner differences' "$log"), $(grep '^Classifier differences' "$log"), $(grep '^Diagnostics' "$log"), checksum $checksum, $(tail -n 1 "$log")"
+    echo "$path $corpus $checksum" >> build/checksums.txt
+}
+
+# Every path must produce the same AST checksum on each corpus.
+check_checksums() {
+    local corpus distinct paths
+    for corpus in "${CORPORA[@]}"; do
+        distinct=$(awk -v c="$corpus" '$2 == c { print $3 }' build/checksums.txt | sort -u | wc -l)
+        if [[ "$distinct" -ne 1 ]]; then
+            echo "checksums DIFFER across paths for $corpus:" >&2
+            cat build/checksums.txt >&2
+            exit 1
+        fi
+    done
+    paths=$(cut -d' ' -f1 build/checksums.txt | sort -u | wc -l)
+    echo "checksums: identical across $paths paths for ${#CORPORA[@]} corpora"
 }
 
 case "$MODE" in
@@ -74,7 +100,7 @@ case "$MODE" in
         unpack_corpus
         g++ -std=c++11 -Wall -Wextra -fsyntax-only tests/cpp_check.cpp
         rm -f build/checksums.txt
-        # Every native SIMD path: unit tests and the WEB corpus test.
+        # Every native SIMD path: unit tests and every corpus.
         PATHS=("scalar:-DUSFM_SIMD_NONE" "sse2:")
         if grep -q ' avx2' /proc/cpuinfo; then PATHS+=("avx2:-mavx2"); else echo "avx2: skipped (CPU lacks AVX2)"; fi
         for entry in "${PATHS[@]}"; do
@@ -89,8 +115,9 @@ case "$MODE" in
             echo "$name: $(tail -n 1 "build/run_tests_$name.log")"
             # shellcheck disable=SC2086
             gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" $flags tests/corpus_test.c -o "build/corpus_test_$name"
-            "./build/corpus_test_$name" build/corpus/WEB | tee "build/corpus_$name.log"
-            echo "$name $(grep 'AST checksum' "build/corpus_$name.log" | cut -d' ' -f3)" >> build/checksums.txt
+            for corpus in "${CORPORA[@]}"; do
+                run_corpus "$name" "$corpus" "./build/corpus_test_$name" "build/corpus/$corpus" tests/corpus/expected.txt
+            done
         done
         # Consumers use the default enum ABI: run the unit tests once more
         # without -fshort-enums.
@@ -138,10 +165,10 @@ case "$MODE" in
         grep 'SIMD path' build/run_tests_neon.log
         echo "neon: $(tail -n 1 build/run_tests_neon.log)"
         rm -f build/checksums.txt
-        ./build/corpus_test_ref build/corpus/WEB > build/corpus_ref.log
-        echo "scalar $(grep 'AST checksum' build/corpus_ref.log | cut -d' ' -f3)" >> build/checksums.txt
-        qemu-aarch64 ./build/corpus_test_neon build/corpus/WEB | tee build/corpus_neon.log
-        echo "neon $(grep 'AST checksum' build/corpus_neon.log | cut -d' ' -f3)" >> build/checksums.txt
+        for corpus in "${CORPORA[@]}"; do
+            run_corpus scalar "$corpus" ./build/corpus_test_ref "build/corpus/$corpus" tests/corpus/expected.txt
+            run_corpus neon "$corpus" qemu-aarch64 ./build/corpus_test_neon "build/corpus/$corpus" tests/corpus/expected.txt
+        done
         check_checksums
         ;;
     test-wasm)
@@ -163,10 +190,11 @@ case "$MODE" in
         grep 'SIMD path' build/run_tests_wasm.log
         echo "wasm: $(tail -n 1 build/run_tests_wasm.log)"
         rm -f build/checksums.txt
-        ./build/corpus_test_ref build/corpus/WEB > build/corpus_ref.log
-        echo "scalar $(grep 'AST checksum' build/corpus_ref.log | cut -d' ' -f3)" >> build/checksums.txt
-        node --no-warnings tests/wasi_run.mjs build/corpus_test_wasm.wasm "$PWD/build/corpus/WEB" | tee build/corpus_wasm.log
-        echo "wasm $(grep 'AST checksum' build/corpus_wasm.log | cut -d' ' -f3)" >> build/checksums.txt
+        for corpus in "${CORPORA[@]}"; do
+            run_corpus scalar "$corpus" ./build/corpus_test_ref "build/corpus/$corpus" tests/corpus/expected.txt
+            run_corpus wasm "$corpus" node --no-warnings tests/wasi_run.mjs build/corpus_test_wasm.wasm \
+                "$PWD/build/corpus/$corpus" "$PWD/tests/corpus/expected.txt"
+        done
         check_checksums
         ;;
     test-avx512)
@@ -186,10 +214,10 @@ case "$MODE" in
         grep 'SIMD path' build/run_tests_avx512.log
         echo "avx512bw: $(tail -n 1 build/run_tests_avx512.log)"
         rm -f build/checksums.txt
-        ./build/corpus_test_ref build/corpus/WEB > build/corpus_ref.log
-        echo "scalar $(grep 'AST checksum' build/corpus_ref.log | cut -d' ' -f3)" >> build/checksums.txt
-        "$USFM_SDE" -spr -- ./build/corpus_test_avx512 build/corpus/WEB | tee build/corpus_avx512.log
-        echo "avx512bw $(grep 'AST checksum' build/corpus_avx512.log | cut -d' ' -f3)" >> build/checksums.txt
+        for corpus in "${CORPORA[@]}"; do
+            run_corpus scalar "$corpus" ./build/corpus_test_ref "build/corpus/$corpus" tests/corpus/expected.txt
+            run_corpus avx512bw "$corpus" "$USFM_SDE" -spr -- ./build/corpus_test_avx512 "build/corpus/$corpus" tests/corpus/expected.txt
+        done
         check_checksums
         ;;
     fuzz)
@@ -203,7 +231,9 @@ case "$MODE" in
         unpack_corpus
         shift
         DIRS=("$@")
-        if [[ ${#DIRS[@]} -eq 0 ]]; then DIRS=(build/corpus/WEB); fi
+        if [[ ${#DIRS[@]} -eq 0 ]]; then
+            for corpus in "${CORPORA[@]}"; do DIRS+=("build/corpus/$corpus"); done
+        fi
         VARIANTS=("scalar:-DUSFM_SIMD_NONE" "sse2:-mno-avx2 -mno-avx512f" "avx2:-mno-avx512f")
         if grep -q ' avx512bw' /proc/cpuinfo; then VARIANTS+=("avx512bw:"); fi
         PIN=()
