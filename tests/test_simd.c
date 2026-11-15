@@ -58,6 +58,19 @@ static void test_bit_helpers(void)
     CHECK_EQ(usfm__bit_range(64, 64), 0);
     CHECK_EQ(usfm__bit_range(0, 0), 0);
 }
+
+static void test_classifier_long_buffer(void)
+{
+    /* Every 64-byte block of a 16 KiB random buffer, via the shared helper. */
+    static const char special[] = "\\|/~\r\n\t";
+    static char buf[16384];
+    uint32_t k;
+    for (k = 0; k < sizeof buf; k++) {
+        uint32_t r = simd_rand();
+        buf[k] = (r & 3u) == 0 ? special[(r >> 2) % 7u] : (char)(r >> 4);
+    }
+    CHECK_EQ(classifier_mismatches(buf, (uint32_t)sizeof buf), 0);
+}
 #endif
 
 static void test_scanner_block_boundaries(void)
@@ -124,5 +137,6 @@ static void run_simd_tests(void)
 #if USFM__USE_BLOCKS
     RUN(test_bit_helpers);
     RUN(test_classifier_matches_scalar);
+    RUN(test_classifier_long_buffer);
 #endif
 }

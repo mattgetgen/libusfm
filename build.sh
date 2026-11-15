@@ -109,7 +109,7 @@ case "$MODE" in
             aarch64-linux-gnu-gcc "${COMMON_FLAGS[@]}" -O1 -c tests/run_tests.c -o /dev/null && echo "neon: compiles"
         fi
         if command -v zig > /dev/null; then
-            zig cc -target wasm32-wasi -msimd128 -std=c99 -O1 -c tests/run_tests.c -o build/wasm_check.o && echo "wasm-simd128: compiles"
+            zig cc -target wasm32-wasi -msimd128 -std=c99 -O1 -D_WASI_EMULATED_PROCESS_CLOCKS -c tests/run_tests.c -o build/wasm_check.o && echo "wasm-simd128: compiles"
         fi
         check_checksums
         ;;
@@ -151,9 +151,10 @@ case "$MODE" in
             echo "test-wasm: skipped (needs zig and node)"
             exit 0
         fi
-        WASM_FLAGS=(-target wasm32-wasi -msimd128 -std=c99 -O2 -Wl,-z,stack-size=8388608)
-        zig cc "${WASM_FLAGS[@]}" tests/run_tests.c -o build/run_tests_wasm.wasm
-        zig cc "${WASM_FLAGS[@]}" tests/corpus_test.c -o build/corpus_test_wasm.wasm
+        # clock() needs WASI's emulated process clocks (tests time two lookahead checks).
+        WASM_FLAGS=(-target wasm32-wasi -msimd128 -std=c99 -O2 -D_WASI_EMULATED_PROCESS_CLOCKS -Wl,-z,stack-size=8388608)
+        zig cc "${WASM_FLAGS[@]}" tests/run_tests.c -lwasi-emulated-process-clocks -o build/run_tests_wasm.wasm
+        zig cc "${WASM_FLAGS[@]}" tests/corpus_test.c -lwasi-emulated-process-clocks -o build/corpus_test_wasm.wasm
         gcc "${COMMON_FLAGS[@]}" -O1 -DUSFM_SIMD_NONE tests/corpus_test.c -o build/corpus_test_ref
         if ! node --no-warnings tests/wasi_run.mjs build/run_tests_wasm.wasm 2> build/run_tests_wasm.log; then
             cat build/run_tests_wasm.log >&2
