@@ -940,9 +940,13 @@ static const uint8_t USFM_MarkerSlots[1149] = {
 
 /* ===== Allocator ===== */
 
+/* Largest request the library makes: the largest u32 that is a multiple of 8. */
+#define USFM__ALLOC_MAX 0xFFFFFFF8u
+
 /* Every request is rounded to a multiple of 8 (allocator contract). */
 static size_t usfm__round8(size_t size)
 {
+    USFM_ASSERT(size <= USFM__ALLOC_MAX);
     if (size == 0) size = 1;
     return (size + 7u) & ~(size_t)7u;
 }
@@ -991,36 +995,55 @@ static void usfm__free(const USFM_Alc *alc, void *ptr, size_t size)
     if (ptr != NULL) alc->dealloc(alc->ctx, ptr, usfm__round8(size));
 }
 
-/* Makes room for `needed` elements of elem_size, doubling *capacity.
- * Returns the (possibly moved) array, or NULL on failure; on failure
- * the old block stays valid and *capacity is unchanged. */
+/* New capacity for growing `capacity` to hold `needed` elements of
+ * elem_size: doubles (first step 8), clamped so the array stays within
+ * USFM__ALLOC_MAX bytes. Returns 0 if `needed` can't fit. */
+static uint32_t usfm__grow_capacity(uint32_t capacity, uint32_t elem_size, uint32_t needed)
+{
+    uint32_t max_capacity;
+    uint64_t new_capacity;
+    uint32_t i;
+    USFM_ASSERT(elem_size > 0);
+    if (needed <= capacity) return capacity;
+    max_capacity = USFM__ALLOC_MAX / elem_size;
+    if (needed > max_capacity) return 0;
+    new_capacity = capacity ? (uint64_t)capacity * 2u : 8u;
+    /* Bounded: each pass doubles a 64-bit value toward a 32-bit target. */
+    for (i = 0; i < 32 && new_capacity < needed; i++) new_capacity *= 2u;
+    if (new_capacity > max_capacity) new_capacity = max_capacity;
+    return (uint32_t)new_capacity;
+}
+
+/* Makes room for `needed` elements of elem_size, doubling *capacity
+ * (clamped at USFM__ALLOC_MAX bytes). Returns the (possibly moved)
+ * array, or NULL on failure; on failure the old block stays valid and
+ * *capacity is unchanged. */
 static void *usfm__grow(const USFM_Alc *alc, void *array, uint32_t *capacity,
                         uint32_t elem_size, uint32_t needed)
 {
-    uint64_t new_capacity;
+    uint32_t new_capacity;
     void *block;
-    uint32_t i;
     if (needed <= *capacity) return array;
-    new_capacity = *capacity ? (uint64_t)*capacity * 2u : 8u;
-    /* Bounded: each pass doubles a 64-bit value toward a 32-bit target. */
-    for (i = 0; i < 32 && new_capacity < needed; i++) new_capacity *= 2u;
-    if (new_capacity < needed || new_capacity * elem_size > 0xFFFFFFFFull) return NULL;
+    new_capacity = usfm__grow_capacity(*capacity, elem_size, needed);
+    if (new_capacity == 0) return NULL;
     if (array == NULL) {
-        block = usfm__alloc(alc, (size_t)(new_capacity * elem_size));
+        block = usfm__alloc(alc, (size_t)new_capacity * elem_size);
     } else {
         block = alc->resize(alc->ctx, array,
                             usfm__round8((size_t)*capacity * elem_size),
-                            usfm__round8((size_t)(new_capacity * elem_size)));
+                            usfm__round8((size_t)new_capacity * elem_size));
     }
     if (block == NULL) return NULL;
-    *capacity = (uint32_t)new_capacity;
+    *capacity = new_capacity;
     return block;
 }
 
+/* Sizes above USFM__ALLOC_MAX can never have been allocated by the
+ * library, so such a call is ignored (nothing is freed). */
 USFM_API void USFM_Alc_Free(const USFM_Alc *alc, void *ptr, size_t size)
 {
     const USFM_Alc *a = usfm__alc_or_default(alc);
-    if (ptr == NULL || a == NULL) return;
+    if (ptr == NULL || a == NULL || size > USFM__ALLOC_MAX) return;
     usfm__free(a, ptr, size);
 }
 
