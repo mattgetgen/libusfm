@@ -1,7 +1,6 @@
 /* SIMD tests: the block classifier against the scalar reference, and
  * (Task 2) the block scanner against the byte-loop scanner. */
 
-#if USFM__USE_BLOCKS
 static uint32_t simd_rng = 12345u;
 
 static uint32_t simd_rand(void)
@@ -9,8 +8,6 @@ static uint32_t simd_rand(void)
     simd_rng = simd_rng * 1103515245u + 12345u;
     return simd_rng >> 8;
 }
-
-#endif
 
 static void test_simd_path_name(void)
 {
@@ -54,8 +51,8 @@ static void test_bit_helpers(void)
     CHECK_EQ(usfm__ctz64(1u), 0);
     CHECK_EQ(usfm__ctz64((uint64_t)1 << 63), 63);
     CHECK_EQ(usfm__ctz64(0x50u), 4);
-    CHECK_EQ(usfm__popcount64(0), 0);
-    CHECK_EQ(usfm__popcount64(~(uint64_t)0), 64);
+    CHECK_EQ(usfm__ctz64(~(uint64_t)0), 0);
+    CHECK_EQ(usfm__ctz64((uint64_t)0x8000000000000000ull | 0x100u), 8);
     CHECK_EQ(usfm__bit_range(0, 64), ~(uint64_t)0);
     CHECK_EQ(usfm__bit_range(3, 5), 0x18u);
     CHECK_EQ(usfm__bit_range(64, 64), 0);
@@ -63,9 +60,67 @@ static void test_bit_helpers(void)
 }
 #endif
 
+static void test_scanner_block_boundaries(void)
+{
+    static const char *const snippets[] = {
+        "\\\\", "\\/", "\\|", "\\~", "\\\"", "\\=", "//", "/", "|", "~", "\r\n", "\r", "\n",
+        "\t", "\\w ", "\\w*", "\\*", "\\+nd ", "\\v 1 ", "|lemma=\"a\\\"b\"\\w*", "\\", "~~//\\\\|"
+    };
+    char buf[256];
+    uint32_t bad = 0, si, off, pipe;
+    for (si = 0; si < sizeof snippets / sizeof snippets[0]; si++) {
+        uint32_t sl = (uint32_t)strlen(snippets[si]);
+        for (off = 0; off < 140u; off++) {
+            uint32_t len = off + sl + 40u, k;
+            for (k = 0; k < len; k++) buf[k] = (char)('a' + k % 23u);
+            memcpy(buf + off, snippets[si], sl);
+            for (pipe = 0; pipe < 3u; pipe++) {
+                bad += (uint32_t)scan_compare(buf, off + sl, pipe == 2u ? 77u + off : pipe, bad == 0);
+                bad += (uint32_t)scan_compare(buf, len, pipe == 2u ? 91u + off : pipe, bad == 0);
+            }
+        }
+    }
+    CHECK_EQ(bad, 0);
+}
+
+static void test_scanner_every_length(void)
+{
+    static const char unit[] =
+        "\\id GEN x\n\\c 1\n\\p \\v 1 a\\/b~c\td \\w In|strong=\"H1\\=x\"\\w* e//f "
+        "\\f + \\ft n\\f* \\qt-s |who=\"P\"\\*g\r\nh\\\\i|j \\zz k\\zz* \\+nd l\\+nd*\n";
+    char rich[512];
+    uint32_t bad = 0, len, pipe, used = 0;
+    while (used + sizeof unit - 1u < sizeof rich) {     /* bounded by sizeof rich */
+        memcpy(rich + used, unit, sizeof unit - 1u);
+        used += (uint32_t)(sizeof unit - 1u);
+    }
+    for (len = 0; len <= used; len++) {
+        for (pipe = 0; pipe < 3u; pipe++) {
+            bad += (uint32_t)scan_compare(rich, len, pipe == 2u ? 5u + len : pipe, bad == 0);
+        }
+    }
+    CHECK_EQ(bad, 0);
+}
+
+static void test_scanner_random(void)
+{
+    static const char alphabet[] = "\\\\\\|/~\r\n\t \"=*+-abcwvpq1";
+    char buf[320];
+    uint32_t bad = 0, n;
+    for (n = 0; n < 20000u; n++) {
+        uint32_t len = simd_rand() % 300u, k;
+        for (k = 0; k < len; k++) buf[k] = alphabet[simd_rand() % (sizeof alphabet - 1u)];
+        bad += (uint32_t)scan_compare(buf, len, 2u + n, bad == 0);
+    }
+    CHECK_EQ(bad, 0);
+}
+
 static void run_simd_tests(void)
 {
     RUN(test_simd_path_name);
+    RUN(test_scanner_block_boundaries);
+    RUN(test_scanner_every_length);
+    RUN(test_scanner_random);
 #if USFM__USE_BLOCKS
     RUN(test_bit_helpers);
     RUN(test_classifier_matches_scalar);

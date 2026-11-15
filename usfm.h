@@ -1487,19 +1487,19 @@ static void usfm__classify_block_scalar(const char *p, USFM_BlockMasks *m)
 #endif
 
 #if USFM__USE_BLOCKS
+/* Index of the lowest set bit; x must not be 0. */
 #if defined(__GNUC__) || defined(__clang__)
-static uint32_t usfm__popcount64(uint64_t x) { return (uint32_t)__builtin_popcountll(x); }
 static uint32_t usfm__ctz64(uint64_t x) { return (uint32_t)__builtin_ctzll(x); }
 #else
-static uint32_t usfm__popcount64(uint64_t x)
+static uint32_t usfm__ctz64(uint64_t x)
 {
+    /* Population count of the bits below the lowest set bit. */
+    x = (x & (0 - x)) - 1u;
     x = x - ((x >> 1) & 0x5555555555555555ull);
     x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
     x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0Full;
     return (uint32_t)((x * 0x0101010101010101ull) >> 56);
 }
-/* x must not be 0. */
-static uint32_t usfm__ctz64(uint64_t x) { return usfm__popcount64((x & (0 - x)) - 1u); }
 #endif
 
 /* Bits [from, to) of a block, 0 <= from <= to <= 64. */
@@ -1623,6 +1623,9 @@ typedef struct USFM_Scanner {
     uint8_t     expect_arg;             /* set after a marker that takes one */
     uint8_t     pipe_is_attr;           /* set by the parser before each call */
     uint16_t    reserved;
+    uint32_t    block_base;             /* offset of the cached block, or
+                                           USFM__NO_BLOCK */
+    USFM_BlockMasks block;              /* masks of the cached block */
 } USFM_Scanner;
 
 /* Does the input start with a UTF-16 (FF FE, FE FF) or UTF-32
@@ -1634,12 +1637,14 @@ static int usfm__wide_bom(const char *input, uint32_t length)
     if ((u[0] == 0xFFu && u[1] == 0xFEu) || (u[0] == 0xFEu && u[1] == 0xFFu)) return 1;
     return length >= 4 && u[0] == 0 && u[1] == 0 && u[2] == 0xFEu && u[3] == 0xFFu;
 }
+#define USFM__NO_BLOCK 0xFFFFFFFFu
 
 static void usfm__scan_init(USFM_Scanner *s, const char *input, uint32_t length)
 {
     memset(s, 0, sizeof *s);
     s->input = input;
     s->length = length;
+    s->block_base = USFM__NO_BLOCK;
     if (length >= 3 && (uint8_t)input[0] == 0xEF && (uint8_t)input[1] == 0xBB &&
         (uint8_t)input[2] == 0xBF) {
         s->position = 3;                /* UTF-8 BOM */
@@ -1746,52 +1751,12 @@ static int usfm__scan_argument(USFM_Scanner *s, USFM_ScanToken *t, uint8_t mode)
     return 1;
 }
 
-/* Returns 1 and fills *t, or 0 at end of input. Every call that
- * returns 1 consumes at least one byte, so a caller's loop is bounded
- * by the input length. */
-static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
+/* End of a text run starting at `start` (byte loop); sets *flags. */
+static uint32_t usfm__text_end_scalar(const USFM_Scanner *s, uint32_t start, uint8_t *flags)
 {
     const char *in = s->input;
-    uint32_t len = s->length;
-    uint32_t start, i;
-    uint8_t flags = 0;
-    if (s->expect_arg != USFM_ARG_NONE) {
-        uint8_t mode = s->expect_arg;
-        s->expect_arg = USFM_ARG_NONE;
-        if (usfm__scan_argument(s, t, mode)) return 1;
-    }
-    start = s->position;
-    if (start >= len) return 0;
-    if (in[start] == '\\' && !usfm__is_escape(in, len, start)) return usfm__scan_marker(s, t);
-    if (in[start] == '|' && s->pipe_is_attr) {
-        uint32_t end;
-        i = start + 1;
-        /* Attributes run to the next marker; escapes don't end them. */
-        while (i < len) {
-            if (in[i] == '\\') {
-                /* \= is an escape here only (field guide section 1). */
-                if (!usfm__is_escape(in, len, i) &&
-                    !(i + 1 < len && in[i + 1] == '=')) break;
-                i += 2;
-                continue;
-            }
-            i++;
-        }
-        if (i > len) i = len;
-        end = i;
-        while (end > start + 1 &&
-               (USFM_ByteClass[(uint8_t)in[end - 1]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) end--;
-        usfm__tok(t, USFM_TOK_ATTRIBUTES, start, end);
-        s->position = i;
-        return 1;
-    }
-    if (in[start] == '/' && start + 1 < len && in[start + 1] == '/') {
-        usfm__tok(t, USFM_TOK_OPTBREAK, start, start + 2);
-        s->position = start + 2;
-        return 1;
-    }
-    /* Text: skip quickly over bytes that are not STOP bytes. */
-    i = start;
+    uint32_t len = s->length, i = start;
+    uint8_t f = 0;
     while (i < len) {
         uint8_t b = (uint8_t)in[i];
         if (!(USFM_ByteClass[b] & USFM_BC_STOP)) {
@@ -1802,7 +1767,7 @@ static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
             /* \" is accepted as an escape in text too, as in attributes:
              * deliberate and harmless, since \" can't start a marker. */
             if (!usfm__is_escape(in, len, i)) break;
-            flags |= USFM_TF_HAS_ESCAPE;
+            f |= USFM_TF_HAS_ESCAPE;
             i += 2;
             continue;
         }
@@ -1816,17 +1781,199 @@ static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
             i++;
             continue;
         }
-        if (b == '~') flags |= USFM_TF_HAS_NBSP;
-        else flags |= USFM_TF_HAS_LOOSE_WS;      /* CR, LF, TAB */
+        if (b == '~') f |= USFM_TF_HAS_NBSP;
+        else f |= USFM_TF_HAS_LOOSE_WS;          /* CR, LF, TAB */
         i++;
     }
-    if (i > len) i = len;
+    *flags = f;
+    return i > len ? len : i;
+}
+
+/* End of an attributes run whose first byte after the '|' is at `i`
+ * (byte loop): the next backslash that does not start an escape. */
+static uint32_t usfm__attr_end_scalar(const USFM_Scanner *s, uint32_t i)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    while (i < len) {
+        if (in[i] == '\\') {
+            /* \= is an escape here only (field guide section 1). */
+            if (!usfm__is_escape(in, len, i) && !(i + 1 < len && in[i + 1] == '=')) break;
+            i += 2;
+            continue;
+        }
+        i++;
+    }
+    return i > len ? len : i;
+}
+
+#if USFM__USE_BLOCKS
+/* Makes the 64-byte block at `base` (a multiple of 64, below the input
+ * length) the cached block. A last, partial block is classified from a
+ * zero-padded copy, so nothing past the input is ever read; zero bytes
+ * are not special, so the padding sets no bits. */
+static void usfm__load_block(USFM_Scanner *s, uint32_t base)
+{
+    if (s->block_base == base) return;
+    if (s->length - base >= 64u) {
+        usfm__classify_block(s->input + base, &s->block);
+    } else {
+        char tail[64];
+        memset(tail, 0, sizeof tail);
+        memcpy(tail, s->input + base, s->length - base);
+        usfm__classify_block(tail, &s->block);
+    }
+    s->block_base = base;
+}
+
+/* Adds the flag-only bits of the cached block in [from, to) (input
+ * offsets inside the cached block) to the running results. */
+static void usfm__flag_span(const USFM_Scanner *s, uint32_t from, uint32_t to,
+                            uint64_t *nbsp, uint64_t *loose)
+{
+    uint64_t r;
+    if (to <= from) return;
+    r = usfm__bit_range(from - s->block_base, to - s->block_base);
+    *nbsp |= s->block.nbsp & r;
+    *loose |= s->block.loose_ws & r;
+}
+
+/* End of a text run starting at `start`, from cached block masks. Gives
+ * the same end and flags as usfm__text_end_scalar: escaped bytes are
+ * skipped (so an escaped '~' sets no NBSP flag), and only the stop
+ * candidates ('\', '/', and '|' where attributes are allowed) are
+ * inspected one by one. Bounded: each pass ends the run or advances i. */
+static uint32_t usfm__text_end_blocks(USFM_Scanner *s, uint32_t start, uint8_t *flags)
+{
+    const char *in = s->input;
+    uint32_t len = s->length, i = start;
+    uint64_t nbsp = 0, loose = 0;
+    uint8_t f = 0;
+    while (i < len) {
+        uint32_t base = i & ~63u, block_end = base + 64u, j;
+        uint64_t stops;
+        usfm__load_block(s, base);
+        stops = s->block.backslash | s->block.slash | (s->pipe_is_attr ? s->block.pipe : 0u);
+        stops &= usfm__bit_range(i - base, 64u);
+        if (stops == 0) {                   /* no stop in the rest of this block */
+            usfm__flag_span(s, i, block_end < len ? block_end : len, &nbsp, &loose);
+            i = block_end;
+            continue;
+        }
+        j = base + usfm__ctz64(stops);
+        usfm__flag_span(s, i, j, &nbsp, &loose);
+        if (in[j] == '\\') {
+            if (!usfm__is_escape(in, len, j)) {
+                i = j;
+                break;
+            }
+            f |= USFM_TF_HAS_ESCAPE;
+            i = j + 2u;                     /* skip the escaped byte too */
+        } else if (in[j] == '|') {
+            i = j;
+            break;
+        } else {                            /* '/' */
+            if (j + 1u < len && in[j + 1u] == '/') {
+                i = j;
+                break;
+            }
+            i = j + 1u;
+        }
+    }
+    if (nbsp != 0) f |= USFM_TF_HAS_NBSP;
+    if (loose != 0) f |= USFM_TF_HAS_LOOSE_WS;
+    *flags = f;
+    return i > len ? len : i;
+}
+
+/* End of an attributes run from cached block masks: the next backslash
+ * that starts neither an escape nor "\=". Bounded like the text run. */
+static uint32_t usfm__attr_end_blocks(USFM_Scanner *s, uint32_t i)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    while (i < len) {
+        uint32_t base = i & ~63u, j;
+        uint64_t stops;
+        usfm__load_block(s, base);
+        stops = s->block.backslash & usfm__bit_range(i - base, 64u);
+        if (stops == 0) {
+            i = base + 64u;
+            continue;
+        }
+        j = base + usfm__ctz64(stops);
+        if (!usfm__is_escape(in, len, j) && !(j + 1u < len && in[j + 1u] == '=')) return j;
+        i = j + 2u;
+    }
+    return len;
+}
+#endif /* USFM__USE_BLOCKS */
+
+/* Returns 1 and fills *t, or 0 at end of input. Every call that
+ * returns 1 consumes at least one byte, so a caller's loop is bounded
+ * by the input length. use_blocks selects the cached-block loops (when
+ * compiled in) or the byte loops; results are identical either way. */
+static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_blocks)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    uint32_t start, i;
+    uint8_t flags = 0;
+#if !USFM__USE_BLOCKS
+    (void)use_blocks;
+#endif
+    if (s->expect_arg != USFM_ARG_NONE) {
+        uint8_t mode = s->expect_arg;
+        s->expect_arg = USFM_ARG_NONE;
+        if (usfm__scan_argument(s, t, mode)) return 1;
+    }
+    start = s->position;
+    if (start >= len) return 0;
+    if (in[start] == '\\' && !usfm__is_escape(in, len, start)) return usfm__scan_marker(s, t);
+    if (in[start] == '|' && s->pipe_is_attr) {
+        uint32_t end;
+#if USFM__USE_BLOCKS
+        i = use_blocks ? usfm__attr_end_blocks(s, start + 1u) : usfm__attr_end_scalar(s, start + 1u);
+#else
+        i = usfm__attr_end_scalar(s, start + 1u);
+#endif
+        end = i;
+        while (end > start + 1 &&
+               (USFM_ByteClass[(uint8_t)in[end - 1]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) end--;
+        usfm__tok(t, USFM_TOK_ATTRIBUTES, start, end);
+        s->position = i;
+        return 1;
+    }
+    if (in[start] == '/' && start + 1 < len && in[start + 1] == '/') {
+        usfm__tok(t, USFM_TOK_OPTBREAK, start, start + 2);
+        s->position = start + 2;
+        return 1;
+    }
+#if USFM__USE_BLOCKS
+    i = use_blocks ? usfm__text_end_blocks(s, start, &flags) : usfm__text_end_scalar(s, start, &flags);
+#else
+    i = usfm__text_end_scalar(s, start, &flags);
+#endif
     USFM_ASSERT(i > start);
     usfm__tok(t, USFM_TOK_TEXT, start, i);
     t->tok.level_flags = flags;
     s->position = i;
     return 1;
 }
+
+static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
+{
+    return usfm__scan_next_with(s, t, USFM__USE_BLOCKS);
+}
+
+#if defined(USFM_TEST_SCAN_REFERENCE)
+/* v0.1's byte-loop scanner: the reference the block scanner is tested
+ * against. Test builds only. */
+static int usfm__scan_next_scalar(USFM_Scanner *s, USFM_ScanToken *t)
+{
+    return usfm__scan_next_with(s, t, 0);
+}
+#endif
 
 /* ===== AST handle ===== */
 
