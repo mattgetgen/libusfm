@@ -2,6 +2,7 @@
  * are visible here because this translation unit defines
  * USFM_IMPLEMENTATION. */
 #include <stdlib.h>
+#include <time.h>
 #define USFM_IMPLEMENTATION
 #include "../usfm.h"
 #include "test.h"

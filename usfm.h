@@ -1464,19 +1464,46 @@ typedef struct USFM_Frame {
     uint16_t reserved;
 } USFM_Frame;
 
+/* One past the largest USFM_Marker id (USFM_M_WL = 180). A test checks
+ * every USFM_MarkerRows entry against it. */
+#define USFM__MARKER_ID_COUNT 181u
+/* Slots in a closer table's unknown-name hash set (a power of two). */
+#define USFM__NAME_SLOTS 64u
+
+typedef struct USFM_NameSlot {
+    uint32_t hash;                      /* FNV-1a of the marker name */
+    uint32_t last;                      /* offset of its last closer */
+    uint32_t stamp;                     /* == generation: slot in use */
+} USFM_NameSlot;
+
+/* Where each end marker last appears in one lookahead segment: the
+ * stretch from `start` to the next token that ends every character span
+ * (see usfm__closer_ahead). Entries are valid only when their stamp
+ * equals `generation`, so a rescan never clears the arrays. */
+typedef struct USFM_CloserTable {
+    uint32_t      start;                /* scan position the segment began at */
+    uint32_t      stop;                 /* offset of the stop token, or the
+                                           input length */
+    uint32_t      generation;           /* 0: no segment scanned yet */
+    uint32_t      name_overflow;        /* segment had > USFM__NAME_SLOTS
+                                           distinct unknown closer names */
+    uint32_t      last_closer[USFM__MARKER_ID_COUNT];
+    uint32_t      stamp[USFM__MARKER_ID_COUNT];
+    USFM_NameSlot names[USFM__NAME_SLOTS];
+} USFM_CloserTable;
+
 typedef struct USFM_Parser {
-    USFM_Ast      *ast;
-    USFM_Scanner   scan;
-    USFM_ScanToken peeked;
-    uint8_t        has_peeked;
-    uint8_t        failed;              /* a tree array could not grow */
-    uint8_t        version;             /* resolved; \usfm may change it */
-    uint8_t        version_auto;        /* config said AUTO */
-    uint32_t       depth;
-    uint32_t       last_end;            /* end of the last token placed */
-    uint32_t       lookahead_node;      /* cache for usfm__closer_ahead */
-    uint32_t       lookahead_until;
-    USFM_Frame     stack[USFM_STACK_DEPTH];
+    USFM_Ast        *ast;
+    USFM_Scanner     scan;
+    USFM_ScanToken   peeked;
+    uint8_t          has_peeked;
+    uint8_t          failed;            /* a tree array could not grow */
+    uint8_t          version;           /* resolved; \usfm may change it */
+    uint8_t          version_auto;      /* config said AUTO */
+    uint32_t         depth;
+    uint32_t         last_end;          /* end of the last token placed */
+    USFM_CloserTable closers[2];        /* [in_note]: see usfm__closer_ahead */
+    USFM_Frame       stack[USFM_STACK_DEPTH];
 } USFM_Parser;
 
 static uint8_t usfm__top_kind(const USFM_Parser *p)
@@ -2007,69 +2034,180 @@ static int usfm__frame_matches(const USFM_Parser *p, const USFM_Frame *f,
     return usfm__closer_matches(p, closer, n->marker, offset, length);
 }
 
-/* Does the end marker for (marker, name) appear before the span must
- * end anyway: at a paragraph-level marker, a verse, a cell, or (inside
- * a note) the next note part or the note's end? Scans a copy of the
- * scanner, so it consumes nothing. Bounded by the input length; the
- * cache makes repeated questions about one open span O(1). */
-static int usfm__closer_ahead(USFM_Parser *p, USFM_Marker marker, uint32_t name_offset,
-                              uint32_t name_length, uint32_t cache_node)
+/* 32-bit FNV-1a of an unknown marker's name bytes. */
+static uint32_t usfm__name_hash(const char *name, uint32_t length)
 {
-    USFM_Scanner s;
-    USFM_ScanToken t;
-    int in_note = usfm__find_kind(p, USFM_AST_NOTE) != 0;
-    if (cache_node != USFM_NIL && p->lookahead_node == cache_node &&
-        p->scan.position < p->lookahead_until) {
-        return 1;
+    uint32_t h = 2166136261u, i;
+    for (i = 0; i < length; i++) {
+        h ^= (uint8_t)name[i];
+        h *= 16777619u;
     }
-    s = p->scan;
-    s.pipe_is_attr = 0;
-    while (usfm__scan_next(&s, &t)) {
-        uint8_t role;
-        if (t.tok.kind == USFM_TOK_MARKER_END) {
-            if (usfm__closer_matches(p, &t, marker, name_offset, name_length)) {
-                if (cache_node != USFM_NIL) {
-                    p->lookahead_node = cache_node;
-                    p->lookahead_until = t.tok.span.offset;
-                }
-                return 1;
-            }
-            if (in_note && t.row != USFM_ROW_NONE &&
-                USFM_MarkerRows[t.row].role == USFM_ROLE_NOTE) {
-                return 0;
-            }
-            continue;
-        }
-        if (t.tok.kind != USFM_TOK_MARKER || t.row == USFM_ROW_NONE) continue;
-        role = USFM_MarkerRows[t.row].role;
-        if (role == USFM_ROLE_CHAR || role == USFM_ROLE_NOTE || role == USFM_ROLE_FIGURE ||
-            role == USFM_ROLE_MILESTONE) {
-            continue;
-        }
-        if (role == USFM_ROLE_NOTE_PART && !in_note) continue;
+    return h;
+}
+
+/* Only spaces and tabs between the previous line break (or the start of
+ * the input) and `offset`? Bounded by `offset`. */
+static int usfm__at_line_start(const char *in, uint32_t offset)
+{
+    while (offset > 0 && (in[offset - 1] == ' ' || in[offset - 1] == '\t')) offset--;
+    return offset == 0 || in[offset - 1] == '\n' || in[offset - 1] == '\r';
+}
+
+/* Does marker token `t` end every open character span (the end of a
+ * lookahead segment)? A known marker whose role is not character-level,
+ * a note part or note end marker inside a note, and an unknown marker
+ * that the parser will turn into a paragraph (at line start, not
+ * followed by "|" or "\*"). */
+static int usfm__is_segment_stop(const USFM_Parser *p, const USFM_ScanToken *t, int in_note)
+{
+    const char *in = p->ast->input;
+    uint32_t len = p->ast->input_length, after;
+    uint8_t role;
+    if (t->tok.kind == USFM_TOK_MARKER_END) {
+        return in_note && t->row != USFM_ROW_NONE &&
+               USFM_MarkerRows[t->row].role == USFM_ROLE_NOTE;
+    }
+    if (t->tok.kind != USFM_TOK_MARKER) return 0;
+    if (t->row == USFM_ROW_NONE) {
+        if (!usfm__at_line_start(in, t->tok.span.offset)) return 0;
+        after = usfm__tok_end(t);
+        return !(after < len && (in[after] == '|' ||
+                                 (in[after] == '\\' && after + 1 < len && in[after + 1] == '*')));
+    }
+    role = USFM_MarkerRows[t->row].role;
+    if (role == USFM_ROLE_CHAR || role == USFM_ROLE_NOTE || role == USFM_ROLE_FIGURE ||
+        role == USFM_ROLE_MILESTONE) {
         return 0;
+    }
+    return role != USFM_ROLE_NOTE_PART || in_note;
+}
+
+/* Records an unknown marker's closer at `offset` in c->names. Probing is
+ * bounded by USFM__NAME_SLOTS. */
+static void usfm__record_name(USFM_CloserTable *c, uint32_t hash, uint32_t offset)
+{
+    uint32_t i, slot;
+    for (i = 0; i < USFM__NAME_SLOTS; i++) {
+        USFM_NameSlot *n;
+        slot = (hash + i) & (USFM__NAME_SLOTS - 1u);
+        n = &c->names[slot];
+        if (n->stamp != c->generation) {
+            n->hash = hash;
+            n->last = offset;
+            n->stamp = c->generation;
+            return;
+        }
+        if (n->hash == hash) {
+            n->last = offset;
+            return;
+        }
+    }
+    c->name_overflow = 1;               /* table full: name not recorded */
+}
+
+/* Offset of the last closer recorded for an unknown name, or 0 with
+ * *found = 0. Bounded by USFM__NAME_SLOTS. */
+static uint32_t usfm__lookup_name(const USFM_CloserTable *c, uint32_t hash, int *found)
+{
+    uint32_t i, slot;
+    *found = 0;
+    for (i = 0; i < USFM__NAME_SLOTS; i++) {
+        const USFM_NameSlot *n;
+        slot = (hash + i) & (USFM__NAME_SLOTS - 1u);
+        n = &c->names[slot];
+        if (n->stamp != c->generation) return 0;     /* empty: not present */
+        if (n->hash == hash) {
+            *found = 1;
+            return n->last;
+        }
     }
     return 0;
 }
 
+/* Scans one segment: from the current scan position to the first stop
+ * token (usfm__is_segment_stop), recording the offset of the last end
+ * marker of each marker id, and of each unknown name, in it. Scans a
+ * copy of the scanner, so it consumes nothing. Bounded by the input
+ * length. */
+static void usfm__scan_segment(USFM_Parser *p, USFM_CloserTable *c, int in_note)
+{
+    USFM_Scanner s = p->scan;
+    USFM_ScanToken t;
+    c->generation++;                    /* invalidates every entry */
+    c->start = p->scan.position;
+    c->stop = p->ast->input_length;
+    c->name_overflow = 0;
+    s.pipe_is_attr = 0;
+    while (usfm__scan_next(&s, &t)) {
+        if (usfm__is_segment_stop(p, &t, in_note)) {
+            c->stop = t.tok.span.offset;
+            return;
+        }
+        if (t.tok.kind != USFM_TOK_MARKER_END || t.name_length == 0) continue;
+        if (t.tok.marker == USFM_M_UNKNOWN) {
+            usfm__record_name(c, usfm__name_hash(p->ast->input + t.name_offset, t.name_length),
+                              t.tok.span.offset);
+            continue;
+        }
+        USFM_ASSERT((uint32_t)t.tok.marker < USFM__MARKER_ID_COUNT);
+        c->last_closer[t.tok.marker] = t.tok.span.offset;
+        c->stamp[t.tok.marker] = c->generation;
+    }
+}
+
+/* Does the end marker for (marker, name) appear before the span must
+ * end anyway: at a paragraph-level marker, a verse, a cell, or (inside
+ * a note) the next note part or the note's end?
+ *
+ * Each segment is scanned once (usfm__scan_segment) into a per-segment
+ * closer table, one for in_note = 0 and one for in_note = 1, and every
+ * question about a position inside it is answered in O(1): the closer is
+ * ahead if the last one in the segment starts at or after the current
+ * position. Scan positions only grow, so a rescan starts past the
+ * previous segment's stop and the scans cost O(input length) in total.
+ *
+ * Unknown markers match by a 32-bit FNV-1a hash of their name; two
+ * different names with equal hashes (probability about 2^-32 per pair)
+ * would be treated as the same name. If a segment has more distinct
+ * unknown closer names than USFM__NAME_SLOTS, the extra names are not
+ * recorded and a question about one answers "no": deterministic and
+ * conservative (the span is closed, or the marker stays a milestone). */
+static int usfm__closer_ahead(USFM_Parser *p, USFM_Marker marker, uint32_t name_offset,
+                              uint32_t name_length)
+{
+    int in_note = usfm__find_kind(p, USFM_AST_NOTE) != 0;
+    USFM_CloserTable *c = &p->closers[in_note];
+    uint32_t pos = p->scan.position, last;
+    int found;
+    if (c->generation == 0 || pos < c->start || pos > c->stop) {
+        usfm__scan_segment(p, c, in_note);
+    }
+    if (marker != USFM_M_UNKNOWN) {
+        USFM_ASSERT((uint32_t)marker < USFM__MARKER_ID_COUNT);
+        return c->stamp[marker] == c->generation && c->last_closer[marker] >= pos;
+    }
+    if (name_length == 0) return 0;
+    last = usfm__lookup_name(c, usfm__name_hash(p->ast->input + name_offset, name_length),
+                             &found);
+    return found && last >= pos;
+}
+
+/* A plain (non-\+) character marker inside open character spans closes
+ * them, innermost first, until one whose end marker is still ahead
+ * (usfm__closer_ahead); it nests inside that one. Note parts are never
+ * closed here. Bounded by the stack depth. */
 static void usfm__on_char(USFM_Parser *p, const USFM_ScanToken *t)
 {
-    const USFM_Frame *top;
     usfm__ensure_inline(p, t->tok.span.offset);
-    top = &p->stack[p->depth - 1];
-    if (top->kind == USFM_AST_CHAR && !(top->flags & USFM_FRAME_NOTE_PART) &&
-        !(t->tok.level_flags & USFM_TF_NESTED)) {
-        const USFM_Node *outer = &p->ast->nodes[top->node];
-        uint32_t offset = 0, length = 0;
-        if (outer->marker == USFM_M_UNKNOWN) usfm__node_name(p, top->node, &offset, &length);
-        if (!usfm__closer_ahead(p, outer->marker, offset, length, top->node)) {
-            /* 2.x semantics: a plain character marker closes every open
-             * span (but not note parts). Bounded by the stack depth. */
-            while (p->depth > 1) {
-                const USFM_Frame *f = &p->stack[p->depth - 1];
-                if (f->kind != USFM_AST_CHAR || (f->flags & USFM_FRAME_NOTE_PART)) break;
-                usfm__close_implicit(p);
-            }
+    if (!(t->tok.level_flags & USFM_TF_NESTED)) {
+        while (p->depth > 1) {
+            const USFM_Frame *top = &p->stack[p->depth - 1];
+            const USFM_Node *outer = &p->ast->nodes[top->node];
+            uint32_t offset = 0, length = 0;
+            if (top->kind != USFM_AST_CHAR || (top->flags & USFM_FRAME_NOTE_PART)) break;
+            if (outer->marker == USFM_M_UNKNOWN) usfm__node_name(p, top->node, &offset, &length);
+            if (usfm__closer_ahead(p, outer->marker, offset, length)) break;
+            usfm__close_implicit(p);
         }
     }
     usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0);
@@ -2228,7 +2366,6 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     p.ast = ast;
     p.version_auto = version == USFM_VERSION_AUTO;
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
-    p.lookahead_node = USFM_NIL;
     usfm__scan_init(&p.scan, text, input_length);
     usfm__open(&p, USFM_AST_BOOK, usfm__span(0, input_length), USFM_M_NONE, 0, 0);
     /* The BOOK span covers the whole input, which would otherwise make

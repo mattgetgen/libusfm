@@ -242,7 +242,7 @@ These follow `docs/usfm-field-guide.md` §3.
 | Note part (`\fr \ft \fq \xo \xt` ...) | Every CHAR opened since the note's last note part. | Opens CHAR. |
 | `\f*`, `\x*` ... | Everything inside the note, then the note. | — |
 | `\X*` / `\+X*` | If `X` is open in the current paragraph or note: everything up to and including it. A stray note-part closer is ignored. Any other stray closer gets a diagnostic and is dropped. | — |
-| Plain char marker inside an open char span | Nests if it has a `+`, or if the outer span's `\outer*` appears before the next paragraph-level marker (bounded lookahead). Otherwise it closes the outer span. | Opens CHAR. |
+| Plain char marker inside an open char span | Nests if it has a `+`, or if the outer span's `\outer*` appears before the next paragraph-level marker (bounded lookahead). Otherwise it closes open character spans, innermost first, until one whose end marker appears before the next paragraph-level marker; it nests inside that one. Note parts are never closed this way. | Opens CHAR. |
 | Cell (`\tc# \th# \tcr#` ...) | The previous cell. | Opens CELL. |
 | Unknown marker | Followed by `\*`: a MILESTONE. At line start: a PARA. A matching `\name*` later in the same paragraph: a CHAR. Otherwise: an inline MILESTONE leaf with `USFM_M_UNKNOWN`. Its text is never dropped. | — |
 | End of input | Everything. Unclosed notes get a diagnostic. | — |
@@ -252,6 +252,10 @@ Two rules are judgement calls that the corpus counts will check:
 - `\v` closes open character spans. This is believed to match ParatextData.
 - The lookahead runs only when a plain char marker opens inside another
   span, and it stops at the next paragraph-level marker.
+- Each lookahead segment (up to that stop) is scanned once into a
+  per-segment closer table (last end-marker offset per marker id, plus a
+  small hash set for unknown names), so every question is O(1) and all
+  lookahead is linear in the input.
 
 ### Versions
 
