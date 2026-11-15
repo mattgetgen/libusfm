@@ -1513,9 +1513,11 @@ typedef struct USFM_Scanner {
     uint8_t     expect_arg;             /* set after a marker that takes one */
     uint8_t     pipe_is_attr;           /* set by the parser before each call */
     uint16_t    reserved;
+#if USFM__USE_BLOCKS
     uint32_t    block_base;             /* offset of the cached block, or
                                            USFM__NO_BLOCK */
     USFM_BlockMasks block;              /* masks of the cached block */
+#endif
 } USFM_Scanner;
 
 #define USFM__NO_BLOCK 0xFFFFFFFFu
@@ -1525,7 +1527,9 @@ static void usfm__scan_init(USFM_Scanner *s, const char *input, uint32_t length)
     memset(s, 0, sizeof *s);
     s->input = input;
     s->length = length;
+#if USFM__USE_BLOCKS
     s->block_base = USFM__NO_BLOCK;
+#endif
     if (length >= 3 && (uint8_t)input[0] == 0xEF && (uint8_t)input[1] == 0xBB &&
         (uint8_t)input[2] == 0xBF) {
         s->position = 3;                /* UTF-8 BOM */
