@@ -20,6 +20,7 @@
 #include "test_structure.c"
 #include "test_versions.c"
 #include "test_iter.c"
+#include "test_parse_alloc.c"
 
 int main(void)
 {
@@ -43,6 +44,8 @@ int main(void)
     run_versions_tests();
     fprintf(stderr, "iterators\n");
     run_iter_tests();
+    fprintf(stderr, "parse alloc\n");
+    run_parse_alloc_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;
