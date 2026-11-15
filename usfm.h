@@ -2225,6 +2225,30 @@ static void usfm__on_attributes(USFM_Parser *p, const USFM_ScanToken *t)
     }
 }
 
+static void usfm__on_note(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    USFM_Span arg;
+    uint32_t note = usfm__find_kind(p, USFM_AST_NOTE);
+    if (note != 0) usfm__close_to_depth(p, note - 1);   /* notes can't nest */
+    /* No implied paragraph: USFM 3.1 allows notes directly after \c. */
+    if (usfm__open_tok(p, USFM_AST_NOTE, t, USFM_LEVEL(t->tok.level_flags), 0) == USFM_NIL) return;
+    if (!usfm__take_argument(p, &arg, usfm__tok_end(t))) {
+        usfm__diag(p, USFM_DIAGNOSTIC_MISSING_CALLER, arg, t->tok.marker);
+    }
+}
+
+static void usfm__on_note_part(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    uint32_t note = usfm__find_kind(p, USFM_AST_NOTE);
+    if (note == 0) {                    /* \xt outside a note (3.1) */
+        usfm__on_char(p, t);
+        return;
+    }
+    /* Close the previous part and every span opened inside it. */
+    usfm__close_to_depth(p, note);
+    usfm__open_tok(p, USFM_AST_CHAR, t, USFM_LEVEL(t->tok.level_flags), USFM_FRAME_NOTE_PART);
+}
+
 static void usfm__on_close(USFM_Parser *p, const USFM_ScanToken *t)
 {
     uint32_t d, end = usfm__tok_end(t);
@@ -2266,6 +2290,8 @@ static void usfm__on_marker(USFM_Parser *p, USFM_ScanToken *t)
     case USFM_ROLE_CHAPTER: usfm__on_chapter(p, t); break;
     case USFM_ROLE_VERSE: usfm__on_verse(p, t); break;
     case USFM_ROLE_CHAR: usfm__on_char(p, t); break;
+    case USFM_ROLE_NOTE: usfm__on_note(p, t); break;
+    case USFM_ROLE_NOTE_PART: usfm__on_note_part(p, t); break;
     default:
         /* Roles handled by later sections; keep the marker as a leaf. */
         usfm__append(p, USFM_AST_MILESTONE, t->tok.span, t->tok.marker, 0);
