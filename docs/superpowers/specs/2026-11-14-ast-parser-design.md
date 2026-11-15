@@ -401,5 +401,16 @@ design and plan.
 - **WebAssembly support.** A `build.sh wasm` mode (clang
   `--target=wasm32`), running the unit and corpus tests under Node, plus
   the `USFM_NO_LIBC` path with a caller-supplied allocator. Needs
-  `wasm-ld` (`lld-14`) installed, and a WASI sysroot (`wasi-sdk`) for
+  `wasm-ld` (`lld-14`, installed; clang looks for plain `wasm-ld`, so the
+  build must point at `wasm-ld-14`), and a WASI sysroot (`wasi-sdk`) for
   libc-backed builds.
+  - A throwaway smoke test (2026-11-15) already works: a freestanding
+    wasm32 build with a bump allocator over wasm memory, byte-loop
+    `memcpy`/`memset`/`memcmp` and `USFM_ASSERT` mapped to a trap is a
+    26 KB `.wasm`. Under Node 22 it reproduces the native results on all
+    83 WEB files (2,861,026 nodes, 1,402 chapters, 38,058 verses) at about
+    300 MiB/s, roughly 80% of native.
+  - To fix: `usfm.h` includes `<string.h>` even under `USFM_NO_LIBC`, and
+    freestanding wasm32 has no `string.h` (the smoke test needed a stub
+    header). Under `USFM_NO_LIBC`, don't include it and use internal
+    `usfm__memcpy` / `usfm__memcmp` / `usfm__memset` helpers instead.
