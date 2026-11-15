@@ -940,7 +940,169 @@ static const uint8_t USFM_MarkerSlots[1149] = {
 
 /* ===== Allocator ===== */
 
+/* Every request is rounded to a multiple of 8 (allocator contract). */
+static size_t usfm__round8(size_t size)
+{
+    if (size == 0) size = 1;
+    return (size + 7u) & ~(size_t)7u;
+}
+
+#ifndef USFM_NO_LIBC
+static void *usfm__libc_alloc(void *ctx, size_t size)
+{
+    (void)ctx;
+    return malloc(size);
+}
+static void *usfm__libc_resize(void *ctx, void *ptr, size_t old_size, size_t new_size)
+{
+    (void)ctx;
+    (void)old_size;
+    return realloc(ptr, new_size);
+}
+static void usfm__libc_dealloc(void *ctx, void *ptr, size_t size)
+{
+    (void)ctx;
+    (void)size;
+    free(ptr);
+}
+static const USFM_Alc usfm__libc_alc = {
+    usfm__libc_alloc, usfm__libc_resize, usfm__libc_dealloc, NULL
+};
+#endif
+
+/* The allocator to use, or NULL when none was given and libc is off. */
+static const USFM_Alc *usfm__alc_or_default(const USFM_Alc *alc)
+{
+    if (alc != NULL) return alc;
+#ifndef USFM_NO_LIBC
+    return &usfm__libc_alc;
+#else
+    return NULL;
+#endif
+}
+
+static void *usfm__alloc(const USFM_Alc *alc, size_t size)
+{
+    return alc->alloc(alc->ctx, usfm__round8(size));
+}
+
+static void usfm__free(const USFM_Alc *alc, void *ptr, size_t size)
+{
+    if (ptr != NULL) alc->dealloc(alc->ctx, ptr, usfm__round8(size));
+}
+
+/* Makes room for `needed` elements of elem_size, doubling *capacity.
+ * Returns the (possibly moved) array, or NULL on failure; on failure
+ * the old block stays valid and *capacity is unchanged. */
+static void *usfm__grow(const USFM_Alc *alc, void *array, uint32_t *capacity,
+                        uint32_t elem_size, uint32_t needed)
+{
+    uint64_t new_capacity;
+    void *block;
+    uint32_t i;
+    if (needed <= *capacity) return array;
+    new_capacity = *capacity ? (uint64_t)*capacity * 2u : 8u;
+    /* Bounded: each pass doubles a 64-bit value toward a 32-bit target. */
+    for (i = 0; i < 32 && new_capacity < needed; i++) new_capacity *= 2u;
+    if (new_capacity < needed || new_capacity * elem_size > 0xFFFFFFFFull) return NULL;
+    if (array == NULL) {
+        block = usfm__alloc(alc, (size_t)(new_capacity * elem_size));
+    } else {
+        block = alc->resize(alc->ctx, array,
+                            usfm__round8((size_t)*capacity * elem_size),
+                            usfm__round8((size_t)(new_capacity * elem_size)));
+    }
+    if (block == NULL) return NULL;
+    *capacity = (uint32_t)new_capacity;
+    return block;
+}
+
+USFM_API void USFM_Alc_Free(const USFM_Alc *alc, void *ptr, size_t size)
+{
+    const USFM_Alc *a = usfm__alc_or_default(alc);
+    if (ptr == NULL || a == NULL) return;
+    usfm__free(a, ptr, size);
+}
+
 /* ===== Errors and diagnostics ===== */
+
+static const char *usfm__status_message(uint32_t code)
+{
+    switch (code) {
+    case USFM_OK: return "ok";
+    case USFM_ERR_CAPACITY: return "output buffer too small";
+    case USFM_ERR_DEPTH: return "nesting too deep";
+    case USFM_ERR_INPUT_TOO_LARGE: return "input larger than USFM_INPUT_MAX";
+    case USFM_ERR_INVALID_ARG: return "invalid argument";
+    case USFM_ERR_NOMEM: return "out of memory";
+    case USFM_ERR_NO_ALLOCATOR: return "no allocator (USFM_NO_LIBC)";
+    default: return "unknown error";
+    }
+}
+
+static void usfm__set_err(USFM_Err *err, uint32_t code, uint32_t pos)
+{
+    if (err == NULL) return;
+    err->code = code;
+    err->pos = pos;
+    err->msg = usfm__status_message(code);
+}
+
+static const uint8_t usfm__diag_severity[USFM_DIAGNOSTIC_CODE_COUNT] = {
+    USFM_SEVERITY_NONE,                 /* NONE */
+    USFM_SEVERITY_WARNING,              /* UNKNOWN_MARKER */
+    USFM_SEVERITY_ERROR,                /* UNCLOSED_MARKER */
+    USFM_SEVERITY_ERROR,                /* UNEXPECTED_CLOSE */
+    USFM_SEVERITY_ERROR,                /* INVALID_NESTING */
+    USFM_SEVERITY_ERROR,                /* INVALID_NUMBER */
+    USFM_SEVERITY_ERROR,                /* DUPLICATE_NUMBER */
+    USFM_SEVERITY_ERROR,                /* VERSE_BEFORE_CHAPTER */
+    USFM_SEVERITY_ERROR,                /* INVALID_BOOK_CODE */
+    USFM_SEVERITY_ERROR,                /* MISSING_CALLER */
+    USFM_SEVERITY_ERROR,                /* UNTERMINATED_QUOTE */
+    USFM_SEVERITY_WARNING,              /* UNKNOWN_ATTRIBUTE */
+    USFM_SEVERITY_ERROR,                /* MISSING_ATTRIBUTE */
+    USFM_SEVERITY_ERROR,                /* INVALID_ESCAPE */
+    USFM_SEVERITY_ERROR,                /* MILESTONE_MISMATCH */
+    USFM_SEVERITY_WARNING,              /* UNSUPPORTED_VERSION */
+    USFM_SEVERITY_INFO,                 /* DUPLICATE_STYLE */
+    USFM_SEVERITY_WARNING,              /* IMPLIED_PARAGRAPH */
+    USFM_SEVERITY_ERROR                 /* TOO_DEEP */
+};
+
+static const char *const usfm__diag_message[USFM_DIAGNOSTIC_CODE_COUNT] = {
+    "",
+    "unknown marker",
+    "unclosed marker",
+    "end marker with no open marker",
+    "invalid nesting",
+    "invalid number",
+    "duplicate number",
+    "verse before the first chapter",
+    "invalid book code",
+    "missing note caller",
+    "unterminated attribute quote",
+    "unknown attribute",
+    "missing required attribute",
+    "invalid escape",
+    "milestone start and end do not match",
+    "unsupported USFM version",
+    "style defined more than once",
+    "implied paragraph",
+    "nesting deeper than USFM_STACK_DEPTH"
+};
+
+USFM_API uint8_t USFM_DiagnosticCode_GetSeverity(uint16_t code)
+{
+    return code < USFM_DIAGNOSTIC_CODE_COUNT ? usfm__diag_severity[code]
+                                             : (uint8_t)USFM_SEVERITY_NONE;
+}
+
+USFM_API const char *USFM_DiagnosticCode_GetMessage(uint16_t code)
+{
+    return code < USFM_DIAGNOSTIC_CODE_COUNT ? usfm__diag_message[code]
+                                             : "unknown diagnostic";
+}
 
 /* ===== Marker lookup ===== */
 
