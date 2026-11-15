@@ -149,6 +149,14 @@ extern "C" {
  * implementation still calls memcpy, memcmp and memset (<string.h>),
  * and assert() unless USFM_ASSERT is defined. A freestanding build must
  * provide those three functions and define USFM_ASSERT. */
+/* SIMD: the scanner finds text and attribute boundaries 64 bytes at a
+ * time. The instruction set is chosen at compile time from the
+ * compiler's target macros: AVX-512BW (-mavx512bw), AVX2 (-mavx2), SSE2
+ * (always on x86-64), NEON (ARM64), wasm simd128 (-msimd128); anything
+ * else uses byte loops. There is no runtime CPU detection, so build with
+ * the flags for the machines you target (e.g. -march=native). Define
+ * USFM_SIMD_NONE to force the byte loops. Every path produces identical
+ * results, and none reads past the end of the input. */
 
 #define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
 

@@ -200,6 +200,28 @@ case "$MODE" in
         clang -std=c99 -g -O1 -mavx2 -fsanitize=fuzzer,address,undefined tests/fuzz_ast.c -o build/fuzz_ast
         echo "Run: ./build/fuzz_ast -dict=tests/fuzz/usfm.dict -max_total_time=1800 build/fuzz/corpus tests/fuzz/seeds"
         ;;
+    bench)
+        run_codegen
+        unpack_corpus
+        shift
+        DIRS=("$@")
+        if [[ ${#DIRS[@]} -eq 0 ]]; then DIRS=(build/corpus/WEB); fi
+        VARIANTS=("scalar:-DUSFM_SIMD_NONE" "sse2:-mno-avx2 -mno-avx512f" "avx2:-mno-avx512f")
+        if grep -q ' avx512bw' /proc/cpuinfo; then VARIANTS+=("avx512bw:"); fi
+        PIN=()
+        if [[ -n "${USFM_BENCH_CPU:-}" ]]; then PIN=(taskset -c "$USFM_BENCH_CPU"); fi
+        for entry in "${VARIANTS[@]}"; do
+            name="${entry%%:*}"
+            flags="${entry#*:}"
+            # shellcheck disable=SC2086
+            clang -std=c99 -O3 -march=native $flags tests/bench.c -o "build/bench_$name"
+        done
+        for d in "${DIRS[@]}"; do
+            for entry in "${VARIANTS[@]}"; do
+                "${PIN[@]}" "./build/bench_${entry%%:*}" -n "${USFM_BENCH_PASSES:-5}" "$d"
+            done
+        done
+        ;;
     codegen)
         rm -f build/codegen.stamp
         run_codegen
