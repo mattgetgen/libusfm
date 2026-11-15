@@ -2672,13 +2672,16 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     ast->input = text;
     ast->input_length = input_length;
 
-    /* Initial node capacity from the input length (WEB averages about
-     * one node per 12 bytes); grown x2 as needed. The estimate is capped
+    /* Initial node capacity from the input length: about one node per 6
+     * bytes (WEB averages one per 7, so most books never grow). It is
+     * allocated at exactly this size, not rounded up to a power of two,
+     * and grown x2 only if the tree needs more. The estimate is capped
      * so a huge input never fails on the estimate alone: past the cap,
      * growth allocates only what the tree really needs. */
-    estimate = input_length / 8u + 16u;
+    estimate = input_length / 6u + 16u;
     if (estimate > USFM__NODE_ESTIMATE_MAX) estimate = USFM__NODE_ESTIMATE_MAX;
-    grown = usfm__grow(alc, NULL, &ast->node_capacity, sizeof(USFM_Node), estimate);
+    grown = usfm__alloc(alc, (size_t)estimate * sizeof(USFM_Node));
+    if (grown != NULL) ast->node_capacity = estimate;
     if (grown == NULL) {
         USFM_Ast_Free(ast);
         usfm__set_err(err, USFM_ERR_NOMEM, 0);
