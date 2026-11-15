@@ -10,6 +10,7 @@
 #include "dump.h"
 #include "check.h"
 #include "helpers.h"
+#include "scan_compare.h"
 
 #include "test_basics.c"
 #include "test_markers.c"
