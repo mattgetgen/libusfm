@@ -380,3 +380,26 @@ reported; unclosed notes and figures are reported in every version.
   `build.sh` reruns codegen whenever `codegen/codegen.c` or
   `codegen/markers.h` is newer than `build/codegen.stamp`.
 
+
+## Follow-ups after v0.1
+
+Requested by the user during implementation; each gets its own small
+design and plan.
+
+- **Cross-parser benchmark on this machine.** Add a whole-corpus mode to
+  `main.c` (all 83 WEB files, fastest of N runs, I/O excluded, the method
+  in `~/repos/usfm/RESULTS.md`), then run the other parsers' `./test.sh`
+  in `~/repos/usfm/*/` back to back on the same machine and compare.
+- **Marker-table cache behaviour.** Today: `USFM_MarkerSlots[1149]`
+  (1 byte each) + `USFM_MarkerRows[186]` (16 bytes each, with a pointer to
+  the name) + the name strings, about 4.9 KB in total. Compare against a
+  smaller power-of-two table that stores collisions in the next slot and
+  keeps names inline in the rows (no pointer chase). Measure with a
+  marker-lookup microbenchmark that uses WEB's real marker frequencies
+  and deliberately includes colliding keys, and with full-parse
+  `perf stat` (instructions, L1 misses), not only wall time.
+- **WebAssembly support.** A `build.sh wasm` mode (clang
+  `--target=wasm32`), running the unit and corpus tests under Node, plus
+  the `USFM_NO_LIBC` path with a caller-supplied allocator. Needs
+  `wasm-ld` (`lld-14`) installed, and a WASI sysroot (`wasi-sdk`) for
+  libc-backed builds.
