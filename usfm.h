@@ -1159,7 +1159,9 @@ typedef struct USFM_ScanToken {
 /* Sets t->row, t->tok.marker and the level / milestone bits of
  * t->tok.level_flags from a marker name. Tries the full name first
  * (k1, s1e), then base letters + level digits + optional -s / -e /
- * -<digits> (qt1-s, tc1-2). Anything else is USFM_M_UNKNOWN. */
+ * -<digits> (qt1-s, tc1-2). Anything else is USFM_M_UNKNOWN, including
+ * a level above 15 and -s / -e on a marker that is not a character or
+ * milestone marker (\p-s). */
 static void usfm__classify(const char *name, uint32_t length, USFM_ScanToken *t)
 {
     uint32_t row = usfm__marker_find(name, length);
