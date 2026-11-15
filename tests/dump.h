@@ -136,4 +136,69 @@ static void dump_tokens(const char *input, int pipe_is_attr, char *out, size_t c
     }
 }
 
+static const char *const dump_kind_names[] = {
+    "?", "BOOK", "HEADER", "CHAPTER", "VERSE", "PARA", "CHAR", "NOTE",
+    "MILESTONE", "FIGURE", "TABLE", "ROW", "CELL", "SIDEBAR", "PERIPHERAL",
+    "TEXT", "OPTBREAK", "ARGUMENT", "ATTRIBUTES"
+};
+
+static const char *const dump_diag_names[USFM_DIAGNOSTIC_CODE_COUNT] = {
+    "NONE", "UNKNOWN_MARKER", "UNCLOSED_MARKER", "UNEXPECTED_CLOSE",
+    "INVALID_NESTING", "INVALID_NUMBER", "DUPLICATE_NUMBER",
+    "VERSE_BEFORE_CHAPTER", "INVALID_BOOK_CODE", "MISSING_CALLER",
+    "UNTERMINATED_QUOTE", "UNKNOWN_ATTRIBUTE", "MISSING_ATTRIBUTE",
+    "INVALID_ESCAPE", "MILESTONE_MISMATCH", "UNSUPPORTED_VERSION",
+    "DUPLICATE_STYLE", "IMPLIED_PARAGRAPH", "TOO_DEEP"
+};
+
+static void dump_tree(const USFM_Ast *ast, char *out, size_t cap)
+{
+    DumpOut o;
+    uint32_t count, input_length, depth = 0;
+    uint32_t ends[USFM_STACK_DEPTH + 8];
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    const char *input = USFM_Ast_GetInput(ast, &input_length);
+    o.buf = out;
+    o.cap = cap;
+    o.len = 0;
+    out[0] = '\0';
+    for (uint32_t i = 0; i < count; i++) {
+        const USFM_Node *n = &nodes[i];
+        while (depth > 0 && i >= ends[depth - 1]) depth--;
+        for (uint32_t d = 0; d < depth; d++) dump_puts(&o, "  ");
+        dump_puts(&o, n->kind <= USFM_AST_ATTRIBUTES ? dump_kind_names[n->kind] : "?");
+        if (n->kind == USFM_AST_TEXT || n->kind == USFM_AST_ARGUMENT ||
+            n->kind == USFM_AST_ATTRIBUTES) {
+            dump_putc(&o, ' ');
+            dump_quoted(&o, input, n->span);
+        } else if (n->marker != USFM_M_NONE) {
+            dump_putc(&o, ' ');
+            dump_marker(&o, input, input_length, n->span.offset, n->marker, n->level_flags,
+                        n->kind == USFM_AST_CHAR || n->kind == USFM_AST_MILESTONE);
+        }
+        if (n->kind == USFM_AST_PARA && (n->level_flags & USFM_NF_IMPLIED)) dump_puts(&o, " implied");
+        if (n->kind == USFM_AST_PARA && (n->level_flags & USFM_NF_HEADING)) dump_puts(&o, " heading");
+        if (n->kind == USFM_AST_MILESTONE && (n->level_flags & USFM_TF_SELF_CLOSED)) dump_puts(&o, " closed");
+        dump_putc(&o, '\n');
+        if (depth < sizeof ends / sizeof ends[0]) ends[depth++] = n->end;
+    }
+}
+
+static void dump_diags(const USFM_Ast *ast, char *out, size_t cap)
+{
+    DumpOut o;
+    uint32_t count;
+    const USFM_Diagnostic *diags = USFM_Ast_GetDiagnostics(ast, &count);
+    o.buf = out;
+    o.cap = cap;
+    o.len = 0;
+    out[0] = '\0';
+    for (uint32_t i = 0; i < count; i++) {
+        char number[16];
+        dump_puts(&o, diags[i].code < USFM_DIAGNOSTIC_CODE_COUNT ? dump_diag_names[diags[i].code] : "?");
+        snprintf(number, sizeof number, " %u\n", (unsigned)diags[i].span.offset);
+        dump_puts(&o, number);
+    }
+}
+
 #endif

@@ -1416,9 +1416,747 @@ static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
 
 /* ===== AST handle ===== */
 
+struct USFM_Ast {
+    USFM_Alc           alc;                 /* copy of the caller's allocator */
+    const char        *input;
+    char              *owned_input;         /* USFM_PARSE_COPY_INPUT, else NULL */
+    uint32_t           input_length;
+    uint8_t            version;             /* resolved enum USFM_Version */
+    uint8_t            chapters_sorted;     /* strictly increasing numbers */
+    uint8_t            verses_sorted;       /* strictly increasing per chapter */
+    uint8_t            reserved;
+    USFM_Node         *nodes;
+    uint32_t           node_count, node_capacity;
+    USFM_ChapterEntry *chapters;
+    uint32_t           chapter_count, chapter_capacity;
+    USFM_VerseEntry   *verses;
+    uint32_t           verse_count, verse_capacity;
+    USFM_Diagnostic   *diagnostics;
+    uint32_t           diagnostic_count, diagnostic_capacity;
+    uint32_t           dropped_diagnostics;
+    uint32_t           first_dropped_offset;
+    uint32_t           max_chapter;
+    char               book_code[4];        /* NUL-terminated */
+};
+
+USFM_API void USFM_Ast_Free(USFM_Ast *ast)
+{
+    USFM_Alc alc;
+    if (ast == NULL) return;
+    alc = ast->alc;
+    usfm__free(&alc, ast->nodes, (size_t)ast->node_capacity * sizeof(USFM_Node));
+    usfm__free(&alc, ast->chapters, (size_t)ast->chapter_capacity * sizeof(USFM_ChapterEntry));
+    usfm__free(&alc, ast->verses, (size_t)ast->verse_capacity * sizeof(USFM_VerseEntry));
+    usfm__free(&alc, ast->diagnostics,
+               (size_t)ast->diagnostic_capacity * sizeof(USFM_Diagnostic));
+    usfm__free(&alc, ast->owned_input, ast->input_length);
+    usfm__free(&alc, ast, sizeof(USFM_Ast));
+}
+
 /* ===== Parser ===== */
 
+enum { USFM_FRAME_NOTE_PART = 0x01 };
+
+typedef struct USFM_Frame {
+    uint32_t node;
+    uint8_t  kind;                      /* USFM_AST_* of the node */
+    uint8_t  flags;                     /* USFM_FRAME_* */
+    uint16_t reserved;
+} USFM_Frame;
+
+typedef struct USFM_Parser {
+    USFM_Ast      *ast;
+    USFM_Scanner   scan;
+    USFM_ScanToken peeked;
+    uint8_t        has_peeked;
+    uint8_t        failed;              /* a tree array could not grow */
+    uint8_t        version;             /* resolved; \usfm may change it */
+    uint8_t        version_auto;        /* config said AUTO */
+    uint32_t       depth;
+    uint32_t       last_end;            /* end of the last token placed */
+    uint32_t       lookahead_node;      /* cache for usfm__closer_ahead */
+    uint32_t       lookahead_until;
+    USFM_Frame     stack[USFM_STACK_DEPTH];
+} USFM_Parser;
+
+static uint8_t usfm__top_kind(const USFM_Parser *p)
+{
+    return p->stack[p->depth - 1].kind;
+}
+
+static int usfm__is_block(uint8_t kind)
+{
+    return kind == USFM_AST_BOOK || kind == USFM_AST_SIDEBAR || kind == USFM_AST_PERIPHERAL;
+}
+
+static int usfm__is_blank(const char *in, USFM_Span s)
+{
+    uint32_t i;
+    for (i = 0; i < s.length; i++) {
+        char c = in[s.offset + i];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') return 0;
+    }
+    return 1;
+}
+
+static int usfm__next(USFM_Parser *p, USFM_ScanToken *t)
+{
+    uint8_t top;
+    if (p->has_peeked) {
+        *t = p->peeked;
+        p->has_peeked = 0;
+        return 1;
+    }
+    top = usfm__top_kind(p);
+    p->scan.pipe_is_attr = (uint8_t)(top == USFM_AST_CHAR || top == USFM_AST_MILESTONE ||
+                                     top == USFM_AST_FIGURE || top == USFM_AST_PERIPHERAL);
+    return usfm__scan_next(&p->scan, t);
+}
+
+static void usfm__push_back(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    p->peeked = *t;
+    p->has_peeked = 1;
+}
+
+/* Diagnostics never fail the parse: if the array can't grow, the
+ * diagnostic is counted as dropped. */
+static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marker marker)
+{
+    USFM_Ast *ast = p->ast;
+    USFM_Diagnostic *d;
+    if (ast->diagnostic_count == ast->diagnostic_capacity) {
+        void *grown = usfm__grow(&ast->alc, ast->diagnostics, &ast->diagnostic_capacity,
+                                 sizeof(USFM_Diagnostic), ast->diagnostic_count + 1);
+        if (grown == NULL) {
+            if (ast->dropped_diagnostics == 0) ast->first_dropped_offset = span.offset;
+            ast->dropped_diagnostics++;
+            return;
+        }
+        ast->diagnostics = (USFM_Diagnostic *)grown;
+    }
+    d = &ast->diagnostics[ast->diagnostic_count++];
+    d->span = span;
+    d->code = code;
+    d->marker = marker;
+}
+
+/* Appends a node as a child of the top frame. Returns its index, or
+ * USFM_NIL (and sets p->failed) if the node array can't grow. */
+static uint32_t usfm__append(USFM_Parser *p, uint8_t kind, USFM_Span span,
+                             USFM_Marker marker, uint8_t level_flags)
+{
+    USFM_Ast *ast = p->ast;
+    USFM_Node *n;
+    uint32_t index, span_end;
+    if (p->failed) return USFM_NIL;
+    if (ast->node_count == ast->node_capacity) {
+        void *grown = usfm__grow(&ast->alc, ast->nodes, &ast->node_capacity,
+                                 sizeof(USFM_Node), ast->node_count + 1);
+        if (grown == NULL) {
+            p->failed = 1;
+            return USFM_NIL;
+        }
+        ast->nodes = (USFM_Node *)grown;
+    }
+    index = ast->node_count++;
+    n = &ast->nodes[index];
+    n->parent = p->depth > 0 ? p->stack[p->depth - 1].node : USFM_NIL;
+    n->end = index + 1;
+    n->span = span;
+    n->marker = marker;
+    n->kind = kind;
+    n->level_flags = level_flags;
+    span_end = span.offset + span.length;
+    if (span_end > p->last_end) p->last_end = span_end;
+    return index;
+}
+
+/* Appends a container and pushes it. Returns USFM_NIL if the stack is
+ * full (diagnostic added) or memory ran out (p->failed). */
+static uint32_t usfm__open(USFM_Parser *p, uint8_t kind, USFM_Span span, USFM_Marker marker,
+                           uint8_t level_flags, uint8_t frame_flags)
+{
+    uint32_t node;
+    if (p->depth >= USFM_STACK_DEPTH) {
+        usfm__diag(p, USFM_DIAGNOSTIC_TOO_DEEP, span, marker);
+        return USFM_NIL;
+    }
+    node = usfm__append(p, kind, span, marker, level_flags);
+    if (node == USFM_NIL) return USFM_NIL;
+    p->stack[p->depth].node = node;
+    p->stack[p->depth].kind = kind;
+    p->stack[p->depth].flags = frame_flags;
+    p->stack[p->depth].reserved = 0;
+    p->depth++;
+    return node;
+}
+
+/* Opens a container for a marker token. If the stack is full, the
+ * marker is kept as plain text instead. */
+static uint32_t usfm__open_tok(USFM_Parser *p, uint8_t kind, const USFM_ScanToken *t,
+                               uint8_t level_flags, uint8_t frame_flags)
+{
+    uint32_t node = usfm__open(p, kind, t->tok.span, t->tok.marker, level_flags, frame_flags);
+    if (node == USFM_NIL && !p->failed) {
+        usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE, 0);
+    }
+    return node;
+}
+
+/* Pops the top frame. Its span grows to the last byte placed inside it
+ * (or to an end marker the caller just accounted for in last_end). */
+static void usfm__close_top(USFM_Parser *p)
+{
+    USFM_Frame *f;
+    USFM_Node *n;
+    USFM_ASSERT(p->depth > 1);
+    f = &p->stack[--p->depth];
+    n = &p->ast->nodes[f->node];
+    n->end = p->ast->node_count;
+    if (p->last_end > n->span.offset + n->span.length) {
+        n->span.length = p->last_end - n->span.offset;
+    }
+}
+
+/* Closes the top frame without an end marker, reporting it when the
+ * version requires an explicit close. */
+static void usfm__close_implicit(USFM_Parser *p)
+{
+    const USFM_Frame *f = &p->stack[p->depth - 1];
+    const USFM_Node *n = &p->ast->nodes[f->node];
+    int report = f->kind == USFM_AST_NOTE || f->kind == USFM_AST_FIGURE ||
+                 (f->kind == USFM_AST_CHAR && !(f->flags & USFM_FRAME_NOTE_PART) &&
+                  p->version >= USFM_VERSION_3_1);
+    if (report) usfm__diag(p, USFM_DIAGNOSTIC_UNCLOSED_MARKER, n->span, n->marker);
+    usfm__close_top(p);
+}
+
+/* Bounded by the stack depth. */
+static void usfm__close_to_depth(USFM_Parser *p, uint32_t depth)
+{
+    while (p->depth > depth && p->depth > 1) usfm__close_implicit(p);
+}
+
+/* Closes everything above the nearest BOOK / SIDEBAR / PERIPHERAL
+ * (and above a TABLE too, if keep_table). */
+static void usfm__close_to_block(USFM_Parser *p, int keep_table)
+{
+    while (p->depth > 1) {
+        uint8_t k = usfm__top_kind(p);
+        if (usfm__is_block(k) || (keep_table && k == USFM_AST_TABLE)) break;
+        usfm__close_implicit(p);
+    }
+}
+
+/* Depth (index + 1) of the nearest open frame of `kind`, or 0. */
+static uint32_t usfm__find_kind(const USFM_Parser *p, uint8_t kind)
+{
+    uint32_t d;
+    for (d = p->depth; d > 0; d--) {
+        if (p->stack[d - 1].kind == kind) return d;
+    }
+    return 0;
+}
+
+/* Trims trailing whitespace from the last TEXT node if it belongs to the
+ * open top container, removing the node if nothing is left. Called
+ * before paragraph-level markers, \v and the end of input. */
+static void usfm__trim_last_text(USFM_Parser *p)
+{
+    USFM_Ast *ast = p->ast;
+    USFM_Node *n;
+    if (ast->node_count == 0) return;
+    n = &ast->nodes[ast->node_count - 1];
+    if (n->kind != USFM_AST_TEXT || n->parent != p->stack[p->depth - 1].node) return;
+    while (n->span.length > 0) {
+        char c = ast->input[n->span.offset + n->span.length - 1];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+        n->span.length--;
+    }
+    if (n->span.length == 0) ast->node_count--;
+}
+
+/* Inline content with no paragraph open gets an implied \p. */
+static void usfm__ensure_inline(USFM_Parser *p, uint32_t offset)
+{
+    uint8_t k = usfm__top_kind(p);
+    USFM_Span at;
+    if (!usfm__is_block(k) && k != USFM_AST_TABLE) return;
+    at = usfm__span(offset, 0);
+    usfm__diag(p, USFM_DIAGNOSTIC_IMPLIED_PARAGRAPH, at, USFM_M_P);
+    usfm__open(p, USFM_AST_PARA, at, USFM_M_P, USFM_NF_IMPLIED, 0);
+}
+
+/* Takes the ARGUMENT token the scanner produced after a marker, as a
+ * leaf child of the top frame. Returns 0 if there was none (the next
+ * token is pushed back; *arg is a zero-length span at `missing_at`). */
+static int usfm__take_argument(USFM_Parser *p, USFM_Span *arg, uint32_t missing_at)
+{
+    USFM_ScanToken t;
+    if (usfm__next(p, &t)) {
+        if (t.tok.kind == USFM_TOK_ARGUMENT) {
+            usfm__append(p, USFM_AST_ARGUMENT, t.tok.span, USFM_M_NONE, 0);
+            *arg = t.tok.span;
+            return 1;
+        }
+        usfm__push_back(p, &t);
+    }
+    *arg = usfm__span(missing_at, 0);
+    return 0;
+}
+
+static uint32_t usfm__tok_end(const USFM_ScanToken *t)
+{
+    return t->tok.span.offset + t->tok.span.length;
+}
+
+/* Reads decimal digits at in[*i]; fails on no digits or > 65535. */
+static int usfm__read_uint(const char *in, uint32_t *i, uint32_t end, uint32_t *value)
+{
+    uint32_t start = *i, v = 0;
+    while (*i < end && in[*i] >= '0' && in[*i] <= '9') {
+        if (v <= 65535u) v = v * 10u + (uint32_t)(in[*i] - '0');
+        (*i)++;
+    }
+    *value = v;
+    return *i > start && v <= 65535u;
+}
+
+/* "3", "3a", "3-5", "3a-5b". Returns 0 if malformed; *ref keeps what
+ * was read. */
+static int usfm__parse_verse(const char *in, USFM_Span s, USFM_VerseRef *ref)
+{
+    uint32_t i = s.offset, end = s.offset + s.length, v;
+    if (!usfm__read_uint(in, &i, end, &v)) return 0;
+    ref->verse_first = ref->verse_last = (uint16_t)v;
+    if (i < end && in[i] >= 'a' && in[i] <= 'z') {
+        ref->segment_first = ref->segment_last = (uint8_t)(in[i] - 'a' + 1);
+        i++;
+    }
+    if (i < end && in[i] == '-') {
+        i++;
+        if (!usfm__read_uint(in, &i, end, &v)) return 0;
+        ref->verse_last = (uint16_t)v;
+        ref->segment_last = 0;
+        if (i < end && in[i] >= 'a' && in[i] <= 'z') {
+            ref->segment_last = (uint8_t)(in[i] - 'a' + 1);
+            i++;
+        }
+        if (ref->verse_last < ref->verse_first) return 0;
+    }
+    return i == end;
+}
+
+/* Three bytes, A-Z or 0-9, at least one letter (USFM 3.1.1). */
+static int usfm__valid_book_code(const char *in, USFM_Span s)
+{
+    uint32_t i;
+    int letters = 0;
+    if (s.length != 3) return 0;
+    for (i = 0; i < 3; i++) {
+        char c = in[s.offset + i];
+        if (c >= 'A' && c <= 'Z') letters++;
+        else if (c < '0' || c > '9') return 0;
+    }
+    return letters > 0;
+}
+
+/* The most recent verse ends where the next verse or chapter starts. */
+static void usfm__end_open_verse(USFM_Parser *p, uint32_t node)
+{
+    USFM_Ast *ast = p->ast;
+    if (ast->verse_count > 0 && ast->verses[ast->verse_count - 1].end_node == USFM_NIL) {
+        ast->verses[ast->verse_count - 1].end_node = node;
+    }
+}
+
+static void usfm__add_chapter(USFM_Parser *p, uint32_t node, uint32_t number)
+{
+    USFM_Ast *ast = p->ast;
+    USFM_ChapterEntry *e;
+    void *grown;
+    usfm__end_open_verse(p, node);
+    if (ast->chapter_count > 0) {
+        USFM_ChapterEntry *prev = &ast->chapters[ast->chapter_count - 1];
+        prev->end_node = node;
+        if (number <= prev->number) ast->chapters_sorted = 0;
+    }
+    grown = usfm__grow(&ast->alc, ast->chapters, &ast->chapter_capacity,
+                       sizeof(USFM_ChapterEntry), ast->chapter_count + 1);
+    if (grown == NULL) {
+        p->failed = 1;
+        return;
+    }
+    ast->chapters = (USFM_ChapterEntry *)grown;
+    e = &ast->chapters[ast->chapter_count++];
+    memset(e, 0, sizeof *e);
+    e->number = (uint16_t)number;
+    e->node = node;
+    e->end_node = USFM_NIL;
+    e->first_verse = ast->verse_count;
+    if (number > ast->max_chapter) ast->max_chapter = number;
+}
+
+static void usfm__add_verse(USFM_Parser *p, uint32_t node, const USFM_VerseRef *ref)
+{
+    USFM_Ast *ast = p->ast;
+    USFM_VerseEntry *e;
+    void *grown;
+    usfm__end_open_verse(p, node);
+    grown = usfm__grow(&ast->alc, ast->verses, &ast->verse_capacity,
+                       sizeof(USFM_VerseEntry), ast->verse_count + 1);
+    if (grown == NULL) {
+        p->failed = 1;
+        return;
+    }
+    ast->verses = (USFM_VerseEntry *)grown;
+    e = &ast->verses[ast->verse_count++];
+    e->ref = *ref;
+    e->node = node;
+    e->end_node = USFM_NIL;
+    if (ast->chapter_count > 0) {
+        USFM_ChapterEntry *chapter = &ast->chapters[ast->chapter_count - 1];
+        if (chapter->verse_count > 0 &&
+            ast->verses[ast->verse_count - 2].ref.verse_first >= ref->verse_first) {
+            ast->verses_sorted = 0;
+        }
+        chapter->verse_count++;
+    }
+}
+
+static void usfm__set_version(USFM_Parser *p, USFM_Span arg)
+{
+    const char *s = p->ast->input + arg.offset;
+    uint32_t i = 0, major = 0, minor = 0;
+    uint8_t v;
+    if (!p->version_auto) return;
+    while (i < arg.length && s[i] >= '0' && s[i] <= '9' && major < 100) major = major * 10u + (uint32_t)(s[i++] - '0');
+    if (i < arg.length && s[i] == '.') {
+        i++;
+        while (i < arg.length && s[i] >= '0' && s[i] <= '9' && minor < 100) minor = minor * 10u + (uint32_t)(s[i++] - '0');
+    }
+    if (major == 1) v = USFM_VERSION_1;
+    else if (major == 2) v = USFM_VERSION_2;
+    else if (major == 3 && minor == 0) v = USFM_VERSION_3_0;
+    else if (major == 3) v = USFM_VERSION_3_1;
+    else {
+        usfm__diag(p, USFM_DIAGNOSTIC_UNSUPPORTED_VERSION, arg, USFM_M_USFM);
+        v = USFM_VERSION_3_1;
+    }
+    p->version = v;
+}
+
+static void usfm__on_text(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    uint8_t k = usfm__top_kind(p);
+    if ((usfm__is_block(k) || k == USFM_AST_TABLE || k == USFM_AST_MILESTONE) &&
+        usfm__is_blank(p->ast->input, t->tok.span)) {
+        return;                         /* layout whitespace between blocks */
+    }
+    usfm__ensure_inline(p, t->tok.span.offset);
+    usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
+                 (uint8_t)(t->tok.level_flags & USFM_TEXT_FLAGS_COOK));
+}
+
+static void usfm__on_optbreak(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    usfm__ensure_inline(p, t->tok.span.offset);
+    usfm__append(p, USFM_AST_OPTBREAK, t->tok.span, USFM_M_NONE, 0);
+}
+
+static void usfm__on_para(USFM_Parser *p, const USFM_ScanToken *t, uint8_t kind)
+{
+    const USFM_MarkerRow *row = &USFM_MarkerRows[t->row];
+    uint8_t level_flags = USFM_LEVEL(t->tok.level_flags);
+    uint32_t node;
+    USFM_Span arg;
+    usfm__trim_last_text(p);
+    usfm__close_to_block(p, 0);
+    if (kind == USFM_AST_PARA && (row->props & USFM_MP_HEADING)) level_flags |= USFM_NF_HEADING;
+    node = usfm__open_tok(p, kind, t, level_flags, 0);
+    if (node == USFM_NIL || !(row->props & USFM_MP_ARG_WORD)) return;
+    if (usfm__take_argument(p, &arg, usfm__tok_end(t)) && t->tok.marker == USFM_M_USFM) {
+        usfm__set_version(p, arg);
+    }
+}
+
+static void usfm__on_id(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    USFM_Ast *ast = p->ast;
+    USFM_Span arg;
+    int has;
+    usfm__trim_last_text(p);
+    usfm__close_to_depth(p, 1);
+    if (usfm__open_tok(p, USFM_AST_HEADER, t, 0, 0) == USFM_NIL) return;
+    has = usfm__take_argument(p, &arg, usfm__tok_end(t));
+    if (!has || !usfm__valid_book_code(ast->input, arg)) {
+        usfm__diag(p, USFM_DIAGNOSTIC_INVALID_BOOK_CODE, arg, USFM_M_ID);
+    }
+    if (has && arg.length == 3 && ast->book_code[0] == '\0') {
+        memcpy(ast->book_code, ast->input + arg.offset, 3);
+        ast->book_code[3] = '\0';
+    }
+}
+
+static void usfm__on_chapter(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    USFM_Span arg;
+    uint32_t node, number = 0, i;
+    int valid;
+    usfm__trim_last_text(p);
+    usfm__close_to_depth(p, 1);
+    node = usfm__open_tok(p, USFM_AST_CHAPTER, t, 0, 0);
+    if (node == USFM_NIL) return;
+    valid = usfm__take_argument(p, &arg, usfm__tok_end(t));
+    usfm__close_top(p);
+    i = arg.offset;
+    valid = valid && usfm__read_uint(p->ast->input, &i, arg.offset + arg.length, &number) &&
+            i == arg.offset + arg.length && number > 0;
+    if (!valid) {
+        usfm__diag(p, USFM_DIAGNOSTIC_INVALID_NUMBER, arg, USFM_M_C);
+        number = 0;
+    }
+    usfm__add_chapter(p, node, number);
+}
+
+static void usfm__on_verse(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    USFM_Ast *ast = p->ast;
+    USFM_VerseRef ref;
+    USFM_Span arg;
+    uint32_t node, note;
+    uint8_t k;
+    usfm__trim_last_text(p);
+    /* A verse can't be inside a note: the note was left open. */
+    note = usfm__find_kind(p, USFM_AST_NOTE);
+    if (note != 0) usfm__close_to_depth(p, note - 1);
+    /* Character spans end at a verse. Bounded by the stack depth. */
+    while (p->depth > 1) {
+        k = usfm__top_kind(p);
+        if (k != USFM_AST_CHAR && k != USFM_AST_MILESTONE && k != USFM_AST_FIGURE) break;
+        usfm__close_implicit(p);
+    }
+    /* A verse inside a heading closes the heading. */
+    k = usfm__top_kind(p);
+    if (p->depth > 1 &&
+        (k == USFM_AST_HEADER ||
+         (k == USFM_AST_PARA && (ast->nodes[p->stack[p->depth - 1].node].level_flags & USFM_NF_HEADING)))) {
+        usfm__close_implicit(p);
+    }
+    usfm__ensure_inline(p, t->tok.span.offset);
+    node = usfm__open_tok(p, USFM_AST_VERSE, t, 0, 0);
+    if (node == USFM_NIL) return;
+    memset(&ref, 0, sizeof ref);
+    if (!usfm__take_argument(p, &arg, usfm__tok_end(t)) ||
+        !usfm__parse_verse(ast->input, arg, &ref)) {
+        usfm__diag(p, USFM_DIAGNOSTIC_INVALID_NUMBER, arg, USFM_M_V);
+    }
+    usfm__close_top(p);
+    if (ast->chapter_count == 0) {
+        usfm__diag(p, USFM_DIAGNOSTIC_VERSE_BEFORE_CHAPTER, t->tok.span, USFM_M_V);
+    } else {
+        ref.chapter = ast->chapters[ast->chapter_count - 1].number;
+    }
+    usfm__add_verse(p, node, &ref);
+}
+
+static void usfm__on_close(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    /* Replaced in Task 6. */
+    usfm__diag(p, USFM_DIAGNOSTIC_UNEXPECTED_CLOSE, t->tok.span, t->tok.marker);
+}
+
+static void usfm__on_marker(USFM_Parser *p, USFM_ScanToken *t)
+{
+    uint8_t role = t->row == USFM_ROW_NONE ? 0 : USFM_MarkerRows[t->row].role;
+    switch (role) {
+    case USFM_ROLE_PARA: usfm__on_para(p, t, USFM_AST_PARA); break;
+    case USFM_ROLE_HEADER: usfm__on_para(p, t, USFM_AST_HEADER); break;
+    case USFM_ROLE_ID: usfm__on_id(p, t); break;
+    case USFM_ROLE_CHAPTER: usfm__on_chapter(p, t); break;
+    case USFM_ROLE_VERSE: usfm__on_verse(p, t); break;
+    default:
+        /* Roles handled by later sections; keep the marker as a leaf. */
+        usfm__append(p, USFM_AST_MILESTONE, t->tok.span, t->tok.marker, 0);
+        break;
+    }
+}
+
+/* The main loop. Bounded: every token consumes at least one input byte,
+ * and a pushed-back token is consumed by the next iteration. */
+static void usfm__parse(USFM_Parser *p)
+{
+    USFM_ScanToken t;
+    while (!p->failed && usfm__next(p, &t)) {
+        switch (t.tok.kind) {
+        case USFM_TOK_TEXT: usfm__on_text(p, &t); break;
+        case USFM_TOK_ARGUMENT: usfm__on_text(p, &t); break;   /* unclaimed */
+        case USFM_TOK_ATTRIBUTES: usfm__on_text(p, &t); break; /* Task 6 */
+        case USFM_TOK_OPTBREAK: usfm__on_optbreak(p, &t); break;
+        case USFM_TOK_MARKER_END: usfm__on_close(p, &t); break;
+        case USFM_TOK_MARKER: usfm__on_marker(p, &t); break;
+        default: break;
+        }
+    }
+}
+
+static void usfm__finish(USFM_Parser *p)
+{
+    USFM_Ast *ast = p->ast;
+    usfm__trim_last_text(p);
+    while (p->depth > 1) usfm__close_implicit(p);
+    ast->nodes[0].end = ast->node_count;
+    if (ast->chapter_count > 0 && ast->chapters[ast->chapter_count - 1].end_node == USFM_NIL) {
+        ast->chapters[ast->chapter_count - 1].end_node = ast->node_count;
+    }
+    if (ast->verse_count > 0 && ast->verses[ast->verse_count - 1].end_node == USFM_NIL) {
+        ast->verses[ast->verse_count - 1].end_node = ast->node_count;
+    }
+}
+
+USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
+                                      const USFM_Config *config, uint32_t flags,
+                                      const USFM_Alc *alc_in, USFM_Err *err)
+{
+    const USFM_Alc *alc = usfm__alc_or_default(alc_in);
+    USFM_Ast *ast;
+    USFM_Parser p;
+    const char *text = input != NULL ? input : "";
+    uint8_t version = config != NULL ? config->version : (uint8_t)USFM_VERSION_AUTO;
+    void *grown;
+
+    usfm__set_err(err, USFM_OK, 0);
+    if (alc == NULL) {
+        usfm__set_err(err, USFM_ERR_NO_ALLOCATOR, 0);
+        return NULL;
+    }
+    if ((input == NULL && input_length > 0) || version > USFM_VERSION_3_1) {
+        usfm__set_err(err, USFM_ERR_INVALID_ARG, 0);
+        return NULL;
+    }
+    if (input_length > USFM_INPUT_MAX) {
+        usfm__set_err(err, USFM_ERR_INPUT_TOO_LARGE, 0);
+        return NULL;
+    }
+    ast = (USFM_Ast *)usfm__alloc(alc, sizeof(USFM_Ast));
+    if (ast == NULL) {
+        usfm__set_err(err, USFM_ERR_NOMEM, 0);
+        return NULL;
+    }
+    memset(ast, 0, sizeof *ast);
+    ast->alc = *alc;
+    ast->chapters_sorted = 1;
+    ast->verses_sorted = 1;
+    if ((flags & USFM_PARSE_COPY_INPUT) && input_length > 0) {
+        ast->owned_input = (char *)usfm__alloc(alc, input_length);
+        if (ast->owned_input == NULL) {
+            USFM_Ast_Free(ast);
+            usfm__set_err(err, USFM_ERR_NOMEM, 0);
+            return NULL;
+        }
+        memcpy(ast->owned_input, input, input_length);
+        text = ast->owned_input;
+    }
+    ast->input = text;
+    ast->input_length = input_length;
+
+    /* Initial node capacity from the input length (WEB averages about
+     * one node per 12 bytes); grown x2 as needed. */
+    grown = usfm__grow(alc, NULL, &ast->node_capacity, sizeof(USFM_Node), input_length / 8u + 16u);
+    if (grown == NULL) {
+        USFM_Ast_Free(ast);
+        usfm__set_err(err, USFM_ERR_NOMEM, 0);
+        return NULL;
+    }
+    ast->nodes = (USFM_Node *)grown;
+
+    memset(&p, 0, sizeof p);
+    p.ast = ast;
+    p.version_auto = version == USFM_VERSION_AUTO;
+    p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
+    p.lookahead_node = USFM_NIL;
+    usfm__scan_init(&p.scan, text, input_length);
+    usfm__open(&p, USFM_AST_BOOK, usfm__span(0, input_length), USFM_M_NONE, 0, 0);
+    usfm__parse(&p);
+    if (!p.failed) usfm__finish(&p);
+    if (p.failed) {
+        uint32_t pos = p.scan.position;
+        USFM_Ast_Free(ast);
+        usfm__set_err(err, USFM_ERR_NOMEM, pos);
+        return NULL;
+    }
+    ast->version = p.version;
+    if (ast->dropped_diagnostics > 0) {
+        usfm__set_err(err, USFM_ERR_NOMEM, ast->first_dropped_offset);
+    }
+    return ast;
+}
+
+USFM_API USFM_Ast *USFM_Ast_Parse(const char *input, uint32_t input_length,
+                                  const USFM_Config *config, USFM_Err *err)
+{
+    return USFM_Ast_ParseOpts(input, input_length, config, USFM_PARSE_DEFAULT, NULL, err);
+}
+
 /* ===== Lookups ===== */
+
+USFM_API uint8_t USFM_Node_GetLevel(const USFM_Node *node) { return USFM_LEVEL(node->level_flags); }
+USFM_API uint8_t USFM_Node_GetFlags(const USFM_Node *node) { return USFM_FLAGS(node->level_flags); }
+USFM_API int USFM_Node_HasFlags(const USFM_Node *node, uint32_t flags)
+{
+    return (USFM_FLAGS(node->level_flags) & flags) == flags;
+}
+
+USFM_API const char *USFM_Ast_GetInput(const USFM_Ast *ast, uint32_t *length)
+{
+    if (length) *length = ast ? ast->input_length : 0;
+    return ast ? ast->input : NULL;
+}
+
+USFM_API const USFM_Diagnostic *USFM_Ast_GetDiagnostics(const USFM_Ast *ast, uint32_t *count)
+{
+    if (count) *count = ast ? ast->diagnostic_count : 0;
+    return ast ? ast->diagnostics : NULL;
+}
+
+USFM_API uint32_t USFM_Ast_GetDroppedDiagnosticCount(const USFM_Ast *ast)
+{
+    return ast ? ast->dropped_diagnostics : 0;
+}
+
+USFM_API const USFM_Node *USFM_Ast_GetNodes(const USFM_Ast *ast, uint32_t *count)
+{
+    if (count) *count = ast ? ast->node_count : 0;
+    return ast ? ast->nodes : NULL;
+}
+
+USFM_API const USFM_ChapterEntry *USFM_Ast_GetChapters(const USFM_Ast *ast, uint32_t *count)
+{
+    if (count) *count = ast ? ast->chapter_count : 0;
+    return ast ? ast->chapters : NULL;
+}
+
+USFM_API const USFM_VerseEntry *USFM_Ast_GetVerses(const USFM_Ast *ast, uint32_t *count)
+{
+    if (count) *count = ast ? ast->verse_count : 0;
+    return ast ? ast->verses : NULL;
+}
+
+USFM_API uint32_t USFM_Ast_GetMaxChapterNumber(const USFM_Ast *ast)
+{
+    return ast ? ast->max_chapter : 0;
+}
+
+USFM_API const char *USFM_Ast_GetBookCode(const USFM_Ast *ast)
+{
+    return ast ? ast->book_code : "";
+}
+
+USFM_API uint8_t USFM_Ast_GetVersion(const USFM_Ast *ast)
+{
+    return ast ? ast->version : (uint8_t)USFM_VERSION_AUTO;
+}
 
 /* ===== Iterators ===== */
 

@@ -6,11 +6,14 @@
 #include "../usfm.h"
 #include "test.h"
 #include "dump.h"
+#include "check.h"
+#include "helpers.h"
 
 #include "test_basics.c"
 #include "test_markers.c"
 #include "test_alloc.c"
 #include "test_scanner.c"
+#include "test_parser.c"
 
 int main(void)
 {
@@ -22,6 +25,8 @@ int main(void)
     run_alloc_tests();
     fprintf(stderr, "scanner\n");
     run_scanner_tests();
+    fprintf(stderr, "parser\n");
+    run_parser_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;
