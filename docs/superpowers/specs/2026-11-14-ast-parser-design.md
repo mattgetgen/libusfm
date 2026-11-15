@@ -26,11 +26,27 @@ into an AST. It must be correct on real files of every USFM version from
 
 The counts come from `docs/usfm-field-guide.md` §12. They were produced by
 `~/repos/usfm/ParatextData/CountingSink.cs`, which counts ParatextData
-parser events: `Chapter`, `Verse`, `StartPara`, `StartChar` and
-`StartNote`. libusfm's counter must count the same things. Note parts such
-as `\ft` are expected to count as character spans. Header lines such as
-`\h` and `\toc1` are expected to count as paragraphs. Any mismatch is
-investigated by comparing per-book counts against ParatextData.
+parser events. Counting the markers in the WEB files checks the arithmetic:
+
+- **Character spans:** every `\w`, `\+w`, `\wj`, `\fr`, `\ft`, `\fqa`,
+  `\xt`, `\xo`, `\k`, `\+wh`, `\qs`, `\bk`, `\fl`, `\+bk` and `\fq` sums to
+  exactly 685,197. So note parts count as character spans.
+- **Paragraphs:** every paragraph marker, including `\h`, `\toc1-3`, `\ide`
+  and `\mt#`, sums to 34,754. That is one more than 34,753, because
+  ParatextData reports `\cp` (1 occurrence) as part of the chapter event,
+  not as a paragraph.
+
+libusfm's counter therefore counts:
+
+- chapters: CHAPTER nodes;
+- verses: VERSE nodes;
+- character spans: CHAR nodes;
+- notes: NOTE nodes;
+- paragraphs: PARA nodes without `USFM_NF_IMPLIED` and whose marker is not
+  `\cp`, plus HEADER nodes whose marker is not `\id`.
+
+Per-book chapter, verse and paragraph counts from ParatextData are kept in
+`tests/corpus/paratextdata-web.csv` for diffing.
 
 ## Scope
 
@@ -65,14 +81,20 @@ AST and writer, search, the fixed and growable arenas, the
     number, book code, note caller, or `\periph` title.
   - `USFM_AST_ATTRIBUTES`: a leaf for the raw attribute text (`|lemma="x"`).
 
-  When present, they are the first children of their owner node, with the
-  ARGUMENT before the ATTRIBUTES.
+  An ARGUMENT, when present, is the first child of its owner. ATTRIBUTES
+  appear where they were written: the last child of a character span or
+  figure (`\w word|lemma="x"\w*`), right after the ARGUMENT of a `\periph`,
+  and the only child of a milestone.
 - `enum USFM_DiagnosticCode` gains `USFM_DIAGNOSTIC_IMPLIED_PARAGRAPH`.
-- A node flag `USFM_NF_IMPLIED = 0x10` marks a PARA node that the parser
-  inserted. All four high bits of `level_flags` are already taken by marker
-  flags, so it reuses `0x10` on PARA nodes only. `USFM_TF_NESTED` and the
-  milestone flags never apply to paragraphs. This is the same trick the API
-  uses for the TEXT flags.
+- PARA nodes carry two node flags in the high bits of `level_flags`.
+  `USFM_TF_NESTED` and the milestone flags never apply to paragraphs, so
+  these bits are free on PARA nodes. The API already uses the same trick for
+  the TEXT flags.
+  - `USFM_NF_IMPLIED = 0x10`: the parser inserted this paragraph.
+  - `USFM_NF_HEADING = 0x20`: a heading paragraph, such as `\s`, `\ms`, `\mt`
+    or `\r`. The verse iterator skips these.
+- `enum USFM_DiagnosticCode` gains `USFM_DIAGNOSTIC_TOO_DEEP`, emitted when
+  a marker would push the stack past `USFM_STACK_DEPTH`.
 
 ## Ground rules
 
@@ -155,8 +177,9 @@ WHITESPACE, NEWLINE, MARKER, MARKER_END, ARGUMENT, ATTRIBUTES, OPTBREAK.
   `~`, CR or LF.
   - Escapes `\\ \/ \| \~ \"` stay inside TEXT and set `USFM_TF_HAS_ESCAPE`.
   - `~` sets `USFM_TF_HAS_NBSP`.
-  - A newline inside a paragraph, or a run of spaces, sets
-    `USFM_TF_HAS_LOOSE_WS`.
+  - A CR, LF or TAB inside the text sets `USFM_TF_HAS_LOOSE_WS`. Runs of
+    spaces are not detected: doing so would put the space byte on the hot
+    path.
   - `//` is an OPTBREAK token.
 - **Arguments.** The next word after `\c`, `\v`, `\id`, `\periph` or a note
   opener is an ARGUMENT. For notes, that word is the caller.
@@ -165,6 +188,11 @@ WHITESPACE, NEWLINE, MARKER, MARKER_END, ARGUMENT, ATTRIBUTES, OPTBREAK.
   Attributes are kept raw in v0.1.
 - **Whitespace.** One whitespace byte after an opening marker is part of the
   marker. All other whitespace is kept, so every span is exact.
+- **Trailing whitespace.** Before a paragraph-level marker, a `\v`, or the
+  end of input, the parser trims trailing whitespace from the last TEXT
+  node of the open container, and removes the node if nothing is left.
+  Whitespace-only text at block level (directly under BOOK, SIDEBAR,
+  PERIPHERAL or TABLE) is dropped.
 
 ### Parser loop
 
@@ -278,8 +306,9 @@ silently in 2.x and reported in 3.1.
   - Every result is either a NULL handle with a matching `err`, or a handle
     whose invariants hold. Any crash, sanitizer report, leak, or broken
     invariant is a bug.
-  - The fuzzer also runs the 2.x and 3.1 nesting cases from the unit tests
-    and checks them against the closing rules.
+  - The seed corpus includes the 2.x and 3.1 nesting cases from the unit
+    tests, so the fuzzer mutates real closing-rule inputs. The fuzzer
+    checks invariants, not tree shapes; the unit tests check shapes.
   - The seed corpus is the unit-test snippets plus a few WEB chapters.
     `tests/fuzz/usfm.dict` holds every marker name from the codegen table,
     plus `\*`, `|`, `//`, `~` and the escape sequences.
@@ -292,5 +321,6 @@ silently in 2.x and reported in 3.1.
 - **The benchmark** is `main.c`, rewritten as a timing harness that
   reports cycles per byte on JER.
 - **`build.sh`** gains `test` and `fuzz` modes. Debug builds keep ASan and UBSan.
-  Codegen runs whenever its table changes.
+  `build.sh` reruns codegen whenever `codegen/codegen.c` or
+  `codegen/markers.h` is newer than `build/codegen.stamp`.
 
