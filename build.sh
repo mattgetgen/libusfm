@@ -113,6 +113,37 @@ case "$MODE" in
         fi
         check_checksums
         ;;
+    test-neon)
+        run_codegen
+        unpack_corpus
+        if ! command -v qemu-aarch64 > /dev/null; then
+            echo "test-neon: skipped (install qemu-user)"
+            exit 0
+        fi
+        if command -v aarch64-linux-gnu-gcc > /dev/null; then
+            ARM_CC=(aarch64-linux-gnu-gcc -static)
+        elif command -v zig > /dev/null; then
+            ARM_CC=(zig cc -target aarch64-linux-musl)
+        else
+            echo "test-neon: skipped (install gcc-aarch64-linux-gnu or zig)"
+            exit 0
+        fi
+        "${ARM_CC[@]}" "${COMMON_FLAGS[@]}" -O1 -g tests/run_tests.c -o build/run_tests_neon
+        "${ARM_CC[@]}" "${COMMON_FLAGS[@]}" -O1 -g tests/corpus_test.c -o build/corpus_test_neon
+        gcc "${COMMON_FLAGS[@]}" -O1 -DUSFM_SIMD_NONE tests/corpus_test.c -o build/corpus_test_ref
+        if ! qemu-aarch64 ./build/run_tests_neon 2> build/run_tests_neon.log; then
+            cat build/run_tests_neon.log >&2
+            exit 1
+        fi
+        grep 'SIMD path' build/run_tests_neon.log
+        echo "neon: $(tail -n 1 build/run_tests_neon.log)"
+        rm -f build/checksums.txt
+        ./build/corpus_test_ref build/corpus/WEB > build/corpus_ref.log
+        echo "scalar $(grep 'AST checksum' build/corpus_ref.log | cut -d' ' -f3)" >> build/checksums.txt
+        qemu-aarch64 ./build/corpus_test_neon build/corpus/WEB | tee build/corpus_neon.log
+        echo "neon $(grep 'AST checksum' build/corpus_neon.log | cut -d' ' -f3)" >> build/checksums.txt
+        check_checksums
+        ;;
     fuzz)
         run_codegen
         mkdir -p build/fuzz/corpus
