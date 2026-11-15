@@ -109,7 +109,7 @@ case "$MODE" in
             aarch64-linux-gnu-gcc "${COMMON_FLAGS[@]}" -O1 -c tests/run_tests.c -o /dev/null && echo "neon: compiles"
         fi
         if command -v zig > /dev/null; then
-            zig cc -target wasm32-wasi -msimd128 -std=c99 -O1 -c tests/run_tests.c -o /dev/null && echo "wasm-simd128: compiles"
+            zig cc -target wasm32-wasi -msimd128 -std=c99 -O1 -c tests/run_tests.c -o build/wasm_check.o && echo "wasm-simd128: compiles"
         fi
         check_checksums
         ;;
