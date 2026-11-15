@@ -2054,6 +2054,25 @@ static int usfm__at_line_start(const char *in, uint32_t offset)
     return offset == 0 || in[offset - 1] == '\n' || in[offset - 1] == '\r';
 }
 
+/* Is the byte run at `after` a "|" or a "\*"? That makes an unknown
+ * marker the start of a milestone. */
+static int usfm__milestone_follows(const char *in, uint32_t len, uint32_t after)
+{
+    return after < len &&
+           (in[after] == '|' || (in[after] == '\\' && after + 1 < len && in[after + 1] == '*'));
+}
+
+/* Will the parser turn unknown marker token `t` into a paragraph? Yes at
+ * line start unless it is followed by "|" or "\*" (then it is a
+ * milestone). The one place this is decided: usfm__on_unknown and
+ * usfm__is_segment_stop both call it, so lookahead and parser agree. */
+static int usfm__unknown_starts_para(const USFM_Parser *p, const USFM_ScanToken *t)
+{
+    const char *in = p->ast->input;
+    return usfm__at_line_start(in, t->tok.span.offset) &&
+           !usfm__milestone_follows(in, p->ast->input_length, usfm__tok_end(t));
+}
+
 /* Does marker token `t` end every open character span (the end of a
  * lookahead segment)? A known marker whose role is not character-level,
  * a note part or note end marker inside a note, and an unknown marker
@@ -2061,20 +2080,13 @@ static int usfm__at_line_start(const char *in, uint32_t offset)
  * followed by "|" or "\*"). */
 static int usfm__is_segment_stop(const USFM_Parser *p, const USFM_ScanToken *t, int in_note)
 {
-    const char *in = p->ast->input;
-    uint32_t len = p->ast->input_length, after;
     uint8_t role;
     if (t->tok.kind == USFM_TOK_MARKER_END) {
         return in_note && t->row != USFM_ROW_NONE &&
                USFM_MarkerRows[t->row].role == USFM_ROLE_NOTE;
     }
     if (t->tok.kind != USFM_TOK_MARKER) return 0;
-    if (t->row == USFM_ROW_NONE) {
-        if (!usfm__at_line_start(in, t->tok.span.offset)) return 0;
-        after = usfm__tok_end(t);
-        return !(after < len && (in[after] == '|' ||
-                                 (in[after] == '\\' && after + 1 < len && in[after + 1] == '*')));
-    }
+    if (t->row == USFM_ROW_NONE) return usfm__unknown_starts_para(p, t);
     role = USFM_MarkerRows[t->row].role;
     if (role == USFM_ROLE_CHAR || role == USFM_ROLE_NOTE || role == USFM_ROLE_FIGURE ||
         role == USFM_ROLE_MILESTONE) {
@@ -2280,10 +2292,118 @@ static void usfm__on_close(USFM_Parser *p, const USFM_ScanToken *t)
     usfm__diag(p, USFM_DIAGNOSTIC_UNEXPECTED_CLOSE, t->tok.span, t->tok.marker);
 }
 
+static void usfm__on_milestone(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    /* Open until "\*" or any other token arrives (see usfm__parse).
+     * Milestones may sit anywhere, so there is no implied paragraph. */
+    usfm__open_tok(p, USFM_AST_MILESTONE, t, t->tok.level_flags, 0);
+}
+
+static void usfm__on_row(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    usfm__trim_last_text(p);
+    usfm__close_to_block(p, 1);
+    if (usfm__top_kind(p) != USFM_AST_TABLE) {
+        usfm__open(p, USFM_AST_TABLE, usfm__span(t->tok.span.offset, 0), USFM_M_NONE, 0, 0);
+    }
+    usfm__open_tok(p, USFM_AST_ROW, t, USFM_LEVEL(t->tok.level_flags), 0);
+}
+
+static void usfm__on_cell(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    uint32_t row;
+    usfm__trim_last_text(p);
+    row = usfm__find_kind(p, USFM_AST_ROW);
+    if (row == 0) {
+        USFM_Span at = usfm__span(t->tok.span.offset, 0);
+        usfm__diag(p, USFM_DIAGNOSTIC_INVALID_NESTING, t->tok.span, t->tok.marker);
+        usfm__close_to_block(p, 1);
+        if (usfm__top_kind(p) != USFM_AST_TABLE) {
+            usfm__open(p, USFM_AST_TABLE, at, USFM_M_NONE, 0, 0);
+        }
+        usfm__open(p, USFM_AST_ROW, at, USFM_M_TR, 0, 0);
+    } else {
+        usfm__close_to_depth(p, row);   /* the previous cell */
+    }
+    usfm__open_tok(p, USFM_AST_CELL, t, USFM_LEVEL(t->tok.level_flags), 0);
+}
+
+static void usfm__on_sidebar(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    uint32_t open = usfm__find_kind(p, USFM_AST_SIDEBAR);
+    usfm__trim_last_text(p);
+    if (open != 0) usfm__close_to_depth(p, open - 1);   /* sidebars can't nest */
+    usfm__close_to_block(p, 0);
+    usfm__open_tok(p, USFM_AST_SIDEBAR, t, 0, 0);
+}
+
+static void usfm__on_sidebar_end(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    uint32_t open = usfm__find_kind(p, USFM_AST_SIDEBAR);
+    uint32_t end = usfm__tok_end(t);
+    usfm__trim_last_text(p);
+    if (open == 0) {
+        usfm__diag(p, USFM_DIAGNOSTIC_UNEXPECTED_CLOSE, t->tok.span, t->tok.marker);
+        return;
+    }
+    usfm__close_to_depth(p, open);
+    if (end > p->last_end) p->last_end = end;
+    usfm__close_top(p);
+}
+
+static void usfm__on_periph(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    USFM_Span arg;
+    usfm__trim_last_text(p);
+    usfm__close_to_depth(p, 1);
+    if (usfm__open_tok(p, USFM_AST_PERIPHERAL, t, 0, 0) == USFM_NIL) return;
+    usfm__take_argument(p, &arg, usfm__tok_end(t));
+}
+
+static void usfm__on_figure(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    usfm__open_tok(p, USFM_AST_FIGURE, t, 0, 0);
+}
+
+/* Guide section 2: followed by "\*" or "|" -> milestone; at line start
+ * -> paragraph (usfm__unknown_starts_para); a matching \name* ahead ->
+ * character span; otherwise an inline milestone leaf. The text after it
+ * is never dropped. */
+static void usfm__on_unknown(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    const char *in = p->ast->input;
+    if (t->name_length == 0 || in[t->name_offset] != 'z') {
+        usfm__diag(p, USFM_DIAGNOSTIC_UNKNOWN_MARKER, t->tok.span, USFM_M_UNKNOWN);
+    }
+    if (usfm__unknown_starts_para(p, t)) {
+        usfm__trim_last_text(p);
+        usfm__close_to_block(p, 0);
+        usfm__open_tok(p, USFM_AST_PARA, t, 0, 0);
+        return;
+    }
+    if (usfm__milestone_follows(in, p->ast->input_length, usfm__tok_end(t))) {
+        usfm__on_milestone(p, t);
+        return;
+    }
+    if (t->name_length > 0 &&
+        usfm__closer_ahead(p, USFM_M_UNKNOWN, t->name_offset, t->name_length)) {
+        usfm__on_char(p, t);
+        return;
+    }
+    usfm__append(p, USFM_AST_MILESTONE, t->tok.span, USFM_M_UNKNOWN, 0);
+}
+
 static void usfm__on_marker(USFM_Parser *p, USFM_ScanToken *t)
 {
-    uint8_t role = t->row == USFM_ROW_NONE ? 0 : USFM_MarkerRows[t->row].role;
-    switch (role) {
+    if (USFM_FLAGS(t->tok.level_flags) & (USFM_TF_MILESTONE_START | USFM_TF_MILESTONE_END)) {
+        usfm__on_milestone(p, t);
+        return;
+    }
+    if (t->row == USFM_ROW_NONE) {
+        usfm__on_unknown(p, t);
+        return;
+    }
+    switch (USFM_MarkerRows[t->row].role) {
     case USFM_ROLE_PARA: usfm__on_para(p, t, USFM_AST_PARA); break;
     case USFM_ROLE_HEADER: usfm__on_para(p, t, USFM_AST_HEADER); break;
     case USFM_ROLE_ID: usfm__on_id(p, t); break;
@@ -2292,10 +2412,14 @@ static void usfm__on_marker(USFM_Parser *p, USFM_ScanToken *t)
     case USFM_ROLE_CHAR: usfm__on_char(p, t); break;
     case USFM_ROLE_NOTE: usfm__on_note(p, t); break;
     case USFM_ROLE_NOTE_PART: usfm__on_note_part(p, t); break;
-    default:
-        /* Roles handled by later sections; keep the marker as a leaf. */
-        usfm__append(p, USFM_AST_MILESTONE, t->tok.span, t->tok.marker, 0);
-        break;
+    case USFM_ROLE_ROW: usfm__on_row(p, t); break;
+    case USFM_ROLE_CELL: usfm__on_cell(p, t); break;
+    case USFM_ROLE_MILESTONE: usfm__on_milestone(p, t); break;
+    case USFM_ROLE_SIDEBAR: usfm__on_sidebar(p, t); break;
+    case USFM_ROLE_SIDEBAR_END: usfm__on_sidebar_end(p, t); break;
+    case USFM_ROLE_PERIPH: usfm__on_periph(p, t); break;
+    case USFM_ROLE_FIGURE: usfm__on_figure(p, t); break;
+    default: usfm__on_unknown(p, t); break;
     }
 }
 
@@ -2305,6 +2429,12 @@ static void usfm__parse(USFM_Parser *p)
 {
     USFM_ScanToken t;
     while (!p->failed && usfm__next(p, &t)) {
+        if (usfm__top_kind(p) == USFM_AST_MILESTONE) {
+            int keep = t.tok.kind == USFM_TOK_ATTRIBUTES ||
+                       (t.tok.kind == USFM_TOK_MARKER_END && t.name_length == 0) ||
+                       (t.tok.kind == USFM_TOK_TEXT && usfm__is_blank(p->ast->input, t.tok.span));
+            if (!keep) usfm__close_top(p);
+        }
         switch (t.tok.kind) {
         case USFM_TOK_TEXT: usfm__on_text(p, &t); break;
         case USFM_TOK_ARGUMENT: usfm__on_text(p, &t); break;   /* unclaimed */
