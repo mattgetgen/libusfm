@@ -9,9 +9,12 @@ Ship a fast, single-header USFM parser whose public API parses USFM text
 into an AST. It must be correct on real files of every USFM version from
 2.x to 3.1.
 
-**Done when** all 83 files of the WEB corpus parse, with no failures and
-no sanitizer reports, and the totals match the counts that ParatextData,
-usfmtc and usfm3 agree on:
+**Done when** both of these hold:
+
+- A 30-minute libFuzzer run finds nothing.
+- All 83 files of the WEB corpus parse, with no failures and no sanitizer
+  reports, and the totals match the counts that ParatextData, usfmtc and
+  usfm3 agree on:
 
 | Count | Expected |
 | --- | --- |
@@ -227,11 +230,36 @@ silently in 2.x and reported in 3.1.
   - preorder ranges nest correctly;
   - every span lies inside the input;
   - chapter and verse entries point at CHAPTER and VERSE nodes.
-- **The corpus test** parses the 83 WEB files copied into
-  `tests/corpus/WEB/` and checks the totals in the Goal section.
+- **The corpus test** parses the 83 WEB `.usfm` files and checks the totals
+  in the Goal section.
+  - The files are committed as a single archive, `tests/corpus/WEB.tar.gz`,
+    together with the WEB copyright page (`copr.htm`). WEB is public domain;
+    the name is a trademark of eBible.org.
+  - `build.sh test` unpacks the archive into `build/corpus/WEB/`, which is
+    gitignored, unless that directory is already up to date.
+- **Fuzzing** uses libFuzzer and needs clang.
+  - `tests/fuzz_ast.c` builds an AST from the fuzz input with
+    `USFM_Ast_ParseOpts` and runs the invariant checks on every result.
+  - The first input bytes choose the `USFM_Config` version and the parse
+    flags. They also choose an allocation count after which a test
+    allocator fails, so that every `USFM_ERR_NOMEM` path gets exercised.
+  - Every result is either a NULL handle with a matching `err`, or a handle
+    whose invariants hold. Any crash, sanitizer report, leak, or broken
+    invariant is a bug.
+  - The fuzzer also runs the 2.x and 3.1 nesting cases from the unit tests
+    and checks them against the closing rules.
+  - The seed corpus is the unit-test snippets plus a few WEB chapters.
+    `tests/fuzz/usfm.dict` holds every marker name from the codegen table,
+    plus `\*`, `|`, `//`, `~` and the escape sequences.
+  - The harness also builds without libFuzzer, using gcc and a small
+    `main()`, so it can replay crash files and run the seed corpus as an
+    ordinary regression test inside `build.sh test`.
+  - `build.sh fuzz` builds with
+    `-fsanitize=fuzzer,address,undefined`.
+  - v0.1 requires a 30-minute fuzz run with no findings.
 - **The benchmark** is `main.c`, rewritten as a timing harness that
   reports cycles per byte on JER.
-- **`build.sh`** gains a `test` mode. Debug builds keep ASan and UBSan.
+- **`build.sh`** gains `test` and `fuzz` modes. Debug builds keep ASan and UBSan.
   Codegen runs whenever its table changes.
 
 ## Open items for implementation
@@ -239,5 +267,3 @@ silently in 2.x and reported in 3.1.
 - Settle the exact counting rules behind the corpus totals before
   comparing against them.
 - Pick the perfect-hash scheme for codegen.
-- Decide how the corpus is stored: about 20 MB of plain text, or a
-  compressed archive.
