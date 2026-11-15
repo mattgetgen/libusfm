@@ -11,14 +11,22 @@ paths, and its totals must match its line in `expected.txt`:
 (counted as in `count_ast` in `tests/corpus_test.c`, which follows
 ParatextData's CountingSink; "books" is the number of files).
 
-Only the WEB-STRONGS line is externally verified: ParatextData, usfmtc
-and usfm3 all give the same totals for it, and `paratextdata-web.csv` has
-ParatextData's per-book counts (compare with
-`build/corpus/libusfm-WEB-STRONGS.csv`). Every other line is libusfm's own
-baseline, taken from the scalar build after checking that the corpus
-parses with 0 diagnostics, 0 scanner differences and 0 classifier
-differences on scalar, SSE2 and AVX2. They catch regressions, not
-conformance bugs.
+Every line is externally verified. On 2026-11-15, three independent
+parsers counted every corpus exactly as `expected.txt` says: books,
+chapters, verses, paragraphs, character spans, notes and milestones. The
+three are ParatextData 9.5.0.24 (C#), usfm3 0.2.1 (Rust, AST mode) and
+usfmtc 0.4.8 (Python, the USFM committee's parser), each run with its own
+harness from the parser benchmark repository.
+`paratextdata-web.csv` has ParatextData's per-book counts for
+WEB-STRONGS (compare with `build/corpus/libusfm-WEB-STRONGS.csv`). Every
+corpus also parses in libusfm with 0 diagnostics, 0 scanner differences
+and 0 classifier differences on every SIMD path.
+
+Two other parsers disagree slightly, which is a known difference in them,
+not in these corpora. usfm-grammar 3.2.0 counts a few fewer character
+spans and notes on every corpus that has them, and counts GRC-BYZ as
+31 books with 5,516 paragraphs. The `usfm` 0.2.10 Rust crate counts one
+more paragraph in WEB-STRONGS and WEB (34,754).
 
 `derive.py` removes word-level markup (`\w TEXT|ATTRS\w*` and
 `\+w TEXT|ATTRS\+w*` become `TEXT`; nothing else changes) and copies
