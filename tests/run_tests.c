@@ -6,11 +6,14 @@
 #include "test.h"
 
 #include "test_basics.c"
+#include "test_markers.c"
 
 int main(void)
 {
     fprintf(stderr, "basics\n");
     run_basics_tests();
+    fprintf(stderr, "markers\n");
+    run_markers_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;

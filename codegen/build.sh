@@ -9,7 +9,7 @@ CFLAGS=(
     -Wextra
     -pedantic
     -fshort-enums
-    -O0
+    -O2
     -g
     -fsanitize=address
     -fsanitize=undefined
