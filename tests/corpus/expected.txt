@@ -1,4 +1,4 @@
-# NAME books chapters verses paragraphs chars notes milestones (see tests/corpus/README.md)
+# NAME books chapters verses paragraphs chars notes milestones (see tests/corpus/README.md; every line verified against ParatextData, usfm3 and usfmtc on 2026-11-15)
 WEB-STRONGS 83 1402 38058 34753 685201 2218 0
 WEB 83 1402 38058 34753 7509 2218 0
 HBO-WLC 39 929 23213 1085 0 0 0
