@@ -1972,9 +1972,148 @@ static void usfm__on_verse(USFM_Parser *p, const USFM_ScanToken *t)
     usfm__add_verse(p, node, &ref);
 }
 
+/* Name bytes of a marker node: after "\" and an optional "+". */
+static void usfm__node_name(const USFM_Parser *p, uint32_t node, uint32_t *offset,
+                            uint32_t *length)
+{
+    const char *in = p->ast->input;
+    uint32_t len = p->ast->input_length;
+    uint32_t i = p->ast->nodes[node].span.offset + 1, start;
+    if (i < len && in[i] == '+') i++;
+    start = i;
+    while (i < len && (USFM_ByteClass[(uint8_t)in[i]] & USFM_BC_NAME)) i++;
+    *offset = start;
+    *length = i - start;
+}
+
+/* Does end marker `closer` close a span of `marker`? Unknown markers
+ * match by name. */
+static int usfm__closer_matches(const USFM_Parser *p, const USFM_ScanToken *closer,
+                                USFM_Marker marker, uint32_t name_offset, uint32_t name_length)
+{
+    if (closer->name_length == 0) return 0;
+    if (marker != USFM_M_UNKNOWN) return closer->tok.marker == marker;
+    return closer->tok.marker == USFM_M_UNKNOWN && closer->name_length == name_length &&
+           memcmp(p->ast->input + closer->name_offset, p->ast->input + name_offset,
+                  name_length) == 0;
+}
+
+static int usfm__frame_matches(const USFM_Parser *p, const USFM_Frame *f,
+                               const USFM_ScanToken *closer)
+{
+    const USFM_Node *n = &p->ast->nodes[f->node];
+    uint32_t offset = 0, length = 0;
+    if (n->marker == USFM_M_UNKNOWN) usfm__node_name(p, f->node, &offset, &length);
+    return usfm__closer_matches(p, closer, n->marker, offset, length);
+}
+
+/* Does the end marker for (marker, name) appear before the span must
+ * end anyway: at a paragraph-level marker, a verse, a cell, or (inside
+ * a note) the next note part or the note's end? Scans a copy of the
+ * scanner, so it consumes nothing. Bounded by the input length; the
+ * cache makes repeated questions about one open span O(1). */
+static int usfm__closer_ahead(USFM_Parser *p, USFM_Marker marker, uint32_t name_offset,
+                              uint32_t name_length, uint32_t cache_node)
+{
+    USFM_Scanner s;
+    USFM_ScanToken t;
+    int in_note = usfm__find_kind(p, USFM_AST_NOTE) != 0;
+    if (cache_node != USFM_NIL && p->lookahead_node == cache_node &&
+        p->scan.position < p->lookahead_until) {
+        return 1;
+    }
+    s = p->scan;
+    s.pipe_is_attr = 0;
+    while (usfm__scan_next(&s, &t)) {
+        uint8_t role;
+        if (t.tok.kind == USFM_TOK_MARKER_END) {
+            if (usfm__closer_matches(p, &t, marker, name_offset, name_length)) {
+                if (cache_node != USFM_NIL) {
+                    p->lookahead_node = cache_node;
+                    p->lookahead_until = t.tok.span.offset;
+                }
+                return 1;
+            }
+            if (in_note && t.row != USFM_ROW_NONE &&
+                USFM_MarkerRows[t.row].role == USFM_ROLE_NOTE) {
+                return 0;
+            }
+            continue;
+        }
+        if (t.tok.kind != USFM_TOK_MARKER || t.row == USFM_ROW_NONE) continue;
+        role = USFM_MarkerRows[t.row].role;
+        if (role == USFM_ROLE_CHAR || role == USFM_ROLE_NOTE || role == USFM_ROLE_FIGURE ||
+            role == USFM_ROLE_MILESTONE) {
+            continue;
+        }
+        if (role == USFM_ROLE_NOTE_PART && !in_note) continue;
+        return 0;
+    }
+    return 0;
+}
+
+static void usfm__on_char(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    const USFM_Frame *top;
+    usfm__ensure_inline(p, t->tok.span.offset);
+    top = &p->stack[p->depth - 1];
+    if (top->kind == USFM_AST_CHAR && !(top->flags & USFM_FRAME_NOTE_PART) &&
+        !(t->tok.level_flags & USFM_TF_NESTED)) {
+        const USFM_Node *outer = &p->ast->nodes[top->node];
+        uint32_t offset = 0, length = 0;
+        if (outer->marker == USFM_M_UNKNOWN) usfm__node_name(p, top->node, &offset, &length);
+        if (!usfm__closer_ahead(p, outer->marker, offset, length, top->node)) {
+            /* 2.x semantics: a plain character marker closes every open
+             * span (but not note parts). Bounded by the stack depth. */
+            while (p->depth > 1) {
+                const USFM_Frame *f = &p->stack[p->depth - 1];
+                if (f->kind != USFM_AST_CHAR || (f->flags & USFM_FRAME_NOTE_PART)) break;
+                usfm__close_implicit(p);
+            }
+        }
+    }
+    usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0);
+}
+
+static void usfm__on_attributes(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    uint8_t k = usfm__top_kind(p);
+    if (k == USFM_AST_CHAR || k == USFM_AST_MILESTONE || k == USFM_AST_FIGURE ||
+        k == USFM_AST_PERIPHERAL) {
+        usfm__append(p, USFM_AST_ATTRIBUTES, t->tok.span, USFM_M_NONE, 0);
+    } else {
+        usfm__on_text(p, t);
+    }
+}
+
 static void usfm__on_close(USFM_Parser *p, const USFM_ScanToken *t)
 {
-    /* Replaced in Task 6. */
+    uint32_t d, end = usfm__tok_end(t);
+    if (t->name_length == 0) {          /* "\*" ends a milestone */
+        if (usfm__top_kind(p) == USFM_AST_MILESTONE) {
+            p->ast->nodes[p->stack[p->depth - 1].node].level_flags |= USFM_TF_SELF_CLOSED;
+            if (end > p->last_end) p->last_end = end;
+            usfm__close_top(p);
+        } else {
+            usfm__diag(p, USFM_DIAGNOSTIC_UNEXPECTED_CLOSE, t->tok.span, USFM_M_NONE);
+        }
+        return;
+    }
+    /* Search open spans in the current paragraph or note. Bounded by
+     * the stack depth. */
+    for (d = p->depth; d > 1; d--) {
+        const USFM_Frame *f = &p->stack[d - 1];
+        if (f->kind != USFM_AST_CHAR && f->kind != USFM_AST_NOTE && f->kind != USFM_AST_FIGURE) break;
+        if (usfm__frame_matches(p, f, t)) {
+            while (p->depth > d) usfm__close_implicit(p);
+            if (end > p->last_end) p->last_end = end;
+            usfm__close_top(p);
+            return;
+        }
+        if (f->kind == USFM_AST_NOTE) break;
+    }
+    /* \fr* after \fr already closed: explicit close of a note part. */
+    if (t->row != USFM_ROW_NONE && USFM_MarkerRows[t->row].role == USFM_ROLE_NOTE_PART) return;
     usfm__diag(p, USFM_DIAGNOSTIC_UNEXPECTED_CLOSE, t->tok.span, t->tok.marker);
 }
 
@@ -1987,6 +2126,7 @@ static void usfm__on_marker(USFM_Parser *p, USFM_ScanToken *t)
     case USFM_ROLE_ID: usfm__on_id(p, t); break;
     case USFM_ROLE_CHAPTER: usfm__on_chapter(p, t); break;
     case USFM_ROLE_VERSE: usfm__on_verse(p, t); break;
+    case USFM_ROLE_CHAR: usfm__on_char(p, t); break;
     default:
         /* Roles handled by later sections; keep the marker as a leaf. */
         usfm__append(p, USFM_AST_MILESTONE, t->tok.span, t->tok.marker, 0);
@@ -2003,7 +2143,7 @@ static void usfm__parse(USFM_Parser *p)
         switch (t.tok.kind) {
         case USFM_TOK_TEXT: usfm__on_text(p, &t); break;
         case USFM_TOK_ARGUMENT: usfm__on_text(p, &t); break;   /* unclaimed */
-        case USFM_TOK_ATTRIBUTES: usfm__on_text(p, &t); break; /* Task 6 */
+        case USFM_TOK_ATTRIBUTES: usfm__on_attributes(p, &t); break;
         case USFM_TOK_OPTBREAK: usfm__on_optbreak(p, &t); break;
         case USFM_TOK_MARKER_END: usfm__on_close(p, &t); break;
         case USFM_TOK_MARKER: usfm__on_marker(p, &t); break;

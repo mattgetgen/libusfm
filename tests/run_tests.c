@@ -14,6 +14,7 @@
 #include "test_alloc.c"
 #include "test_scanner.c"
 #include "test_parser.c"
+#include "test_chars.c"
 
 int main(void)
 {
@@ -27,6 +28,8 @@ int main(void)
     run_scanner_tests();
     fprintf(stderr, "parser\n");
     run_parser_tests();
+    fprintf(stderr, "chars\n");
+    run_chars_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;
