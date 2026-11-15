@@ -197,7 +197,7 @@ case "$MODE" in
     fuzz)
         run_codegen
         mkdir -p build/fuzz/corpus
-        clang -std=c99 -g -O1 -fsanitize=fuzzer,address,undefined tests/fuzz_ast.c -o build/fuzz_ast
+        clang -std=c99 -g -O1 -mavx2 -fsanitize=fuzzer,address,undefined tests/fuzz_ast.c -o build/fuzz_ast
         echo "Run: ./build/fuzz_ast -dict=tests/fuzz/usfm.dict -max_total_time=1800 build/fuzz/corpus tests/fuzz/seeds"
         ;;
     codegen)
