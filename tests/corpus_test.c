@@ -144,23 +144,6 @@ static uint64_t checksum_ast(uint64_t h, const USFM_Ast *ast)
     return h;
 }
 
-#if USFM__USE_BLOCKS
-/* Classifies every whole 64-byte block of `data` with the SIMD and the
- * scalar classifier; returns the number of blocks whose masks differ. */
-static unsigned long long classifier_mismatches(const char *data, uint32_t length)
-{
-    unsigned long long bad = 0;
-    uint32_t base;
-    for (base = 0; base + 64u <= length; base += 64u) {     /* bounded by length */
-        USFM_BlockMasks a, b;
-        usfm__classify_block(data + base, &a);
-        usfm__classify_block_scalar(data + base, &b);
-        if (a.backslash != b.backslash || a.pipe != b.pipe || a.slash != b.slash ||
-            a.nbsp != b.nbsp || a.loose_ws != b.loose_ws) bad++;
-    }
-    return bad;
-}
-#endif
 
 int main(int argc, char **argv)
 {
