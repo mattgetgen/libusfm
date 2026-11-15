@@ -49,6 +49,10 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#ifndef USFM_ASSERT
+#include <assert.h>
+#define USFM_ASSERT(x) assert(x)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,11 +97,8 @@ extern "C" {
 #ifndef USFM_INPUT_MAX
 #define USFM_INPUT_MAX 0x7FFFFFFFu      /* 2 GiB - 1 */
 #endif
-#ifndef USFM_ASSERT
-#include <assert.h>
-#define USFM_ASSERT(x) assert(x)
-#endif
-/* Define USFM_NO_LIBC to drop the default malloc-based allocator. */
+/* Define USFM_ASSERT before including to replace assert().
+ * Define USFM_NO_LIBC to drop the default malloc-based allocator. */
 
 #define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
 

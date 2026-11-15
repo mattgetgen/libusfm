@@ -30,10 +30,11 @@ static int usfm_test_checks = 0;
     const char *check_a_ = (actual); \
     const char *check_e_ = (expected); \
     usfm_test_checks++; \
-    if (strcmp(check_a_, check_e_) != 0) { \
+    if (check_a_ == NULL || check_e_ == NULL || strcmp(check_a_, check_e_) != 0) { \
         usfm_test_failures++; \
         fprintf(stderr, "%s:%d: %s\n--- expected\n%s\n--- actual\n%s\n", \
-                __FILE__, __LINE__, #actual, check_e_, check_a_); \
+                __FILE__, __LINE__, #actual, check_e_ ? check_e_ : "(null)", \
+                check_a_ ? check_a_ : "(null)"); \
     } \
 } while (0)
 
