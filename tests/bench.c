@@ -43,6 +43,7 @@ static void counters_open(Counters *c)
         attr.disabled = 1;
         attr.exclude_kernel = 1;
         attr.exclude_hv = 1;
+        attr.read_format = PERF_FORMAT_TOTAL_TIME_RUNNING;
         if (k == 0) { attr.type = PERF_TYPE_HARDWARE; attr.config = PERF_COUNT_HW_INSTRUCTIONS; }
         if (k == 1) { attr.type = PERF_TYPE_HARDWARE; attr.config = PERF_COUNT_HW_CPU_CYCLES; }
         if (k == 2) {
@@ -76,7 +77,15 @@ static void counters_stop(Counters *c)
 #if defined(__linux__)
         if (c->fd[k] >= 0) {
             ioctl(c->fd[k], PERF_EVENT_IOC_DISABLE, 0);
-            if (read(c->fd[k], &c->value[k], sizeof c->value[k]) != (ssize_t)sizeof c->value[k]) c->fd[k] = -1;
+            /* value, then the time the event actually ran. On hybrid CPUs
+             * a generic event only counts on one core type; if it never
+             * ran (e.g. pinned to an E-core), report it as unavailable. */
+            uint64_t buf[2];
+            if (read(c->fd[k], buf, sizeof buf) != (ssize_t)sizeof buf || buf[1] == 0) {
+                c->fd[k] = -1;
+            } else {
+                c->value[k] = buf[0];
+            }
         }
 #endif
     }
