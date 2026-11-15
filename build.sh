@@ -171,6 +171,29 @@ case "$MODE" in
         echo "wasm $(grep 'AST checksum' build/corpus_wasm.log | cut -d' ' -f3)" >> build/checksums.txt
         check_checksums
         ;;
+    test-avx512)
+        run_codegen
+        unpack_corpus
+        if [[ -z "${USFM_SDE:-}" || ! -x "${USFM_SDE}" ]]; then
+            echo "test-avx512: skipped (download Intel SDE and set USFM_SDE to its sde64 executable)"
+            exit 0
+        fi
+        gcc "${COMMON_FLAGS[@]}" -O1 -g -mavx512bw tests/run_tests.c -o build/run_tests_avx512
+        gcc "${COMMON_FLAGS[@]}" -O1 -g -mavx512bw tests/corpus_test.c -o build/corpus_test_avx512
+        gcc "${COMMON_FLAGS[@]}" -O1 -DUSFM_SIMD_NONE tests/corpus_test.c -o build/corpus_test_ref
+        if ! "$USFM_SDE" -spr -- ./build/run_tests_avx512 2> build/run_tests_avx512.log; then
+            cat build/run_tests_avx512.log >&2
+            exit 1
+        fi
+        grep 'SIMD path' build/run_tests_avx512.log
+        echo "avx512bw: $(tail -n 1 build/run_tests_avx512.log)"
+        rm -f build/checksums.txt
+        ./build/corpus_test_ref build/corpus/WEB > build/corpus_ref.log
+        echo "scalar $(grep 'AST checksum' build/corpus_ref.log | cut -d' ' -f3)" >> build/checksums.txt
+        "$USFM_SDE" -spr -- ./build/corpus_test_avx512 build/corpus/WEB | tee build/corpus_avx512.log
+        echo "avx512bw $(grep 'AST checksum' build/corpus_avx512.log | cut -d' ' -f3)" >> build/checksums.txt
+        check_checksums
+        ;;
     fuzz)
         run_codegen
         mkdir -p build/fuzz/corpus
