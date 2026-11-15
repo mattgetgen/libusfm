@@ -8,9 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define USFM_TEST_SCAN_REFERENCE
 #define USFM_IMPLEMENTATION
 #include "../usfm.h"
 #include "check.h"
+#include "scan_compare.h"
 
 /* TEXT nodes whose flag disagrees with their text, per flag. */
 typedef struct FlagMismatches {
@@ -86,6 +88,62 @@ static int compare_names(const void *a, const void *b)
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
+/* FNV-1a over every field of the trees, tables and diagnostics (field
+ * by field, so struct padding never enters the hash). */
+static uint64_t fnv(uint64_t h, uint64_t v, uint32_t bytes)
+{
+    uint32_t k;
+    for (k = 0; k < bytes; k++) {
+        h ^= (v >> (8u * k)) & 0xFFu;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static uint64_t checksum_ast(uint64_t h, const USFM_Ast *ast)
+{
+    uint32_t count, i;
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    const USFM_ChapterEntry *chapters;
+    const USFM_VerseEntry *verses;
+    const USFM_Diagnostic *diags;
+    for (i = 0; i < count; i++) {
+        h = fnv(h, nodes[i].parent, 4);
+        h = fnv(h, nodes[i].end, 4);
+        h = fnv(h, nodes[i].span.offset, 4);
+        h = fnv(h, nodes[i].span.length, 4);
+        h = fnv(h, nodes[i].marker, 2);
+        h = fnv(h, nodes[i].kind, 1);
+        h = fnv(h, nodes[i].level_flags, 1);
+    }
+    chapters = USFM_Ast_GetChapters(ast, &count);
+    for (i = 0; i < count; i++) {
+        h = fnv(h, chapters[i].number, 2);
+        h = fnv(h, chapters[i].node, 4);
+        h = fnv(h, chapters[i].end_node, 4);
+        h = fnv(h, chapters[i].first_verse, 4);
+        h = fnv(h, chapters[i].verse_count, 4);
+    }
+    verses = USFM_Ast_GetVerses(ast, &count);
+    for (i = 0; i < count; i++) {
+        h = fnv(h, verses[i].ref.chapter, 2);
+        h = fnv(h, verses[i].ref.verse_first, 2);
+        h = fnv(h, verses[i].ref.verse_last, 2);
+        h = fnv(h, verses[i].ref.segment_first, 1);
+        h = fnv(h, verses[i].ref.segment_last, 1);
+        h = fnv(h, verses[i].node, 4);
+        h = fnv(h, verses[i].end_node, 4);
+    }
+    diags = USFM_Ast_GetDiagnostics(ast, &count);
+    for (i = 0; i < count; i++) {
+        h = fnv(h, diags[i].span.offset, 4);
+        h = fnv(h, diags[i].span.length, 4);
+        h = fnv(h, diags[i].code, 2);
+        h = fnv(h, diags[i].marker, 2);
+    }
+    return h;
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : "build/corpus/WEB";
@@ -97,6 +155,8 @@ int main(int argc, char **argv)
     char *names[256];
     size_t name_count = 0, i;
     int failures = 0;
+    uint64_t checksum = 0xcbf29ce484222325ull;
+    unsigned long long scan_diffs = 0;
     DIR *d = opendir(dir);
     FILE *csv = fopen("build/corpus/libusfm-web.csv", "w");
     struct dirent *e;
@@ -109,7 +169,8 @@ int main(int argc, char **argv)
     }
     while ((e = readdir(d)) != NULL && name_count < 256) {
         size_t len = strlen(e->d_name);
-        if (len > 5 && strcmp(e->d_name + len - 5, ".usfm") == 0) {
+        if ((len > 5 && strcmp(e->d_name + len - 5, ".usfm") == 0) ||
+            (len > 4 && strcmp(e->d_name + len - 4, ".SFM") == 0)) {
             names[name_count++] = strdup(e->d_name);
         }
     }
@@ -129,11 +190,15 @@ int main(int argc, char **argv)
             failures++;
             continue;
         }
+        scan_diffs += (unsigned long long)(scan_compare(data, length, 0u, scan_diffs == 0) +
+                                           scan_compare(data, length, 1u, scan_diffs == 0) +
+                                           scan_compare(data, length, 7u + (uint32_t)i, scan_diffs == 0));
         ast = USFM_Ast_Parse(data, length, NULL, &err);
         if (ast == NULL || err.code != USFM_OK) {
             fprintf(stderr, "%s: parse failed: %s\n", names[i], err.msg);
             failures++;
         } else {
+            checksum = checksum_ast(checksum, ast);
             count_flag_mismatches(ast, &mismatches);
             if (check_ast(ast) != 0) {
                 fprintf(stderr, "%s: invariants failed\n", names[i]);
@@ -188,6 +253,10 @@ int main(int argc, char **argv)
     printf("Text flag mismatches: %llu loose-ws, %llu nbsp, %llu escape\n",
            mismatches.loose_ws, mismatches.nbsp, mismatches.escape);
     if (mismatches.loose_ws + mismatches.nbsp + mismatches.escape != 0) failures++;
+    printf("SIMD path: %s\n", USFM__SIMD_PATH);
+    printf("Scanner differences: %llu\n", scan_diffs);
+    printf("AST checksum: %016llx\n", (unsigned long long)checksum);
+    if (scan_diffs != 0) failures++;
     if (memcmp(&total, &expected, sizeof total) != 0) {
         printf("Expected:   %llu books, %llu chapters, %llu verses, %llu paragraphs\n"
                "            %llu char styles, %llu notes, %llu milestones\n",
