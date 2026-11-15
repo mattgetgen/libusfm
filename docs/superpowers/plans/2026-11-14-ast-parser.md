@@ -1001,7 +1001,7 @@ static uint32_t usfm__marker_hash(const char *name, uint32_t length)
 /* Multiply-shift reduction: any slot_count, no division. */
 static uint32_t usfm__marker_slot(uint32_t hash, uint32_t seed, uint32_t slot_count)
 {
-    uint32_t mixed = (uint32_t)(((uint64_t)hash * seed) >> 32);
+    uint32_t mixed = hash * seed;       /* wraps mod 2^32 on purpose */
     return (uint32_t)(((uint64_t)mixed * slot_count) >> 32);
 }
 

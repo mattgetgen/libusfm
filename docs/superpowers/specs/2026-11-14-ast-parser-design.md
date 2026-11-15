@@ -143,9 +143,12 @@ prefix and the `*` suffix separately, so those never become keys.
 - **Hash input.** A `u32` packed from the first two and last two bytes of
   the name, combined with its length. The length is needed because short
   names share bytes. Bytes past the end of a short name are never read.
-- **Slot.** `slot = ((hash * seed) >> 32) * size >> 32`, a multiply-shift
-  reduction with no division. The size can be any number, not just a power
-  of two.
+- **Slot.** `slot = ((uint32_t)(hash * seed) * (uint64_t)size) >> 32`: the product
+  wraps modulo 2^32, then its high bits pick the slot. This is the classic
+  multiply-shift hash (keeping the high half of the full 64-bit product
+  instead would scale the hash linearly and never separate close keys). It
+  needs no division, and the size can be any number, not just a power of
+  two.
 - **Search.** Codegen tries sizes from the key count upward. For each size
   it tries seeds up to a fixed bound, which is a codegen constant. It
   stops at the first `(size, seed)` that puts every key in its own slot. If
