@@ -226,6 +226,9 @@ or `\v` node also adds its table entry and sets the previous entry's
   paragraphs. Their ARGUMENT child holds the number, which is also parsed
   into the tables.
 - `TEXT`, `OPTBREAK`, `MILESTONE`, `ARGUMENT` and `ATTRIBUTES` are leaves.
+- A container's span covers the source bytes from its marker to the last byte
+  consumed inside it, which may include whitespace trimmed from its last
+  `TEXT` node.
 
 ### Closing rules
 
@@ -233,7 +236,7 @@ These follow `docs/usfm-field-guide.md` §3.
 
 | Token | Closes | Then |
 | --- | --- | --- |
-| Paragraph-level marker (`\p`, `\q#`, `\s#`, `\c`, `\id`, `\tr`, `\esb`/`\esbe`, `\periph`) | Everything down to the nearest BOOK, SIDEBAR or PERIPHERAL. `\tr` stops at an open TABLE; any other marker also closes the TABLE. Unclosed notes get a diagnostic. | Opens PARA, ROW, etc. (`\tr` opens a TABLE first if none is open). `\c` appends a CHAPTER leaf. |
+| Paragraph-level marker (`\p`, `\q#`, `\s#`, `\c`, `\id`, `\tr`, `\esb`/`\esbe`, `\periph`) | `\c`, `\id` and `\periph` close everything down to BOOK (they start a new top-level division). Other paragraph-level markers close down to the nearest BOOK, SIDEBAR or PERIPHERAL. `\tr` stops at an open TABLE; any other marker also closes the TABLE. Unclosed notes get a diagnostic. | Opens PARA, ROW, etc. (`\tr` opens a TABLE first if none is open). `\c` appends a CHAPTER leaf. |
 | `\v` | Open CHAR spans. A `\v` inside a note closes the note, with a diagnostic. | Appends a VERSE leaf. With no PARA open, it first opens an implied `\p` with a diagnostic. |
 | Note opener (`\f \x \fe \ef \ex \efe`) | An open note, with a diagnostic (notes can't nest). | Opens NOTE, with the caller as its ARGUMENT. |
 | Note part (`\fr \ft \fq \xo \xt` ...) | Every CHAR opened since the note's last note part. | Opens CHAR. |

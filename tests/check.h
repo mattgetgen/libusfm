@@ -31,6 +31,12 @@ static int check_ast(const USFM_Ast *ast)
             CHECK_AST_FAIL("node %u span %u+%u outside input of %u", i,
                            n->span.offset, n->span.length, input_length);
         if (n->end <= i || n->end > count) CHECK_AST_FAIL("node %u end %u", i, n->end);
+        if (k == USFM_AST_TEXT && n->span.length == 0)
+            CHECK_AST_FAIL("TEXT node %u has length 0", i);
+        if (n->end < count &&
+            nodes[n->end].span.offset < (uint64_t)n->span.offset + n->span.length)
+            CHECK_AST_FAIL("node %u (span %u+%u) overlaps next node %u at offset %u", i,
+                           n->span.offset, n->span.length, n->end, nodes[n->end].span.offset);
         if (k < USFM_AST_BOOK || k > USFM_AST_ATTRIBUTES) CHECK_AST_FAIL("node %u kind %u", i, k);
         if ((k == USFM_AST_TEXT || k == USFM_AST_OPTBREAK || k == USFM_AST_ARGUMENT ||
              k == USFM_AST_ATTRIBUTES) && n->end != i + 1)
@@ -40,6 +46,12 @@ static int check_ast(const USFM_Ast *ast)
             if (p >= i) CHECK_AST_FAIL("node %u parent %u is not before it", i, p);
             if (i >= nodes[p].end || n->end > nodes[p].end)
                 CHECK_AST_FAIL("node %u not inside parent %u", i, p);
+            if (n->span.offset < nodes[p].span.offset ||
+                (uint64_t)n->span.offset + n->span.length >
+                    (uint64_t)nodes[p].span.offset + nodes[p].span.length)
+                CHECK_AST_FAIL("node %u span %u+%u outside parent %u span %u+%u", i,
+                               n->span.offset, n->span.length, p,
+                               nodes[p].span.offset, nodes[p].span.length);
         }
     }
     for (i = 0; i < chapter_count; i++) {

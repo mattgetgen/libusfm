@@ -88,6 +88,14 @@ static void test_parse_headers(void)
 static void test_parse_number_and_code_diagnostics(void)
 {
     CHECK_DIAGS("\\id gen\n", USFM_VERSION_AUTO, "INVALID_BOOK_CODE 4\n");
+    {
+        USFM_Ast *ast = parse_with_version("\\id gen\n", USFM_VERSION_AUTO);
+        CHECK(ast != NULL);
+        if (ast != NULL) {
+            CHECK_STR(USFM_Ast_GetBookCode(ast), "");
+            USFM_Ast_Free(ast);
+        }
+    }
     CHECK_DIAGS("\\c x\n", USFM_VERSION_AUTO, "INVALID_NUMBER 3\n");
     CHECK_DIAGS("\\c 0\n", USFM_VERSION_AUTO, "INVALID_NUMBER 3\n");
     CHECK_DIAGS("\\c 1\n\\p \\v 5-3 x", USFM_VERSION_AUTO, "INVALID_NUMBER 11\n");
@@ -141,6 +149,60 @@ static void test_parse_verse_ranges(void)
     USFM_Ast_Free(ast);
 }
 
+static void test_parse_container_spans(void)
+{
+    USFM_Ast *ast = parse_with_version("\\c 1\n\n\\p x", USFM_VERSION_AUTO);
+    uint32_t count;
+    const USFM_Node *nodes;
+    CHECK(ast != NULL);
+    if (ast == NULL) return;
+    nodes = USFM_Ast_GetNodes(ast, &count);
+    CHECK_EQ(nodes[1].kind, USFM_AST_CHAPTER);
+    CHECK_EQ(nodes[1].span.offset, 0);
+    CHECK_EQ(nodes[1].span.length, 4);
+    CHECK_EQ(check_ast(ast), 0);
+    USFM_Ast_Free(ast);
+
+    ast = parse_with_version("\\p a  \n\\p b", USFM_VERSION_AUTO);
+    CHECK(ast != NULL);
+    if (ast == NULL) return;
+    nodes = USFM_Ast_GetNodes(ast, &count);
+    CHECK_EQ(nodes[1].kind, USFM_AST_PARA);
+    CHECK_EQ(nodes[1].span.offset, 0);
+    CHECK(nodes[1].span.length <= 7);
+    CHECK_EQ(check_ast(ast), 0);
+    USFM_Ast_Free(ast);
+}
+
+static void test_parse_verses_sorted(void)
+{
+    static const struct { const char *text; int sorted; } cases[] = {
+        { "\\c 1\n\\p \\v 1-5 a \\v 3 b", 0 },
+        { "\\c 1\n\\p \\v 3a a \\v 3b b \\v 4 c", 1 },
+        { "\\c 1\n\\p \\v 1 a \\v 2 b", 1 },
+    };
+    size_t i;
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        USFM_Ast *ast = parse_with_version(cases[i].text, USFM_VERSION_AUTO);
+        CHECK(ast != NULL);
+        if (ast == NULL) continue;
+        CHECK_EQ(ast->verses_sorted, cases[i].sorted);
+        USFM_Ast_Free(ast);
+    }
+}
+
+static void test_parse_empty_input_is_static(void)
+{
+    char buf[1] = { 'x' };
+    USFM_Ast *ast = USFM_Ast_ParseOpts(buf, 0, NULL, USFM_PARSE_DEFAULT, NULL, NULL);
+    uint32_t len = 5;
+    CHECK(ast != NULL);
+    if (ast == NULL) return;
+    CHECK(USFM_Ast_GetInput(ast, &len) != buf);
+    CHECK_EQ(len, 0);
+    USFM_Ast_Free(ast);
+}
+
 static void test_parse_bad_arguments(void)
 {
     USFM_Err err;
@@ -166,5 +228,8 @@ static void run_parser_tests(void)
     RUN(test_parse_number_and_code_diagnostics);
     RUN(test_parse_book_code_and_tables);
     RUN(test_parse_verse_ranges);
+    RUN(test_parse_container_spans);
+    RUN(test_parse_verses_sorted);
+    RUN(test_parse_empty_input_is_static);
     RUN(test_parse_bad_arguments);
 }

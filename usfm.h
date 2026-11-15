@@ -1423,7 +1423,7 @@ struct USFM_Ast {
     uint32_t           input_length;
     uint8_t            version;             /* resolved enum USFM_Version */
     uint8_t            chapters_sorted;     /* strictly increasing numbers */
-    uint8_t            verses_sorted;       /* strictly increasing per chapter */
+    uint8_t            verses_sorted;       /* per chapter: increasing, no overlap */
     uint8_t            reserved;
     USFM_Node         *nodes;
     uint32_t           node_count, node_capacity;
@@ -1798,6 +1798,17 @@ static void usfm__add_chapter(USFM_Parser *p, uint32_t node, uint32_t number)
     if (number > ast->max_chapter) ast->max_chapter = number;
 }
 
+/* True if `next` can follow `prev` in a chapter's verse table without
+ * breaking the sorted-and-non-overlapping order: it starts after prev
+ * ends, or both share a verse number and next's segment starts after
+ * prev's last segment (`\v 3a` then `\v 3b`). */
+static int usfm__verse_follows(const USFM_VerseRef *prev, const USFM_VerseRef *next)
+{
+    if (next->verse_first > prev->verse_last) return 1;
+    return next->verse_first == prev->verse_last && prev->segment_last != 0 &&
+           next->segment_first > prev->segment_last;
+}
+
 static void usfm__add_verse(USFM_Parser *p, uint32_t node, const USFM_VerseRef *ref)
 {
     USFM_Ast *ast = p->ast;
@@ -1818,7 +1829,7 @@ static void usfm__add_verse(USFM_Parser *p, uint32_t node, const USFM_VerseRef *
     if (ast->chapter_count > 0) {
         USFM_ChapterEntry *chapter = &ast->chapters[ast->chapter_count - 1];
         if (chapter->verse_count > 0 &&
-            ast->verses[ast->verse_count - 2].ref.verse_first >= ref->verse_first) {
+            !usfm__verse_follows(&ast->verses[ast->verse_count - 2].ref, ref)) {
             ast->verses_sorted = 0;
         }
         chapter->verse_count++;
@@ -1893,7 +1904,7 @@ static void usfm__on_id(USFM_Parser *p, const USFM_ScanToken *t)
     if (!has || !usfm__valid_book_code(ast->input, arg)) {
         usfm__diag(p, USFM_DIAGNOSTIC_INVALID_BOOK_CODE, arg, USFM_M_ID);
     }
-    if (has && arg.length == 3 && ast->book_code[0] == '\0') {
+    if (has && usfm__valid_book_code(ast->input, arg) && ast->book_code[0] == '\0') {
         memcpy(ast->book_code, ast->input + arg.offset, 3);
         ast->book_code[3] = '\0';
     }
@@ -2048,7 +2059,9 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     ast->alc = *alc;
     ast->chapters_sorted = 1;
     ast->verses_sorted = 1;
-    if ((flags & USFM_PARSE_COPY_INPUT) && input_length > 0) {
+    if (input_length == 0) {
+        text = ""; /* never hand back a caller pointer for an empty input */
+    } else if (flags & USFM_PARSE_COPY_INPUT) {
         ast->owned_input = (char *)usfm__alloc(alc, input_length);
         if (ast->owned_input == NULL) {
             USFM_Ast_Free(ast);
@@ -2078,6 +2091,9 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     p.lookahead_node = USFM_NIL;
     usfm__scan_init(&p.scan, text, input_length);
     usfm__open(&p, USFM_AST_BOOK, usfm__span(0, input_length), USFM_M_NONE, 0, 0);
+    /* The BOOK span covers the whole input, which would otherwise make
+     * every later container stretch to the end of the input on close. */
+    p.last_end = 0;
     usfm__parse(&p);
     if (!p.failed) usfm__finish(&p);
     if (p.failed) {
