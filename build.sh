@@ -37,6 +37,16 @@ run_codegen() {
     fi
 }
 
+# Unpack the WEB corpus once (and again whenever the archive changes).
+unpack_corpus() {
+    mkdir -p build/corpus
+    if [[ ! -f build/corpus/WEB.stamp || tests/corpus/WEB.tar.gz -nt build/corpus/WEB.stamp ]]; then
+        rm -rf build/corpus/WEB
+        tar -xzf tests/corpus/WEB.tar.gz -C build/corpus
+        touch build/corpus/WEB.stamp
+    fi
+}
+
 case "$MODE" in
     debug)
         run_codegen
@@ -52,6 +62,9 @@ case "$MODE" in
         gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" tests/run_tests.c -o build/run_tests
         g++ -std=c++11 -Wall -Wextra -fsyntax-only tests/cpp_check.cpp
         ./build/run_tests
+        unpack_corpus
+        gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" tests/corpus_test.c -o build/corpus_test
+        ./build/corpus_test build/corpus/WEB
         ;;
     codegen)
         rm -f build/codegen.stamp
