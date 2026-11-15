@@ -34,6 +34,11 @@ The archives were made with
 - Source: World English Bible, eBible.org USFM download
   (https://ebible.org/Scriptures/eng-web_usfm.zip; files `*eng-web.usfm`),
   unchanged. 83 files: Protestant canon, deuterocanon, FRT and GLO.
+- This is a frozen snapshot, built by eBible from source files dated
+  23 May 2026 (see `copr.htm`). eBible revises the WEB from time to time:
+  the download dated 13 Nov 2026 differs, for example, in refined Strong's
+  numbers on some words. Keep this snapshot so its counts stay comparable
+  with the ParatextData, usfmtc and usfm3 results it was verified against.
 - License: public domain. "World English Bible" is a trademark of
   eBible.org (see `copr.htm`).
 - Exercises: a Strong's tag on every word (`\w word|strong="H1234"\w*`,
