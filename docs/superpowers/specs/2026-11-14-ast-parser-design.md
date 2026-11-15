@@ -398,6 +398,14 @@ design and plan.
   marker-lookup microbenchmark that uses WEB's real marker frequencies
   and deliberately includes colliding keys, and with full-parse
   `perf stat` (instructions, L1 misses), not only wall time.
+  - **Done (2026-11-15).** Table size and L1 don't matter: WEB makes
+    1.47M lookups per pass over 54 distinct names (`w` is 92%), L1 misses
+    are under 0.5% of parse cycles, and 256- or 512-slot linear-probing
+    tables were 2-5% slower (probing stops the lookup inlining, and
+    unknown names cost up to 3x more). The 1149-slot table stays. The
+    real cost was `memcmp` compiling to a `bcmp` call in the hot path;
+    replacing it with a byte loop cut 2.3% of instructions (commit
+    903f329).
 - **WebAssembly support.** A `build.sh wasm` mode (clang
   `--target=wasm32`), running the unit and corpus tests under Node, plus
   the `USFM_NO_LIBC` path with a caller-supplied allocator. Needs
