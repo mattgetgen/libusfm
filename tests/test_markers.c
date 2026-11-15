@@ -105,6 +105,19 @@ static void test_lookup_respects_length(void)
     CHECK_EQ(usfm__marker_find("\xc3\xa9", 2), USFM_ROW_NONE);
 }
 
+/* usfm__on_marker's default case is unreachable only if every row has
+ * one of the roles it switches on. */
+static void test_every_role_is_handled(void)
+{
+    size_t count = sizeof USFM_MarkerRows / sizeof USFM_MarkerRows[0];
+    uint32_t bad = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint8_t role = USFM_MarkerRows[i].role;
+        if (role < USFM_ROLE_PARA || role > USFM_ROLE_FIGURE) bad++;
+    }
+    CHECK_EQ(bad, 0);
+}
+
 static void run_markers_tests(void)
 {
     RUN(test_every_row_finds_itself);
@@ -115,4 +128,5 @@ static void run_markers_tests(void)
     RUN(test_byte_classes);
     RUN(test_role_spot_checks);
     RUN(test_lookup_respects_length);
+    RUN(test_every_role_is_handled);
 }

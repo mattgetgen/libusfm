@@ -62,6 +62,15 @@ case "$MODE" in
         gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" tests/run_tests.c -o build/run_tests
         g++ -std=c++11 -Wall -Wextra -fsyntax-only tests/cpp_check.cpp
         ./build/run_tests
+        # Consumers use the default enum ABI: run the unit tests once more
+        # without -fshort-enums.
+        gcc -std=c99 -Wall -Wextra -pedantic "${DEBUG_FLAGS[@]}" tests/run_tests.c \
+            -o build/run_tests_default_enums
+        if ! ./build/run_tests_default_enums 2> build/run_tests_default_enums.log; then
+            cat build/run_tests_default_enums.log >&2
+            exit 1
+        fi
+        echo "default enums: $(tail -n 1 build/run_tests_default_enums.log)"
         unpack_corpus
         gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" tests/corpus_test.c -o build/corpus_test
         ./build/corpus_test build/corpus/WEB

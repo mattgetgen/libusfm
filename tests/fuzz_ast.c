@@ -122,7 +122,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
         USFM_ChapterIter_Init(&chapters, ast);
         while (USFM_ChapterIter_Next(&chapters, &chapter)) {
+            /* The chapter's verses, in table order, then nothing more. */
+            USFM_ChapterVerseIter chapter_verses;
+            USFM_VerseEntry verse;
+            uint32_t seen = 0;
             USFM_Ast_FindChapter(ast, chapter.number, NULL);
+            USFM_ChapterVerseIter_Init(&chapter_verses, ast, &chapter);
+            while (USFM_ChapterVerseIter_Next(&chapter_verses, &verse)) {
+                if (seen >= chapter.verse_count ||
+                    verse.node != verses[chapter.first_verse + seen].node ||
+                    verse.ref.chapter != chapter.number) abort();
+                seen++;
+            }
+            if (seen != chapter.verse_count) abort();
         }
     }
     USFM_Ast_Free(ast);

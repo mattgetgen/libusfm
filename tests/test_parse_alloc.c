@@ -82,10 +82,53 @@ static void test_copy_input_is_independent(void)
     USFM_Ast_Free(ast);
 }
 
+/* An allocator that refuses any single request above 24 MiB. */
+static void *capped_alloc(void *ctx, size_t size)
+{
+    return size > ((size_t)24 << 20) ? NULL : test_alloc(ctx, size);
+}
+
+static void *capped_resize(void *ctx, void *ptr, size_t old_size, size_t new_size)
+{
+    return new_size > ((size_t)24 << 20) ? NULL : test_resize(ctx, ptr, old_size, new_size);
+}
+
+/* The initial node array is only an estimate from the input length; it
+ * is capped (at 1 << 20 nodes), so a large input whose tree is small
+ * does not fail just because of the estimate. */
+static void test_initial_node_estimate_is_capped(void)
+{
+    uint32_t length = 9u << 20;
+    char *input = (char *)malloc(length);
+    TestAlc state;
+    USFM_Alc alc = test_alc(&state, UINT32_MAX);
+    USFM_Err err;
+    USFM_Ast *ast;
+    CHECK(input != NULL);
+    if (input == NULL) return;
+    memset(input, 'a', length);
+    memcpy(input, "\\p ", 3);
+    alc.alloc = capped_alloc;
+    alc.resize = capped_resize;
+    ast = USFM_Ast_ParseOpts(input, length, NULL, USFM_PARSE_DEFAULT, &alc, &err);
+    CHECK(ast != NULL);
+    CHECK_EQ(err.code, USFM_OK);
+    if (ast != NULL) {
+        uint32_t count;
+        USFM_Ast_GetNodes(ast, &count);
+        CHECK_EQ(count, 3);         /* BOOK, PARA, TEXT */
+        USFM_Ast_Free(ast);
+    }
+    CHECK_EQ(state.live_bytes, 0);
+    check_alc_clean(&state);
+    free(input);
+}
+
 static void run_parse_alloc_tests(void)
 {
     RUN(test_parse_with_custom_allocator);
     RUN(test_parse_fails_cleanly_at_every_allocation);
     RUN(test_dropped_diagnostics_keep_the_tree);
     RUN(test_copy_input_is_independent);
+    RUN(test_initial_node_estimate_is_capped);
 }

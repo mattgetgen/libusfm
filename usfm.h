@@ -2479,7 +2479,13 @@ static void usfm__on_sidebar(USFM_Parser *p, const USFM_ScanToken *t)
 {
     uint32_t open = usfm__find_kind(p, USFM_AST_SIDEBAR);
     usfm__trim_last_text(p);
-    if (open != 0) usfm__close_to_depth(p, open - 1);   /* sidebars can't nest */
+    if (open != 0) {
+        /* Sidebars can't nest: the open one was never closed by \esbe. */
+        const USFM_Node *n = &p->ast->nodes[p->stack[open - 1].node];
+        usfm__close_to_depth(p, open);
+        usfm__diag(p, USFM_DIAGNOSTIC_UNCLOSED_MARKER, n->span, n->marker);
+        usfm__close_top(p);
+    }
     usfm__close_to_block(p, 0);
     usfm__open_tok(p, USFM_AST_SIDEBAR, t, 0, 0);
 }
@@ -2567,7 +2573,12 @@ static void usfm__on_marker(USFM_Parser *p, USFM_ScanToken *t)
     case USFM_ROLE_SIDEBAR_END: usfm__on_sidebar_end(p, t); break;
     case USFM_ROLE_PERIPH: usfm__on_periph(p, t); break;
     case USFM_ROLE_FIGURE: usfm__on_figure(p, t); break;
-    default: usfm__on_unknown(p, t); break;
+    default:
+        /* Unreachable: every generated row has one of the roles above.
+         * Release builds fall back to treating the marker as unknown. */
+        USFM_ASSERT(0);
+        usfm__on_unknown(p, t);
+        break;
     }
 }
 
@@ -2609,6 +2620,9 @@ static void usfm__finish(USFM_Parser *p)
     }
 }
 
+/* Cap on the initial node-array estimate (1 << 20 nodes = 20 MiB). */
+#define USFM__NODE_ESTIMATE_MAX (1u << 20)
+
 USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
                                       const USFM_Config *config, uint32_t flags,
                                       const USFM_Alc *alc_in, USFM_Err *err)
@@ -2618,6 +2632,7 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     USFM_Parser p;
     const char *text = input != NULL ? input : "";
     uint8_t version = config != NULL ? config->version : (uint8_t)USFM_VERSION_AUTO;
+    uint32_t estimate;
     void *grown;
 
     usfm__set_err(err, USFM_OK, 0);
@@ -2658,8 +2673,12 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     ast->input_length = input_length;
 
     /* Initial node capacity from the input length (WEB averages about
-     * one node per 12 bytes); grown x2 as needed. */
-    grown = usfm__grow(alc, NULL, &ast->node_capacity, sizeof(USFM_Node), input_length / 8u + 16u);
+     * one node per 12 bytes); grown x2 as needed. The estimate is capped
+     * so a huge input never fails on the estimate alone: past the cap,
+     * growth allocates only what the tree really needs. */
+    estimate = input_length / 8u + 16u;
+    if (estimate > USFM__NODE_ESTIMATE_MAX) estimate = USFM__NODE_ESTIMATE_MAX;
+    grown = usfm__grow(alc, NULL, &ast->node_capacity, sizeof(USFM_Node), estimate);
     if (grown == NULL) {
         USFM_Ast_Free(ast);
         usfm__set_err(err, USFM_ERR_NOMEM, 0);

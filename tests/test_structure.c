@@ -77,6 +77,18 @@ static void test_sidebar(void)
         "  PARA p\n"
         "    TEXT \"out\"\n");
     CHECK_DIAGS("\\p a\\esbe", USFM_VERSION_AUTO, "UNEXPECTED_CLOSE 4\n");
+    /* Sidebars can't nest: a second \esb closes the open one, which was
+     * never closed with \esbe. */
+    CHECK_TREE("\\esb\n\\p a\n\\esb\n\\p b\n\\esbe",
+        "BOOK\n"
+        "  SIDEBAR esb\n"
+        "    PARA p\n"
+        "      TEXT \"a\"\n"
+        "  SIDEBAR esb\n"
+        "    PARA p\n"
+        "      TEXT \"b\"\n");
+    CHECK_DIAGS("\\esb\n\\p a\n\\esb\n\\p b\n\\esbe", USFM_VERSION_AUTO,
+                "UNCLOSED_MARKER 0\n");
 }
 
 static void test_peripheral(void)
