@@ -63,6 +63,48 @@ static void test_byte_classes(void)
     CHECK(!(USFM_ByteClass[' '] & USFM_BC_STOP));
 }
 
+static void test_role_spot_checks(void)
+{
+    /* Guards typos in the hand-written table: one row per role. */
+    static const struct { const char *name; uint8_t role; uint8_t level; uint8_t props; } cases[] = {
+        { "id", USFM_ROLE_ID, 0, USFM_MP_ARG_WORD },
+        { "usfm", USFM_ROLE_HEADER, 0, USFM_MP_ARG_WORD },
+        { "c", USFM_ROLE_CHAPTER, 0, USFM_MP_ARG_WORD },
+        { "v", USFM_ROLE_VERSE, 0, USFM_MP_ARG_WORD },
+        { "p", USFM_ROLE_PARA, 0, 0 },
+        { "s", USFM_ROLE_PARA, 0, USFM_MP_HEADING },
+        { "nd", USFM_ROLE_CHAR, 0, 0 },
+        { "f", USFM_ROLE_NOTE, 0, USFM_MP_ARG_WORD },
+        { "ft", USFM_ROLE_NOTE_PART, 0, 0 },
+        { "xt", USFM_ROLE_NOTE_PART, 0, 0 },
+        { "tr", USFM_ROLE_ROW, 0, 0 },
+        { "tcr", USFM_ROLE_CELL, 0, 0 },
+        { "ts", USFM_ROLE_MILESTONE, 0, 0 },
+        { "esb", USFM_ROLE_SIDEBAR, 0, 0 },
+        { "esbe", USFM_ROLE_SIDEBAR_END, 0, 0 },
+        { "periph", USFM_ROLE_PERIPH, 0, USFM_MP_ARG_LINE },
+        { "fig", USFM_ROLE_FIGURE, 0, 0 },
+        { "s3e", USFM_ROLE_PARA, 3, USFM_MP_HEADING },
+        { "ms2e", USFM_ROLE_PARA, 2, USFM_MP_HEADING },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint32_t row = usfm__marker_find(cases[i].name, (uint32_t)strlen(cases[i].name));
+        CHECK(row != USFM_ROW_NONE);
+        if (row == USFM_ROW_NONE) continue;
+        CHECK_EQ(USFM_MarkerRows[row].role, cases[i].role);
+        CHECK_EQ(USFM_MarkerRows[row].level, cases[i].level);
+        CHECK_EQ(USFM_MarkerRows[row].props, cases[i].props);
+    }
+}
+
+static void test_lookup_respects_length(void)
+{
+    /* Names are spans into the input, not NUL-terminated strings. */
+    CHECK_EQ(usfm__marker_find("pxx", 1), usfm__marker_find("p", 1));
+    CHECK_EQ(usfm__marker_find("ndx", 2), usfm__marker_find("nd", 2));
+    CHECK_EQ(usfm__marker_find("\xc3\xa9", 2), USFM_ROW_NONE);
+}
+
 static void run_markers_tests(void)
 {
     RUN(test_every_row_finds_itself);
@@ -71,4 +113,6 @@ static void run_markers_tests(void)
     RUN(test_slots_are_collision_free);
     RUN(test_k1_is_a_paragraph);
     RUN(test_byte_classes);
+    RUN(test_role_spot_checks);
+    RUN(test_lookup_respects_length);
 }
