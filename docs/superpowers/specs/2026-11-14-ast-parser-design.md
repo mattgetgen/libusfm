@@ -256,7 +256,9 @@ silently in 2.x and reported in 3.1.
   case parses a snippet and compares a tree dump (in the style of
   `test.ast`) against the expected text. There is at least one case for
   every closing-rule row and every diagnostic code.
-- **Invariants** are checked after every parse in debug builds:
+- **Invariants** are checked by `check_ast()` in `tests/check.h`, after every
+  parse in the unit tests, the corpus test and the fuzzer. The check is not
+  compiled into the library, so callers' parses never pay for it. It verifies:
   - preorder ranges nest correctly;
   - every span lies inside the input;
   - chapter and verse entries point at CHAPTER and VERSE nodes.
