@@ -2058,6 +2058,9 @@ static int usfm__at_line_start(const char *in, uint32_t offset)
  * marker the start of a milestone. */
 static int usfm__milestone_follows(const char *in, uint32_t len, uint32_t after)
 {
+    /* Extra blanks may sit before the "|" or "\*". Bounded by the input;
+     * the blanks are scanned again only as the following text token. */
+    while (after < len && (in[after] == ' ' || in[after] == '\t')) after++;
     return after < len &&
            (in[after] == '|' || (in[after] == '\\' && after + 1 < len && in[after + 1] == '*'));
 }

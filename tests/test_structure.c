@@ -112,6 +112,17 @@ static void test_unknown_char_span_in_para(void)
         "    TEXT \" b\"\n");
 }
 
+static void test_unknown_milestone_extra_blanks(void)
+{
+    CHECK_TREE("\\p a \\zx  |a=\"b\"\\* c",
+        "BOOK\n"
+        "  PARA p\n"
+        "    TEXT \"a \"\n"
+        "    MILESTONE ?zx closed\n"
+        "      ATTRIBUTES \"|a=\\\"b\\\"\"\n"
+        "    TEXT \" c\"\n");
+}
+
 static void run_structure_tests(void)
 {
     RUN(test_table);
@@ -121,5 +132,6 @@ static void run_structure_tests(void)
     RUN(test_sidebar);
     RUN(test_peripheral);
     RUN(test_figure);
+    RUN(test_unknown_milestone_extra_blanks);
     RUN(test_unknown_char_span_in_para);
 }
