@@ -62,6 +62,14 @@ static int check_ast(const USFM_Ast *ast)
             CHECK_AST_FAIL("chapter %u end_node %u", i, c->end_node);
         if ((uint64_t)c->first_verse + c->verse_count > verse_count)
             CHECK_AST_FAIL("chapter %u verses out of range", i);
+        {
+            uint32_t v, last = c->first_verse + c->verse_count;
+            for (v = c->first_verse; v < last; v++) {
+                if (verses[v].node <= c->node || verses[v].node >= c->end_node)
+                    CHECK_AST_FAIL("verse %u (node %u) outside chapter %u (nodes %u..%u)", v,
+                                   verses[v].node, i, c->node, c->end_node);
+            }
+        }
     }
     for (i = 0; i < verse_count; i++) {
         const USFM_VerseEntry *v = &verses[i];

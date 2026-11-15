@@ -184,6 +184,45 @@ static void test_last_verse_ends_at_periph(void)
     USFM_Ast_Free(ast);
 }
 
+/* After \id or \periph no chapter is open: a verse there belongs to no
+ * chapter, exactly like a verse before the first \c. */
+static void test_verse_after_division_is_chapterless(void)
+{
+    static const char *docs[2] = {
+        "\\id GEN\n\\c 1\n\\p \\v 1 a\n\\id EXO\n\\p \\v 1 b",
+        "\\id GEN\n\\c 1\n\\p \\v 1 a\n\\periph X\n\\p \\v 1 b"
+    };
+    int d;
+    for (d = 0; d < 2; d++) {
+        USFM_Ast *ast = parse_with_version(docs[d], USFM_VERSION_AUTO);
+        uint32_t chapter_count, verse_count, diag_count;
+        const USFM_ChapterEntry *chapters = USFM_Ast_GetChapters(ast, &chapter_count);
+        const USFM_VerseEntry *verses = USFM_Ast_GetVerses(ast, &verse_count);
+        const USFM_Diagnostic *diags = USFM_Ast_GetDiagnostics(ast, &diag_count);
+        CHECK_EQ(chapter_count, 1);
+        CHECK_EQ(chapters[0].verse_count, 1);
+        CHECK_EQ(verse_count, 2);
+        CHECK_EQ(verses[0].ref.chapter, 1);
+        CHECK_EQ(verses[1].ref.chapter, 0);
+        CHECK_EQ(diag_count, 1);
+        if (diag_count == 1) CHECK_EQ(diags[0].code, USFM_DIAGNOSTIC_VERSE_BEFORE_CHAPTER);
+        CHECK_EQ(check_ast(ast), 0);
+        USFM_Ast_Free(ast);
+    }
+    /* A \c after the division opens a chapter again. */
+    {
+        USFM_Ast *ast = parse_with_version("\\id GEN\n\\c 1\n\\p \\v 1 a\n\\id EXO\n\\c 1\n\\p \\v 1 b",
+                                           USFM_VERSION_AUTO);
+        uint32_t verse_count, diag_count;
+        const USFM_VerseEntry *verses = USFM_Ast_GetVerses(ast, &verse_count);
+        USFM_Ast_GetDiagnostics(ast, &diag_count);
+        CHECK_EQ(verse_count, 2);
+        if (verse_count == 2) CHECK_EQ(verses[1].ref.chapter, 1);
+        CHECK_EQ(diag_count, 0);
+        USFM_Ast_Free(ast);
+    }
+}
+
 static void run_iter_tests(void)
 {
     RUN(test_find_chapter_and_verse);
@@ -195,4 +234,5 @@ static void run_iter_tests(void)
     RUN(test_chapter_iterators);
     RUN(test_find_verse_reversed_range);
     RUN(test_last_verse_ends_at_periph);
+    RUN(test_verse_after_division_is_chapterless);
 }

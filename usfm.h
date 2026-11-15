@@ -1501,6 +1501,9 @@ typedef struct USFM_Parser {
     uint8_t          failed;            /* a tree array could not grow */
     uint8_t          version;           /* resolved; \usfm may change it */
     uint8_t          version_auto;      /* config said AUTO */
+    uint8_t          chapter_open;      /* a \c is open: set by \c, cleared
+                                           by \id and \periph */
+    uint8_t          reserved[3];
     uint32_t         depth;
     uint32_t         last_end;          /* end of the last token placed */
     USFM_CloserTable closers[2];        /* [in_note]: see usfm__closer_ahead */
@@ -1824,14 +1827,17 @@ static void usfm__add_chapter(USFM_Parser *p, uint32_t node, uint32_t number)
     e->end_node = USFM_NIL;
     e->first_verse = ast->verse_count;
     if (number > ast->max_chapter) ast->max_chapter = number;
+    p->chapter_open = 1;
 }
 
 /* \id and \periph start a new top-level division: the open verse and
- * chapter end there, so their content never runs into it. */
+ * chapter end there, so their content never runs into it. Verses after
+ * it belong to no chapter until the next \c. */
 static void usfm__end_division(USFM_Parser *p, uint32_t node)
 {
     USFM_Ast *ast = p->ast;
     usfm__end_open_verse(p, node);
+    p->chapter_open = 0;
     if (ast->chapter_count > 0 && ast->chapters[ast->chapter_count - 1].end_node == USFM_NIL) {
         ast->chapters[ast->chapter_count - 1].end_node = node;
     }
@@ -1868,7 +1874,7 @@ static void usfm__add_verse(USFM_Parser *p, uint32_t node, const USFM_VerseRef *
     /* A reversed range (\v 7-4, diagnosed) breaks the binary search's
      * assumption that verse_last never decreases. */
     if (ref->verse_first > ref->verse_last) ast->verses_sorted = 0;
-    if (ast->chapter_count > 0) {
+    if (p->chapter_open) {
         USFM_ChapterEntry *chapter = &ast->chapters[ast->chapter_count - 1];
         if (chapter->verse_count > 0 &&
             !usfm__verse_follows(&ast->verses[ast->verse_count - 2].ref, ref)) {
@@ -2007,7 +2013,9 @@ static void usfm__on_verse(USFM_Parser *p, const USFM_ScanToken *t)
         usfm__diag(p, USFM_DIAGNOSTIC_INVALID_NUMBER, arg, USFM_M_V);
     }
     usfm__close_top(p);
-    if (ast->chapter_count == 0) {
+    /* No open chapter (before the first \c, or after \id / \periph):
+     * the verse belongs to no chapter. */
+    if (!p->chapter_open) {
         usfm__diag(p, USFM_DIAGNOSTIC_VERSE_BEFORE_CHAPTER, t->tok.span, USFM_M_V);
     } else {
         ref.chapter = ast->chapters[ast->chapter_count - 1].number;
