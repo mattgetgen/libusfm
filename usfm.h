@@ -86,6 +86,34 @@ extern "C" {
  *   non-NULL, err.code == OK      -> complete
  *   non-NULL, err.code == NOMEM   -> tree complete, some diagnostics
  *                                    were dropped
+ *
+ * Ownership and lifetimes (for C callers and FFI bindings alike)
+ *   - The input is BORROWED: by default the AST points into the caller's
+ *     buffer, which must stay valid and unchanged until USFM_Ast_Free.
+ *     With USFM_PARSE_COPY_INPUT the AST owns a copy and the caller's
+ *     buffer may be freed as soon as USFM_Ast_ParseOpts returns.
+ *   - The AST owns everything it hands out. Every pointer returned by a
+ *     USFM_Ast_* getter (nodes, chapters, verses, diagnostics, input,
+ *     book code) is valid until USFM_Ast_Free and must not be freed by
+ *     the caller. Iterators hold the AST pointer and must not be used
+ *     after USFM_Ast_Free either.
+ *   - Array getters may return NULL when their count is 0; always read
+ *     the count before indexing.
+ *   - Strings from USFM_Err.msg and USFM_DiagnosticCode_GetMessage are
+ *     static and never freed.
+ *
+ * NULL rules
+ *   - A NULL ast is accepted by every USFM_Ast_* getter, by FindChapter
+ *     and FindVerse, and by every iterator Init: they report "nothing"
+ *     (count 0, NULL, USFM_NIL, "" or an iterator that yields nothing).
+ *     USFM_Ast_Free(NULL) is a no-op.
+ *   - The `count` out-parameters of the getters, the `out` parameter of
+ *     FindChapter / FindVerse, `err` and `config` may be NULL.
+ *   - Iterator pointers (`it`) and the output pointer of every *_Next
+ *     must be non-NULL. The entry passed to VerseIter_Init /
+ *     ChapterVerseIter_Init may be NULL (nothing is yielded).
+ *   - USFM_Node_GetLevel / GetFlags / HasFlags take a non-NULL node.
+ *   - `input` may be NULL only when input_length is 0.
  * ------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------
@@ -97,8 +125,15 @@ extern "C" {
 #ifndef USFM_INPUT_MAX
 #define USFM_INPUT_MAX 0x7FFFFFFFu      /* 2 GiB - 1 */
 #endif
-/* Define USFM_ASSERT before including to replace assert().
- * Define USFM_NO_LIBC to drop the default malloc-based allocator. */
+/* Define USFM_ASSERT before including to replace assert(); otherwise
+ * <assert.h> is included and assert() is used.
+ *
+ * Define USFM_NO_LIBC to drop the default allocator: malloc, realloc and
+ * free are no longer referenced, and a NULL allocator fails with
+ * USFM_ERR_NO_ALLOCATOR. It does NOT remove every libc dependency: the
+ * implementation still calls memcpy, memcmp and memset (<string.h>),
+ * and assert() unless USFM_ASSERT is defined. A freestanding build must
+ * provide those three functions and define USFM_ASSERT. */
 
 #define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
 
@@ -126,7 +161,9 @@ typedef struct USFM_Span {
 
 typedef enum USFM_Status {
     USFM_OK = 0,
-    USFM_ERR_CAPACITY,                  /* caller's output buffer too small */
+    USFM_ERR_CAPACITY,                  /* reserved: caller's output buffer
+                                           too small (no v0.1 function
+                                           returns it) */
     USFM_ERR_DEPTH,                     /* reserved */
     USFM_ERR_INPUT_TOO_LARGE,
     USFM_ERR_INVALID_ARG,
@@ -314,7 +351,10 @@ typedef struct USFM_Alc {
 
 /* Releases a block the library allocated and handed out. Pass the
  * logical size; the library applies its rounding. NULL ptr: no-op.
- * alc NULL = the default allocator. */
+ * alc NULL = the default allocator.
+ * No v0.1 function hands out such a block (the AST is released with
+ * USFM_Ast_Free), so callers have no use for this yet; it is kept for
+ * later APIs that return caller-owned buffers. */
 USFM_API void USFM_Alc_Free(const USFM_Alc *alc, void *ptr, size_t size);
 
 /* ---------------------------------------------------------------------
@@ -426,8 +466,12 @@ typedef struct USFM_VerseEntry {
 } USFM_VerseEntry;
 
 /* One per \c in document order. A chapter's verses are
- * verses[first_verse .. first_verse + verse_count). Verses before the
- * first \c belong to no chapter. */
+ * verses[first_verse .. first_verse + verse_count). Verses with no open
+ * chapter (before the first \c, or after \id or \periph until the next
+ * \c) belong to no chapter: their ref.chapter is 0.
+ * Chapter number 0 means the \c had a missing or invalid number
+ * (diagnosed as INVALID_NUMBER); such entries are kept and
+ * USFM_Ast_FindChapter(ast, 0, ...) finds the first of them. */
 typedef struct USFM_ChapterEntry {
     uint16_t number;                    /* \c 3 -> 3; 0 if invalid */
     uint16_t reserved;
@@ -461,8 +505,10 @@ USFM_API const char *USFM_Ast_GetBookCode(const USFM_Ast *ast);
 USFM_API uint8_t     USFM_Ast_GetVersion(const USFM_Ast *ast);
 
 /* Return the node index, or USFM_NIL when absent (*out untouched). A
- * repeated chapter number finds the first occurrence. FindVerse finds
- * the entry whose range contains `verse` (\v 3-5 contains 4). */
+ * repeated chapter number finds the first occurrence; chapter 0 finds
+ * a \c with a missing or invalid number. FindVerse finds the entry
+ * whose range contains `verse` (\v 3-5 contains 4); chapterless verses
+ * are not reachable through it. */
 USFM_API uint32_t USFM_Ast_FindChapter(const USFM_Ast *ast, uint16_t chapter,
                                        USFM_ChapterEntry *out);
 USFM_API uint32_t USFM_Ast_FindVerse(const USFM_Ast *ast, uint16_t chapter,

@@ -223,6 +223,52 @@ static void test_verse_after_division_is_chapterless(void)
     }
 }
 
+/* The NULL rules documented in usfm.h. */
+static void test_null_ast_is_accepted(void)
+{
+    USFM_ChapterIter chapters;
+    USFM_ChapterVerseIter chapter_verses;
+    USFM_VerseIter verses;
+    USFM_ChapterEntry chapter;
+    USFM_VerseEntry verse;
+    USFM_VerseItem item;
+    uint32_t count = 7;
+    CHECK(USFM_Ast_GetInput(NULL, &count) == NULL);
+    CHECK_EQ(count, 0);
+    CHECK(USFM_Ast_GetNodes(NULL, NULL) == NULL);
+    CHECK(USFM_Ast_GetChapters(NULL, &count) == NULL);
+    CHECK(USFM_Ast_GetVerses(NULL, &count) == NULL);
+    CHECK(USFM_Ast_GetDiagnostics(NULL, &count) == NULL);
+    CHECK_EQ(USFM_Ast_GetDroppedDiagnosticCount(NULL), 0);
+    CHECK_EQ(USFM_Ast_GetMaxChapterNumber(NULL), 0);
+    CHECK_STR(USFM_Ast_GetBookCode(NULL), "");
+    CHECK_EQ(USFM_Ast_GetVersion(NULL), USFM_VERSION_AUTO);
+    CHECK_EQ(USFM_Ast_FindChapter(NULL, 1, &chapter), USFM_NIL);
+    CHECK_EQ(USFM_Ast_FindVerse(NULL, 1, 1, &verse), USFM_NIL);
+    USFM_ChapterIter_Init(&chapters, NULL);
+    CHECK_EQ(USFM_ChapterIter_Next(&chapters, &chapter), 0);
+    USFM_ChapterVerseIter_Init(&chapter_verses, NULL, NULL);
+    CHECK_EQ(USFM_ChapterVerseIter_Next(&chapter_verses, &verse), 0);
+    USFM_VerseIter_Init(&verses, NULL, NULL, 0);
+    CHECK_EQ(USFM_VerseIter_Next(&verses, &item), 0);
+    USFM_Ast_Free(NULL);
+}
+
+/* A \c with an invalid number is chapter 0, and FindChapter(0) finds it. */
+static void test_find_chapter_zero(void)
+{
+    USFM_Ast *ast = parse_with_version("\\c x\n\\p \\v 1 a\n\\c 2\n\\p \\v 1 b",
+                                       USFM_VERSION_AUTO);
+    USFM_ChapterEntry chapter;
+    USFM_VerseEntry verse;
+    CHECK(USFM_Ast_FindChapter(ast, 0, &chapter) != USFM_NIL);
+    CHECK_EQ(chapter.number, 0);
+    CHECK_EQ(chapter.verse_count, 1);
+    CHECK(USFM_Ast_FindVerse(ast, 0, 1, &verse) != USFM_NIL);
+    CHECK_EQ(verse.ref.chapter, 0);
+    USFM_Ast_Free(ast);
+}
+
 static void run_iter_tests(void)
 {
     RUN(test_find_chapter_and_verse);
@@ -235,4 +281,6 @@ static void run_iter_tests(void)
     RUN(test_find_verse_reversed_range);
     RUN(test_last_verse_ends_at_periph);
     RUN(test_verse_after_division_is_chapterless);
+    RUN(test_null_ast_is_accepted);
+    RUN(test_find_chapter_zero);
 }
