@@ -5,10 +5,12 @@
 #define USFM_IMPLEMENTATION
 #include "../usfm.h"
 #include "test.h"
+#include "dump.h"
 
 #include "test_basics.c"
 #include "test_markers.c"
 #include "test_alloc.c"
+#include "test_scanner.c"
 
 int main(void)
 {
@@ -18,6 +20,8 @@ int main(void)
     run_markers_tests();
     fprintf(stderr, "alloc\n");
     run_alloc_tests();
+    fprintf(stderr, "scanner\n");
+    run_scanner_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;

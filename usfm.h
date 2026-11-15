@@ -1146,7 +1146,262 @@ static uint32_t usfm__marker_find(const char *name, uint32_t length)
     return index - 1;
 }
 
+/* A token plus what the parser needs about its marker. */
+typedef struct USFM_ScanToken {
+    USFM_Token tok;
+    uint16_t   row;                     /* USFM_MarkerRows index, or
+                                           USFM_ROW_NONE */
+    uint16_t   reserved;
+    uint32_t   name_offset;             /* marker name in the input */
+    uint32_t   name_length;             /* 0 for "\*" and a lone "\" */
+} USFM_ScanToken;
+
+/* Sets t->row, t->tok.marker and the level / milestone bits of
+ * t->tok.level_flags from a marker name. Tries the full name first
+ * (k1, s1e), then base letters + level digits + optional -s / -e /
+ * -<digits> (qt1-s, tc1-2). Anything else is USFM_M_UNKNOWN. */
+static void usfm__classify(const char *name, uint32_t length, USFM_ScanToken *t)
+{
+    uint32_t row = usfm__marker_find(name, length);
+    uint32_t i = 0, base, level = 0;
+    uint8_t flags = 0;
+    t->row = USFM_ROW_NONE;
+    t->tok.marker = USFM_M_UNKNOWN;
+    if (row != USFM_ROW_NONE) {
+        t->row = (uint16_t)row;
+        t->tok.marker = USFM_MarkerRows[row].marker;
+        t->tok.level_flags |= USFM_MarkerRows[row].level;
+        return;
+    }
+    while (i < length && (USFM_ByteClass[(uint8_t)name[i]] & USFM_BC_ALPHA)) i++;
+    base = i;
+    if (base == 0) return;
+    while (i < length && (USFM_ByteClass[(uint8_t)name[i]] & USFM_BC_DIGIT)) {
+        if (level < 100) level = level * 10u + (uint32_t)(name[i] - '0');
+        i++;
+    }
+    if (i < length && name[i] == '-') {
+        if (i + 2 == length && name[i + 1] == 's') {
+            flags = USFM_TF_MILESTONE_START;
+            i = length;
+        } else if (i + 2 == length && name[i + 1] == 'e') {
+            flags = USFM_TF_MILESTONE_END;
+            i = length;
+        } else if (level > 0) {         /* column span: \tc1-2 */
+            uint32_t j = i + 1;
+            while (j < length && (USFM_ByteClass[(uint8_t)name[j]] & USFM_BC_DIGIT)) j++;
+            if (j > i + 1 && j == length) i = length;
+        }
+    }
+    if (i != length) return;
+    row = usfm__marker_find(name, base);
+    if (row == USFM_ROW_NONE) return;
+    t->row = (uint16_t)row;
+    t->tok.marker = USFM_MarkerRows[row].marker;
+    t->tok.level_flags |= (uint8_t)((level > 15u ? 15u : level) | flags);
+}
+
 /* ===== Scanner ===== */
+
+enum { USFM_ARG_NONE = 0, USFM_ARG_WORD, USFM_ARG_LINE };
+
+typedef struct USFM_Scanner {
+    const char *input;
+    uint32_t    length;
+    uint32_t    position;
+    uint8_t     expect_arg;             /* set after a marker that takes one */
+    uint8_t     pipe_is_attr;           /* set by the parser before each call */
+    uint16_t    reserved;
+} USFM_Scanner;
+
+static void usfm__scan_init(USFM_Scanner *s, const char *input, uint32_t length)
+{
+    memset(s, 0, sizeof *s);
+    s->input = input;
+    s->length = length;
+    if (length >= 3 && (uint8_t)input[0] == 0xEF && (uint8_t)input[1] == 0xBB &&
+        (uint8_t)input[2] == 0xBF) {
+        s->position = 3;                /* UTF-8 BOM */
+    }
+}
+
+static USFM_Span usfm__span(uint32_t offset, uint32_t length)
+{
+    USFM_Span s;
+    s.offset = offset;
+    s.length = length;
+    return s;
+}
+
+static void usfm__tok(USFM_ScanToken *t, uint8_t kind, uint32_t start, uint32_t end)
+{
+    memset(t, 0, sizeof *t);
+    t->tok.span = usfm__span(start, end - start);
+    t->tok.kind = kind;
+    t->row = USFM_ROW_NONE;
+}
+
+/* Consumes the one whitespace character that ends an opening marker or
+ * an argument: space, tab, LF, CR or CRLF. */
+static uint32_t usfm__skip_one_ws(const char *in, uint32_t len, uint32_t i)
+{
+    if (i >= len) return i;
+    if (in[i] == ' ' || in[i] == '\t' || in[i] == '\n') return i + 1;
+    if (in[i] == '\r') return (i + 1 < len && in[i + 1] == '\n') ? i + 2 : i + 1;
+    return i;
+}
+
+/* in[i] is a backslash: is it an escape (\\ \/ \| \~ \") rather than a
+ * marker? */
+static int usfm__is_escape(const char *in, uint32_t len, uint32_t i)
+{
+    return i + 1 < len && (USFM_ByteClass[(uint8_t)in[i + 1]] & USFM_BC_ESCAPE) != 0;
+}
+
+static int usfm__scan_marker(USFM_Scanner *s, USFM_ScanToken *t)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    uint32_t start = s->position;
+    uint32_t i = start + 1, name_start, name_length;
+    uint8_t kind = USFM_TOK_MARKER, nested = 0;
+    if (i < len && in[i] == '*') {      /* "\*" closes a milestone */
+        usfm__tok(t, USFM_TOK_MARKER_END, start, i + 1);
+        t->tok.level_flags = USFM_TF_SELF_CLOSED;
+        s->position = i + 1;
+        return 1;
+    }
+    if (i < len && in[i] == '+') {
+        nested = 1;
+        i++;
+    }
+    name_start = i;
+    while (i < len && (USFM_ByteClass[(uint8_t)in[i]] & USFM_BC_NAME)) i++;
+    name_length = i - name_start;
+    if (name_length > 0 && i < len && in[i] == '*') {
+        kind = USFM_TOK_MARKER_END;
+        i++;
+    } else {
+        i = usfm__skip_one_ws(in, len, i);
+    }
+    usfm__tok(t, kind, start, i);
+    t->name_offset = name_start;
+    t->name_length = name_length;
+    t->tok.level_flags = nested ? USFM_TF_NESTED : 0;
+    usfm__classify(in + name_start, name_length, t);
+    if (kind == USFM_TOK_MARKER && t->row != USFM_ROW_NONE &&
+        !(t->tok.level_flags & (USFM_TF_MILESTONE_START | USFM_TF_MILESTONE_END))) {
+        uint8_t props = USFM_MarkerRows[t->row].props;
+        if (props & USFM_MP_ARG_WORD) s->expect_arg = USFM_ARG_WORD;
+        else if (props & USFM_MP_ARG_LINE) s->expect_arg = USFM_ARG_LINE;
+    }
+    s->position = i;
+    return 1;
+}
+
+/* Scans the argument a marker asked for. Returns 0 (consuming nothing)
+ * if there is none. */
+static int usfm__scan_argument(USFM_Scanner *s, USFM_ScanToken *t, uint8_t mode)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    uint32_t i = s->position, start, end;
+    while (i < len && (in[i] == ' ' || in[i] == '\t')) i++;
+    start = i;
+    if (mode == USFM_ARG_WORD) {
+        while (i < len && in[i] != '\\' &&
+               !(USFM_ByteClass[(uint8_t)in[i]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) i++;
+    } else {
+        while (i < len && in[i] != '\\' && in[i] != '|' &&
+               !(USFM_ByteClass[(uint8_t)in[i]] & USFM_BC_NEWLINE)) i++;
+    }
+    end = i;
+    if (mode == USFM_ARG_LINE) {
+        while (end > start && (in[end - 1] == ' ' || in[end - 1] == '\t')) end--;
+    }
+    if (end == start) return 0;
+    usfm__tok(t, USFM_TOK_ARGUMENT, start, end);
+    s->position = mode == USFM_ARG_WORD ? usfm__skip_one_ws(in, len, i) : i;
+    return 1;
+}
+
+/* Returns 1 and fills *t, or 0 at end of input. Every call that
+ * returns 1 consumes at least one byte, so a caller's loop is bounded
+ * by the input length. */
+static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    uint32_t start, i;
+    uint8_t flags = 0;
+    if (s->expect_arg != USFM_ARG_NONE) {
+        uint8_t mode = s->expect_arg;
+        s->expect_arg = USFM_ARG_NONE;
+        if (usfm__scan_argument(s, t, mode)) return 1;
+    }
+    start = s->position;
+    if (start >= len) return 0;
+    if (in[start] == '\\' && !usfm__is_escape(in, len, start)) return usfm__scan_marker(s, t);
+    if (in[start] == '|' && s->pipe_is_attr) {
+        uint32_t end;
+        i = start + 1;
+        /* Attributes run to the next marker; escapes don't end them. */
+        while (i < len) {
+            if (in[i] == '\\') {
+                if (!usfm__is_escape(in, len, i)) break;
+                i += 2;
+                continue;
+            }
+            i++;
+        }
+        if (i > len) i = len;
+        end = i;
+        while (end > start + 1 &&
+               (USFM_ByteClass[(uint8_t)in[end - 1]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) end--;
+        usfm__tok(t, USFM_TOK_ATTRIBUTES, start, end);
+        s->position = i;
+        return 1;
+    }
+    if (in[start] == '/' && start + 1 < len && in[start + 1] == '/') {
+        usfm__tok(t, USFM_TOK_OPTBREAK, start, start + 2);
+        s->position = start + 2;
+        return 1;
+    }
+    /* Text: skip quickly over bytes that are not STOP bytes. */
+    i = start;
+    while (i < len) {
+        uint8_t b = (uint8_t)in[i];
+        if (!(USFM_ByteClass[b] & USFM_BC_STOP)) {
+            i++;
+            continue;
+        }
+        if (b == '\\') {
+            if (!usfm__is_escape(in, len, i)) break;
+            flags |= USFM_TF_HAS_ESCAPE;
+            i += 2;
+            continue;
+        }
+        if (b == '|') {
+            if (s->pipe_is_attr) break;
+            i++;
+            continue;
+        }
+        if (b == '/') {
+            if (i + 1 < len && in[i + 1] == '/') break;
+            i++;
+            continue;
+        }
+        if (b == '~') flags |= USFM_TF_HAS_NBSP;
+        else flags |= USFM_TF_HAS_LOOSE_WS;      /* CR, LF, TAB */
+        i++;
+    }
+    if (i > len) i = len;
+    USFM_ASSERT(i > start);
+    usfm__tok(t, USFM_TOK_TEXT, start, i);
+    t->tok.level_flags = flags;
+    s->position = i;
+    return 1;
+}
 
 /* ===== AST handle ===== */
 
