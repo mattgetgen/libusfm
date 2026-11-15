@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-
+# Modes: debug (default), release, test, fuzz, codegen.
 set -e
+cd "$(dirname "$0")"
 
 MODE="${1:-debug}"
 
@@ -25,20 +26,39 @@ RELEASE_FLAGS=(
     -march=native
 )
 
+# Regenerate usfm.h tables when the generator or its data changed.
+run_codegen() {
+    mkdir -p build
+    if [[ ! -f build/codegen.stamp \
+          || codegen/codegen.c -nt build/codegen.stamp \
+          || codegen/markers.h -nt build/codegen.stamp ]]; then
+        (cd codegen && ./build.sh && ./codegen --overwrite)
+        touch build/codegen.stamp
+    fi
+}
+
 case "$MODE" in
     debug)
-        CC=gcc
-        CFLAGS=("${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}")
+        run_codegen
+        gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" main.c -o usfm
         ;;
     release)
-        CC=clang
-        CFLAGS=("${COMMON_FLAGS[@]}" "${RELEASE_FLAGS[@]}")
+        run_codegen
+        clang "${COMMON_FLAGS[@]}" "${RELEASE_FLAGS[@]}" main.c -o usfm
+        ;;
+    test)
+        run_codegen
+        mkdir -p build
+        gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" tests/run_tests.c -o build/run_tests
+        g++ -std=c++11 -Wall -Wextra -fsyntax-only tests/cpp_check.cpp
+        ./build/run_tests
+        ;;
+    codegen)
+        rm -f build/codegen.stamp
+        run_codegen
         ;;
     *)
-        echo "Usage: $0 [debug|release]"
+        echo "Usage: $0 [debug|release|test|fuzz|codegen]"
         exit 1
         ;;
 esac
-
-$CC "${CFLAGS[@]}" main.c -o usfm
-

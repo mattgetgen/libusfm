@@ -4,3 +4,6 @@ codegen
 
 # codegen output
 usfm_copy.h
+
+# build outputs
+build/

@@ -39,690 +39,627 @@
      SOFTWARE.
  */
 
-#ifndef USFM_HEADER
-#define USFM_HEADER
+#ifndef USFM_H
+#define USFM_H
 
 #define USFM_VERSION_MAJOR 0
-#define USFM_VERSION_MINOR 0
+#define USFM_VERSION_MINOR 1
 #define USFM_VERSION_PATCH 0
-#define USFM_VERSION "0.0.0-dev"
+#define USFM_VERSION "0.1.0-dev"
 
-#include <assert.h>
-#include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
+#include <stddef.h>
 
-typedef enum {
-    USFM_OK,
-    USFM_OUT_OF_MEMORY,
-} USFM_Result;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-typedef enum {
-    USFM_TOKEN_UNKNOWN,
-    USFM_TOKEN_WHITESPACE,
-    USFM_TOKEN_NEWLINE,
-    USFM_TOKEN_MARKER_START,
-    USFM_TOKEN_MARKER_TEXT,
-    USFM_TOKEN_MARKER_NUMBER,
-    USFM_TOKEN_MARKER_NESTED,
-    USFM_TOKEN_MARKER_CLOSE,
-    USFM_TOKEN_MARKER_SUFFIX,
-    USFM_TOKEN_TEXT,
-    USFM_TOKEN_NUMBER,
-    USFM_TOKEN_PLUS,
-    USFM_TOKEN_MINUS,
-    USFM_TOKEN_ASTERISK,
-} USFM_TokenType;
+/* ---------------------------------------------------------------------
+ * Overview
+ *
+ * Single-header USFM parser. C99, compiles as C++.
+ * In exactly one translation unit:
+ *     #define USFM_IMPLEMENTATION
+ *     #include "usfm.h"
+ *
+ *     USFM_Err err;
+ *     USFM_Ast *ast = USFM_Ast_Parse(src, len, NULL, &err);
+ *     if (!ast) { ... err.code, err.msg, err.pos ... }
+ *     ...
+ *     USFM_Ast_Free(ast);
+ *
+ * Ground rules (NASA Power of 10 + TigerStyle):
+ *   - All allocation goes through a pluggable allocator (USFM_Alc).
+ *   - No recursion. The parser drives an explicit stack of
+ *     USFM_STACK_DEPTH open containers.
+ *   - Every loop is bounded by the input length or a constant.
+ *   - Trees use u32 indices, not pointers. Sizes are u32.
+ *   - Zero-copy: all text is a (offset, length) span into the input.
+ *   - Malformed USFM is never an error: it produces diagnostics.
+ *
+ * Failure semantics
+ *   NULL                          -> failed, nothing to free (see err)
+ *   non-NULL, err.code == OK      -> complete
+ *   non-NULL, err.code == NOMEM   -> tree complete, some diagnostics
+ *                                    were dropped
+ * ------------------------------------------------------------------- */
 
-typedef struct {
-    uint32_t offset;
-    uint32_t length;
-    USFM_TokenType type;
+/* ---------------------------------------------------------------------
+ * Compile-time configuration
+ * ------------------------------------------------------------------- */
+#ifndef USFM_STACK_DEPTH
+#define USFM_STACK_DEPTH 64u            /* max open containers */
+#endif
+#ifndef USFM_INPUT_MAX
+#define USFM_INPUT_MAX 0x7FFFFFFFu      /* 2 GiB - 1 */
+#endif
+#ifndef USFM_ASSERT
+#include <assert.h>
+#define USFM_ASSERT(x) assert(x)
+#endif
+/* Define USFM_NO_LIBC to drop the default malloc-based allocator. */
+
+#define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
+
+#ifndef USFM_API
+#  if defined(USFM_SHARED) && defined(_WIN32)
+#    ifdef USFM_BUILD
+#      define USFM_API __declspec(dllexport)
+#    else
+#      define USFM_API __declspec(dllimport)
+#    endif
+#  elif defined(USFM_SHARED) && defined(__GNUC__)
+#    define USFM_API __attribute__((visibility("default")))
+#  else
+#    define USFM_API
+#  endif
+#endif
+
+/* ---------------------------------------------------------------------
+ * Basic types
+ * ------------------------------------------------------------------- */
+typedef struct USFM_Span {
+    uint32_t offset;                    /* byte offset into input */
+    uint32_t length;                    /* byte length */
+} USFM_Span;
+
+typedef enum USFM_Status {
+    USFM_OK = 0,
+    USFM_ERR_CAPACITY,                  /* caller's output buffer too small */
+    USFM_ERR_DEPTH,                     /* reserved */
+    USFM_ERR_INPUT_TOO_LARGE,
+    USFM_ERR_INVALID_ARG,
+    USFM_ERR_NOMEM,                     /* allocator returned NULL */
+    USFM_ERR_NO_ALLOCATOR               /* NULL allocator + USFM_NO_LIBC */
+} USFM_Status;
+
+/* Filled by every function that can fail (pass NULL to ignore). */
+typedef struct USFM_Err {
+    const char *msg;                    /* static string, never NULL */
+    uint32_t    code;                   /* USFM_Status */
+    uint32_t    pos;                    /* byte offset reached in input */
+} USFM_Err;
+
+enum USFM_Version {
+    USFM_VERSION_AUTO = 0,              /* read \usfm, else assume 3.1 */
+    USFM_VERSION_1,
+    USFM_VERSION_2,
+    USFM_VERSION_3_0,
+    USFM_VERSION_3_1
+};
+
+/* Marker ids. Values are part of the ABI: never renumber or reuse one;
+ * append new markers before USFM_M_CUSTOM_BASE. Numbered markers share
+ * a base id and carry the number as a level: \q2 -> (USFM_M_Q, 2). */
+typedef uint16_t USFM_Marker;
+enum {
+    USFM_M_NONE = 0,                    /* not a marker */
+    USFM_M_UNKNOWN = 1,                 /* name available via span */
+
+    /* Identification */
+    USFM_M_ID = 2, USFM_M_USFM = 3,
+
+    /* Chapters and verses */
+    USFM_M_C = 4, USFM_M_CA = 5, USFM_M_CP = 6,
+    USFM_M_V = 7, USFM_M_VA = 8, USFM_M_VP = 9,
+
+    /* Paragraphs */
+    USFM_M_B = 10, USFM_M_CD = 11, USFM_M_CL = 12, USFM_M_CLS = 13,
+    USFM_M_D = 14, USFM_M_H = 15, USFM_M_IB = 16, USFM_M_IDE = 17,
+    USFM_M_IE = 18, USFM_M_IEX = 19, USFM_M_ILI = 20, USFM_M_IM = 21,
+    USFM_M_IMI = 22, USFM_M_IMQ = 23, USFM_M_IMT = 24, USFM_M_IMTE = 25,
+    USFM_M_IO = 26, USFM_M_IOT = 27, USFM_M_IP = 28, USFM_M_IPC = 29,
+    USFM_M_IPI = 30, USFM_M_IPQ = 31, USFM_M_IPR = 32, USFM_M_IQ = 33,
+    USFM_M_IS = 34, USFM_M_LF = 35, USFM_M_LH = 36, USFM_M_LI = 37,
+    USFM_M_LIM = 38, USFM_M_LIT = 39, USFM_M_M = 40, USFM_M_MI = 41,
+    USFM_M_MR = 42, USFM_M_MS = 43, USFM_M_MT = 44, USFM_M_MTE = 45,
+    USFM_M_NB = 46, USFM_M_P = 47, USFM_M_PB = 48, USFM_M_PC = 49,
+    USFM_M_PI = 50, USFM_M_PM = 51, USFM_M_PMC = 52, USFM_M_PMO = 53,
+    USFM_M_PMR = 54, USFM_M_PO = 55, USFM_M_PR = 56, USFM_M_Q = 57,
+    USFM_M_QA = 58, USFM_M_QC = 59, USFM_M_QD = 60, USFM_M_QM = 61,
+    USFM_M_QR = 62, USFM_M_R = 63, USFM_M_REM = 64, USFM_M_S = 65,
+    USFM_M_SD = 66, USFM_M_SP = 67, USFM_M_SR = 68, USFM_M_STS = 69,
+    USFM_M_TOC = 70, USFM_M_TOCA = 71, USFM_M_TR = 72,
+
+    /* Character styles */
+    USFM_M_ADD = 73, USFM_M_BD = 74, USFM_M_BDIT = 75, USFM_M_BK = 76,
+    USFM_M_DC = 77, USFM_M_EM = 78, USFM_M_FM = 79, USFM_M_FV = 80,
+    USFM_M_IOR = 81, USFM_M_IQT = 82, USFM_M_IT = 83, USFM_M_JMP = 84,
+    USFM_M_K = 85, USFM_M_LIK = 86, USFM_M_LITL = 87, USFM_M_LIV = 88,
+    USFM_M_ND = 89, USFM_M_NO = 90, USFM_M_ORD = 91, USFM_M_PN = 92,
+    USFM_M_PNG = 93, USFM_M_QAC = 94, USFM_M_QS = 95, USFM_M_QT = 96,
+    USFM_M_RB = 97, USFM_M_REF = 98, USFM_M_RQ = 99, USFM_M_SC = 100,
+    USFM_M_SIG = 101, USFM_M_SLS = 102, USFM_M_SUP = 103, USFM_M_TL = 104,
+    USFM_M_W = 105, USFM_M_WA = 106, USFM_M_WG = 107, USFM_M_WH = 108,
+    USFM_M_WJ = 109,
+
+    /* Notes */
+    USFM_M_EF = 110, USFM_M_EFE = 111, USFM_M_EX = 112, USFM_M_F = 113,
+    USFM_M_FE = 114, USFM_M_X = 115,
+
+    /* Note content */
+    USFM_M_FK = 116, USFM_M_FL = 117, USFM_M_FP = 118, USFM_M_FQ = 119,
+    USFM_M_FQA = 120, USFM_M_FR = 121, USFM_M_FT = 122, USFM_M_FW = 123,
+    USFM_M_XK = 124, USFM_M_XNT = 125, USFM_M_XO = 126, USFM_M_XOP = 127,
+    USFM_M_XOT = 128, USFM_M_XQ = 129, USFM_M_XT = 130, USFM_M_XTA = 131,
+
+    /* Table cells */
+    USFM_M_TC = 132, USFM_M_TCC = 133, USFM_M_TCR = 134, USFM_M_TH = 135,
+    USFM_M_THC = 136, USFM_M_THR = 137,
+
+    /* Milestones */
+    USFM_M_TS = 138,
+
+    /* Figures, peripherals, sidebars, categories */
+    USFM_M_CAT = 139, USFM_M_ESB = 140, USFM_M_ESBE = 141, USFM_M_FIG = 142,
+    USFM_M_PERIPH = 143,
+
+    /* Deprecated (still found in older files) */
+    USFM_M_ADDPN = 144, USFM_M_FDC = 145, USFM_M_FS = 146, USFM_M_PH = 147,
+    USFM_M_PHI = 148, USFM_M_PRO = 149, USFM_M_XDC = 150,
+
+    /* Obsolete (removed before 2.1) */
+    USFM_M_CONC = 151, USFM_M_COV = 152, USFM_M_GLO = 153, USFM_M_IDX = 154,
+    USFM_M_INTRO = 155, USFM_M_MAPS = 156, USFM_M_PREF = 157, USFM_M_PS = 158,
+    USFM_M_PSI = 159, USFM_M_PUB = 160, USFM_M_PUBINFO = 161,
+    USFM_M_SPINE = 162, USFM_M_WR = 163,
+
+    /* Stylesheet-only (defined in usfm.sty, not the spec) */
+    USFM_M_EFM = 164, USFM_M_NDX = 165, USFM_M_XTSEE = 166,
+    USFM_M_XTSEEALSO = 167,
+
+    /* Tool-specific */
+    USFM_M_ERQ = 168, USFM_M_ERQE = 169, USFM_M_MSE = 170,
+    USFM_M_RESTORE = 171, USFM_M_SE = 172,
+
+    /* Drafts (3.1.2 / 3.2 development, not yet released) */
+    USFM_M_ILIT = 173, USFM_M_LIST = 174, USFM_M_PL = 175, USFM_M_T = 176,
+    USFM_M_TA = 177, USFM_M_TABLE = 178, USFM_M_VID = 179, USFM_M_WL = 180,
+
+    USFM_M_CUSTOM_BASE = 0x8000         /* + stylesheet style index */
+};
+
+enum USFM_MarkerClass {
+    USFM_CLASS_NONE = 0,
+    USFM_CLASS_PARAGRAPH, USFM_CLASS_CHARACTER, USFM_CLASS_NOTE,
+    USFM_CLASS_MILESTONE, USFM_CLASS_HEADER, USFM_CLASS_TABLE
+};
+
+typedef struct USFM_Stylesheet USFM_Stylesheet;    /* opaque; later milestone */
+
+typedef struct USFM_Config {
+    uint8_t version;                    /* enum USFM_Version */
+    uint8_t reserved[3];
+    const USFM_Stylesheet *custom;      /* ignored in v0.1 */
+} USFM_Config;
+
+/* ---------------------------------------------------------------------
+ * Diagnostics: problems found in the input. Parsing always continues.
+ * ------------------------------------------------------------------- */
+enum USFM_DiagnosticSeverity {
+    USFM_SEVERITY_NONE = 0,
+    USFM_SEVERITY_ERROR,                /* input is invalid USFM */
+    USFM_SEVERITY_WARNING,              /* valid but suspicious */
+    USFM_SEVERITY_INFO
+};
+
+enum USFM_DiagnosticCode {
+    USFM_DIAGNOSTIC_NONE = 0,
+    USFM_DIAGNOSTIC_UNKNOWN_MARKER = 1,
+    USFM_DIAGNOSTIC_UNCLOSED_MARKER = 2,     /* \w without \w* */
+    USFM_DIAGNOSTIC_UNEXPECTED_CLOSE = 3,    /* \w* with no open \w */
+    USFM_DIAGNOSTIC_INVALID_NESTING = 4,     /* e.g. a cell outside a row */
+    USFM_DIAGNOSTIC_INVALID_NUMBER = 5,      /* \v abc, \c 0, \v 5-3 */
+    USFM_DIAGNOSTIC_DUPLICATE_NUMBER = 6,
+    USFM_DIAGNOSTIC_VERSE_BEFORE_CHAPTER = 7,
+    USFM_DIAGNOSTIC_INVALID_BOOK_CODE = 8,   /* \id gen */
+    USFM_DIAGNOSTIC_MISSING_CALLER = 9,      /* \f with no caller */
+    USFM_DIAGNOSTIC_UNTERMINATED_QUOTE = 10,
+    USFM_DIAGNOSTIC_UNKNOWN_ATTRIBUTE = 11,
+    USFM_DIAGNOSTIC_MISSING_ATTRIBUTE = 12,
+    USFM_DIAGNOSTIC_INVALID_ESCAPE = 13,
+    USFM_DIAGNOSTIC_MILESTONE_MISMATCH = 14,
+    USFM_DIAGNOSTIC_UNSUPPORTED_VERSION = 15,
+    USFM_DIAGNOSTIC_DUPLICATE_STYLE = 16,
+    USFM_DIAGNOSTIC_IMPLIED_PARAGRAPH = 17,  /* \v with no paragraph open */
+    USFM_DIAGNOSTIC_TOO_DEEP = 18,           /* > USFM_STACK_DEPTH open */
+    USFM_DIAGNOSTIC_CODE_COUNT = 19
+};
+
+typedef struct USFM_Diagnostic {
+    USFM_Span   span;                   /* bytes at fault; length 0 for
+                                           "missing" at offset */
+    uint16_t    code;                   /* enum USFM_DiagnosticCode */
+    USFM_Marker marker;                 /* context marker, or NONE */
+} USFM_Diagnostic;
+
+USFM_API uint8_t     USFM_DiagnosticCode_GetSeverity(uint16_t code);
+USFM_API const char *USFM_DiagnosticCode_GetMessage(uint16_t code);
+
+/* ---------------------------------------------------------------------
+ * Allocator (modeled on yyjson_alc)
+ *
+ * Every size the library requests is a multiple of 8, and every
+ * returned pointer must be 8-byte aligned. Frees are SIZED: dealloc and
+ * resize get the exact size last requested. resize returning NULL must
+ * leave the old block valid. The library never passes NULL to dealloc.
+ * ------------------------------------------------------------------- */
+typedef struct USFM_Alc {
+    void *(*alloc)(void *ctx, size_t size);
+    void *(*resize)(void *ctx, void *ptr, size_t old_size, size_t new_size);
+    void  (*dealloc)(void *ctx, void *ptr, size_t size);
+    void *ctx;
+} USFM_Alc;
+
+/* Releases a block the library allocated and handed out. Pass the
+ * logical size; the library applies its rounding. NULL ptr: no-op.
+ * alc NULL = the default allocator. */
+USFM_API void USFM_Alc_Free(const USFM_Alc *alc, void *ptr, size_t size);
+
+/* ---------------------------------------------------------------------
+ * Tokens (internal in v0.1; the type is public because it shares its
+ * level_flags packing with USFM_Node)
+ * ------------------------------------------------------------------- */
+enum USFM_TokenKind {
+    USFM_TOK_TEXT = 1,
+    USFM_TOK_WHITESPACE,                /* reserved for the CST */
+    USFM_TOK_NEWLINE,                   /* reserved for the CST */
+    USFM_TOK_MARKER,                    /* \p  \v  \w  \+w  \qt-s */
+    USFM_TOK_MARKER_END,                /* \w*  \+w*  \* */
+    USFM_TOK_ARGUMENT,                  /* "1-2a" after \v, "GEN" after
+                                           \id, "+" caller after \f */
+    USFM_TOK_ATTRIBUTES,                /* "|lemma="x" ..." */
+    USFM_TOK_OPTBREAK                   /* "//" */
+};
+
+/* level_flags: low 4 bits = number (\q2 -> 2), high 4 bits = flags.
+ * Marker flags: */
+enum {
+    USFM_TF_NESTED = 0x10,              /* \+w */
+    USFM_TF_MILESTONE_START = 0x20,     /* \qt-s */
+    USFM_TF_MILESTONE_END = 0x40,       /* \qt-e */
+    USFM_TF_SELF_CLOSED = 0x80          /* milestone ended with \* */
+};
+/* Text flags (TEXT tokens and TEXT nodes only): */
+enum {
+    USFM_TF_HAS_ESCAPE = 0x10,          /* contains \\ \/ \| \~ \" */
+    USFM_TF_HAS_NBSP = 0x20,            /* contains ~ */
+    USFM_TF_HAS_LOOSE_WS = 0x40,        /* contains CR, LF or TAB */
+    USFM_TEXT_FLAGS_COOK = 0x70
+};
+/* Node flags (PARA nodes only): */
+enum {
+    USFM_NF_IMPLIED = 0x10,             /* inserted by the parser */
+    USFM_NF_HEADING = 0x20              /* \s \ms \mt \r ... */
+};
+
+#define USFM_LEVEL(level_flags) ((uint8_t)((level_flags) & 0x0Fu))
+#define USFM_FLAGS(level_flags) ((uint8_t)((level_flags) & 0xF0u))
+
+typedef struct USFM_Token {
+    USFM_Span   span;                   /* bytes in the input */
+    USFM_Marker marker;                 /* USFM_M_NONE for non-markers */
+    uint8_t     kind;                   /* enum USFM_TokenKind */
+    uint8_t     level_flags;
 } USFM_Token;
 
-typedef struct {
-    USFM_Token *buffer;
-    uint32_t length;
-    uint32_t capacity;
-} USFM_TokenArray;
+/* ---------------------------------------------------------------------
+ * AST (semantic, USX/USJ-shaped)
+ *
+ * Nodes are stored in preorder. A node's descendants are the
+ * contiguous range (i, end). So:
+ *     first child  = i + 1            (if i + 1 < node.end)
+ *     next sibling = nodes[child].end (if < parent.end)
+ *     skip subtree = node.end
+ *
+ * Paragraph markers are containers that close implicitly at the next
+ * paragraph-level marker. Chapters and verses are milestones (as in
+ * USX 3); each has its number as an ARGUMENT child. An ARGUMENT is
+ * always a node's first child; ATTRIBUTES appear where they were
+ * written (last child of a char span, after the ARGUMENT of \periph).
+ * ------------------------------------------------------------------- */
+typedef struct USFM_Node {
+    uint32_t    parent;                 /* USFM_NIL for the root */
+    uint32_t    end;                    /* one past last descendant */
+    USFM_Span   span;                   /* source bytes covered */
+    USFM_Marker marker;
+    uint8_t     kind;                   /* enum USFM_AstKind */
+    uint8_t     level_flags;            /* see the flag enums above */
+} USFM_Node;
 
-typedef struct {
-    USFM_TokenArray tokens;
-    USFM_Result type;
-} USFM_TokenArrayResult;
+USFM_API uint8_t USFM_Node_GetLevel(const USFM_Node *node);
+USFM_API uint8_t USFM_Node_GetFlags(const USFM_Node *node);
+USFM_API int     USFM_Node_HasFlags(const USFM_Node *node, uint32_t flags);
 
-typedef enum {
-// USFM_CODEGEN_DATA marker_type start
-    USFM_MARKER_UNKNOWN,
-    USFM_MARKER_ID,
-    USFM_MARKER_USFM,
-    USFM_MARKER_IDE,
-    USFM_MARKER_STS,
-    USFM_MARKER_REM,
-    USFM_MARKER_H,
-    USFM_MARKER_TOC,
-    USFM_MARKER_TOCA,
-    USFM_MARKER_IMT,
-    USFM_MARKER_IS,
-    USFM_MARKER_IP,
-    USFM_MARKER_IPI,
-    USFM_MARKER_IM,
-    USFM_MARKER_IMI,
-    USFM_MARKER_IPQ,
-    USFM_MARKER_IMQ,
-    USFM_MARKER_IPR,
-    USFM_MARKER_IQ,
-    USFM_MARKER_IB,
-    USFM_MARKER_ILI,
-    USFM_MARKER_IOT,
-    USFM_MARKER_IO,
-    USFM_MARKER_IOR,
-    USFM_MARKER_IQT,
-    USFM_MARKER_IEX,
-    USFM_MARKER_IMTE,
-    USFM_MARKER_IE,
-    USFM_MARKER_MT,
-    USFM_MARKER_MTE,
-    USFM_MARKER_MS,
-    USFM_MARKER_MR,
-    USFM_MARKER_S,
-    USFM_MARKER_SR,
-    USFM_MARKER_R,
-    USFM_MARKER_RQ,
-    USFM_MARKER_D,
-    USFM_MARKER_SP,
-    USFM_MARKER_SD,
-    USFM_MARKER_C,
-    USFM_MARKER_CA,
-    USFM_MARKER_CL,
-    USFM_MARKER_CP,
-    USFM_MARKER_CD,
-    USFM_MARKER_V,
-    USFM_MARKER_VA,
-    USFM_MARKER_VP,
-    USFM_MARKER_P,
-    USFM_MARKER_M,
-    USFM_MARKER_PO,
-    USFM_MARKER_PR,
-    USFM_MARKER_CLS,
-    USFM_MARKER_PMO,
-    USFM_MARKER_PM,
-    USFM_MARKER_PMC,
-    USFM_MARKER_PMR,
-    USFM_MARKER_PI,
-    USFM_MARKER_MI,
-    USFM_MARKER_NB,
-    USFM_MARKER_PC,
-    USFM_MARKER_PH,
-    USFM_MARKER_B,
-    USFM_MARKER_Q,
-    USFM_MARKER_QR,
-    USFM_MARKER_QC,
-    USFM_MARKER_QS,
-    USFM_MARKER_QA,
-    USFM_MARKER_QAC,
-    USFM_MARKER_QM,
-    USFM_MARKER_QD,
-    USFM_MARKER_LH,
-    USFM_MARKER_LI,
-    USFM_MARKER_LF,
-    USFM_MARKER_LIM,
-    USFM_MARKER_LITL,
-    USFM_MARKER_LIK,
-    USFM_MARKER_LIV,
-    USFM_MARKER_TR,
-    USFM_MARKER_TH,
-    USFM_MARKER_THR,
-    USFM_MARKER_TC,
-    USFM_MARKER_TCR,
-    USFM_MARKER_F,
-    USFM_MARKER_FE,
-    USFM_MARKER_FR,
-    USFM_MARKER_FQ,
-    USFM_MARKER_FQA,
-    USFM_MARKER_FK,
-    USFM_MARKER_FL,
-    USFM_MARKER_FW,
-    USFM_MARKER_FP,
-    USFM_MARKER_FV,
-    USFM_MARKER_FT,
-    USFM_MARKER_FDC,
-    USFM_MARKER_FM,
-    USFM_MARKER_X,
-    USFM_MARKER_XO,
-    USFM_MARKER_XK,
-    USFM_MARKER_XQ,
-    USFM_MARKER_XT,
-    USFM_MARKER_XTA,
-    USFM_MARKER_XOP,
-    USFM_MARKER_XOT,
-    USFM_MARKER_XNT,
-    USFM_MARKER_XDC,
-    USFM_MARKER_ADD,
-    USFM_MARKER_BK,
-    USFM_MARKER_DC,
-    USFM_MARKER_K,
-    USFM_MARKER_LIT,
-    USFM_MARKER_ND,
-    USFM_MARKER_ORD,
-    USFM_MARKER_PN,
-    USFM_MARKER_PNG,
-    USFM_MARKER_ADDPN,
-    USFM_MARKER_QT,
-    USFM_MARKER_SIG,
-    USFM_MARKER_SLS,
-    USFM_MARKER_TL,
-    USFM_MARKER_WJ,
-    USFM_MARKER_EM,
-    USFM_MARKER_BD,
-    USFM_MARKER_IT,
-    USFM_MARKER_BDIT,
-    USFM_MARKER_NO,
-    USFM_MARKER_SC,
-    USFM_MARKER_SUP,
-    USFM_MARKER_PB,
-    USFM_MARKER_FIG,
-    USFM_MARKER_NDX,
-    USFM_MARKER_RB,
-    USFM_MARKER_PRO,
-    USFM_MARKER_W,
-    USFM_MARKER_WG,
-    USFM_MARKER_WH,
-    USFM_MARKER_WA,
-    USFM_MARKER_JMP,
-    USFM_MARKER_TS,
-    USFM_MARKER_EF,
-    USFM_MARKER_EX,
-    USFM_MARKER_ESB,
-    USFM_MARKER_ESBE,
-    USFM_MARKER_CAT,
-    USFM_MARKER_PERIPH,
-    USFM_MARKER_CLOSE,
-// USFM_CODEGEN_DATA marker_type end
-} USFM_MarkerType;
+enum USFM_AstKind {
+    USFM_AST_BOOK = 1, USFM_AST_HEADER,     /* \id, \h, \toc ... */
+    USFM_AST_CHAPTER, USFM_AST_VERSE,       /* milestones */
+    USFM_AST_PARA, USFM_AST_CHAR, USFM_AST_NOTE,
+    USFM_AST_MILESTONE, USFM_AST_FIGURE,
+    USFM_AST_TABLE, USFM_AST_ROW, USFM_AST_CELL,
+    USFM_AST_SIDEBAR, USFM_AST_PERIPHERAL,
+    USFM_AST_TEXT, USFM_AST_OPTBREAK,
+    USFM_AST_ARGUMENT,                      /* \v 3-5a, \f +, \id GEN */
+    USFM_AST_ATTRIBUTES                     /* |lemma="grace", raw */
+};
 
-USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
-    uint8_t *output_buffer, uint32_t output_size, uint32_t *output_buffer_length);
+typedef struct USFM_Ast USFM_Ast;       /* opaque */
 
-#endif // USFM_HEADER
+enum {
+    USFM_PARSE_DEFAULT = 0x00,
+    USFM_PARSE_COPY_INPUT = 0x01        /* handle owns a copy of input */
+};
 
+typedef struct USFM_VerseRef {
+    uint16_t chapter;
+    uint16_t verse_first;               /* \v 3-5a -> 3 */
+    uint16_t verse_last;                /*         -> 5 */
+    uint8_t  segment_first;             /* 'a' -> 1, none -> 0 */
+    uint8_t  segment_last;
+} USFM_VerseRef;
+
+typedef struct USFM_VerseEntry {
+    USFM_VerseRef ref;
+    uint32_t node;                      /* the VERSE node */
+    uint32_t end_node;                  /* next VERSE/CHAPTER, or end */
+} USFM_VerseEntry;
+
+/* One per \c in document order. A chapter's verses are
+ * verses[first_verse .. first_verse + verse_count). Verses before the
+ * first \c belong to no chapter. */
+typedef struct USFM_ChapterEntry {
+    uint16_t number;                    /* \c 3 -> 3; 0 if invalid */
+    uint16_t reserved;
+    uint32_t node;                      /* the CHAPTER node */
+    uint32_t end_node;                  /* next CHAPTER, or end */
+    uint32_t first_verse;
+    uint32_t verse_count;
+} USFM_ChapterEntry;
+
+USFM_API USFM_Ast *USFM_Ast_Parse(const char *input, uint32_t input_length,
+                                  const USFM_Config *config, USFM_Err *err);
+USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
+                                      const USFM_Config *config, uint32_t flags,
+                                      const USFM_Alc *alc, USFM_Err *err);
+USFM_API void      USFM_Ast_Free(USFM_Ast *ast);             /* NULL: no-op */
+
+USFM_API const char *USFM_Ast_GetInput(const USFM_Ast *ast, uint32_t *length);
+USFM_API const USFM_Diagnostic *USFM_Ast_GetDiagnostics(const USFM_Ast *ast,
+                                                        uint32_t *count);
+USFM_API uint32_t USFM_Ast_GetDroppedDiagnosticCount(const USFM_Ast *ast);
+USFM_API const USFM_Node *USFM_Ast_GetNodes(const USFM_Ast *ast, uint32_t *count);
+USFM_API const USFM_ChapterEntry *USFM_Ast_GetChapters(const USFM_Ast *ast,
+                                                       uint32_t *count);
+USFM_API const USFM_VerseEntry *USFM_Ast_GetVerses(const USFM_Ast *ast,
+                                                   uint32_t *count);
+/* Highest chapter number present (not the number of chapters). */
+USFM_API uint32_t    USFM_Ast_GetMaxChapterNumber(const USFM_Ast *ast);
+/* "GEN"; NUL-terminated, never NULL ("" if there is no \id). */
+USFM_API const char *USFM_Ast_GetBookCode(const USFM_Ast *ast);
+/* Resolved enum USFM_Version: never AUTO after parsing. */
+USFM_API uint8_t     USFM_Ast_GetVersion(const USFM_Ast *ast);
+
+/* Return the node index, or USFM_NIL when absent (*out untouched). A
+ * repeated chapter number finds the first occurrence. FindVerse finds
+ * the entry whose range contains `verse` (\v 3-5 contains 4). */
+USFM_API uint32_t USFM_Ast_FindChapter(const USFM_Ast *ast, uint16_t chapter,
+                                       USFM_ChapterEntry *out);
+USFM_API uint32_t USFM_Ast_FindVerse(const USFM_Ast *ast, uint16_t chapter,
+                                     uint16_t verse, USFM_VerseEntry *out);
+
+/* ---------------------------------------------------------------------
+ * Iterators (no callbacks, no allocation)
+ * ------------------------------------------------------------------- */
+enum {
+    USFM_VI_INCLUDE_NOTES = 0x01,       /* descend into NOTE subtrees */
+    USFM_VI_INCLUDE_HEADINGS = 0x02,    /* descend into heading paras */
+    USFM_VI_REPORT_BREAKS = 0x04,       /* yield USFM_VITEM_PARA_BREAK */
+    USFM_VI_REPORT_NOTES = 0x08         /* yield USFM_VITEM_NOTE */
+};
+
+enum USFM_VerseItemKind {
+    USFM_VITEM_TEXT = 1,                /* text: raw TEXT span */
+    USFM_VITEM_PARA_BREAK,              /* node: the new PARA */
+    USFM_VITEM_NOTE,                    /* node: the NOTE */
+    USFM_VITEM_OPTBREAK                 /* "//" */
+};
+
+typedef struct USFM_VerseItem {
+    uint8_t   kind;                     /* enum USFM_VerseItemKind */
+    uint8_t   in_note;                  /* 1 if inside a NOTE subtree */
+    uint16_t  reserved;
+    uint32_t  node;                     /* node yielded */
+    uint32_t  para;                     /* enclosing PARA, or USFM_NIL */
+    uint32_t  style;                    /* innermost CHAR, or USFM_NIL */
+    USFM_Span text;                     /* raw span (TEXT, OPTBREAK) */
+} USFM_VerseItem;
+
+typedef struct USFM_VerseIter {
+    const USFM_Ast *ast;
+    uint32_t        position;           /* private */
+    uint32_t        end;                /* private */
+    uint32_t        flags;
+} USFM_VerseIter;
+
+/* Yields the verse's content in reading order, crossing paragraphs.
+ * Defaults: TEXT only; skips notes and heading paragraphs. */
+USFM_API void USFM_VerseIter_Init(USFM_VerseIter *it, const USFM_Ast *ast,
+                                  const USFM_VerseEntry *entry, uint32_t flags);
+USFM_API int  USFM_VerseIter_Next(USFM_VerseIter *it, USFM_VerseItem *item);
+
+typedef struct USFM_ChapterIter {
+    const USFM_Ast *ast;
+    uint32_t        position;           /* private */
+    uint32_t        end;                /* private */
+} USFM_ChapterIter;
+
+USFM_API void USFM_ChapterIter_Init(USFM_ChapterIter *it, const USFM_Ast *ast);
+USFM_API int  USFM_ChapterIter_Next(USFM_ChapterIter *it,
+                                    USFM_ChapterEntry *chapter);
+
+typedef struct USFM_ChapterVerseIter {
+    const USFM_Ast *ast;
+    uint32_t        position;           /* private */
+    uint32_t        end;                /* private */
+} USFM_ChapterVerseIter;
+
+USFM_API void USFM_ChapterVerseIter_Init(USFM_ChapterVerseIter *it,
+                                         const USFM_Ast *ast,
+                                         const USFM_ChapterEntry *chapter);
+USFM_API int  USFM_ChapterVerseIter_Next(USFM_ChapterVerseIter *it,
+                                         USFM_VerseEntry *verse);
+
+/* ---------------------------------------------------------------------
+ * ABI guarantees. C99 has no _Static_assert; a negative array size
+ * fails the build instead.
+ * ------------------------------------------------------------------- */
+#define USFM_STATIC_ASSERT(name, cond) \
+    typedef char usfm_static_assert_##name[(cond) ? 1 : -1]
+USFM_STATIC_ASSERT(span_size,       sizeof(USFM_Span) == 8);
+USFM_STATIC_ASSERT(token_size,      sizeof(USFM_Token) == 12);
+USFM_STATIC_ASSERT(node_size,       sizeof(USFM_Node) == 20);
+USFM_STATIC_ASSERT(diagnostic_size, sizeof(USFM_Diagnostic) == 12);
+USFM_STATIC_ASSERT(chapter_size,    sizeof(USFM_ChapterEntry) == 20);
+USFM_STATIC_ASSERT(verse_size,      sizeof(USFM_VerseEntry) == 16);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* USFM_H */
 
 #ifdef USFM_IMPLEMENTATION
-#define USFM_IMPLEMENTATION
-
-typedef enum {
-    CLASS_OTHER,
-    CLASS_WHITESPACE,
-    CLASS_CARRIAGE_RETURN,
-    CLASS_LINE_FEED,
-    CLASS_BACKSLASH,
-    CLASS_PLUS,
-    CLASS_MINUS,
-    CLASS_ASTERISK,
-    CLASS_LETTER,
-    CLASS_DIGIT,
-} USFM_CharacterClass;
-
-#if USFM_CODEGEN
-void USFM_CharacterClass_Generate(uint8_t *characters)
-{
-    characters[' '] = CLASS_WHITESPACE;
-    characters['\t'] = CLASS_WHITESPACE;
-    characters['\r'] = CLASS_CARRIAGE_RETURN;
-    characters['\n'] = CLASS_LINE_FEED;
-    characters['\\'] = CLASS_BACKSLASH;
-    characters['+'] = CLASS_PLUS;
-    characters['-'] = CLASS_MINUS;
-    characters['*'] = CLASS_ASTERISK;
-    for (uint8_t c = '0'; c <= '9'; c++)
-    {
-        characters[c] = CLASS_DIGIT;
-    }
-    for (uint8_t c = 'A'; c <= 'Z'; c++)
-    {
-        characters[c] = CLASS_LETTER;
-    }
-    for (uint8_t c = 'a'; c <= 'z'; c++)
-    {
-        characters[c] = CLASS_LETTER;
-    }
-}
+#ifndef USFM_IMPLEMENTATION_INCLUDED
+#define USFM_IMPLEMENTATION_INCLUDED
+/* ---------------------------------------------------------------------
+ * Internal: NOT public API.
+ *
+ * This first part is compiled even under USFM_CODEGEN_BOOTSTRAP,
+ * because codegen/codegen.c needs it to generate the tables below.
+ * ------------------------------------------------------------------- */
+#include <string.h>
+#ifndef USFM_NO_LIBC
+#include <stdlib.h>
 #endif
 
-// USFM_CODEGEN character_class start
-/* USFM_CODEGEN_COMMENT --------------------------------------------------- *
- * NOTE: This code is generated via codegen. Please do not modify manually!
- * Last generated: 2026-09-16 00:18:17 GMT
- * Hash: 6f585606
- * USFM_CODEGEN_COMMENT --------------------------------------------------- */
-static const USFM_CharacterClass USFM_CharacterClass_From_Character[256] = {
-    [9] = CLASS_WHITESPACE,
-    [10] = CLASS_LINE_FEED,
-    [13] = CLASS_CARRIAGE_RETURN,
-    [32] = CLASS_WHITESPACE,
-    [42] = CLASS_ASTERISK,
-    [43] = CLASS_PLUS,
-    [45] = CLASS_MINUS,
-    [48] = CLASS_DIGIT,
-    [49] = CLASS_DIGIT,
-    [50] = CLASS_DIGIT,
-    [51] = CLASS_DIGIT,
-    [52] = CLASS_DIGIT,
-    [53] = CLASS_DIGIT,
-    [54] = CLASS_DIGIT,
-    [55] = CLASS_DIGIT,
-    [56] = CLASS_DIGIT,
-    [57] = CLASS_DIGIT,
-    [65] = CLASS_LETTER,
-    [66] = CLASS_LETTER,
-    [67] = CLASS_LETTER,
-    [68] = CLASS_LETTER,
-    [69] = CLASS_LETTER,
-    [70] = CLASS_LETTER,
-    [71] = CLASS_LETTER,
-    [72] = CLASS_LETTER,
-    [73] = CLASS_LETTER,
-    [74] = CLASS_LETTER,
-    [75] = CLASS_LETTER,
-    [76] = CLASS_LETTER,
-    [77] = CLASS_LETTER,
-    [78] = CLASS_LETTER,
-    [79] = CLASS_LETTER,
-    [80] = CLASS_LETTER,
-    [81] = CLASS_LETTER,
-    [82] = CLASS_LETTER,
-    [83] = CLASS_LETTER,
-    [84] = CLASS_LETTER,
-    [85] = CLASS_LETTER,
-    [86] = CLASS_LETTER,
-    [87] = CLASS_LETTER,
-    [88] = CLASS_LETTER,
-    [89] = CLASS_LETTER,
-    [90] = CLASS_LETTER,
-    [92] = CLASS_BACKSLASH,
-    [97] = CLASS_LETTER,
-    [98] = CLASS_LETTER,
-    [99] = CLASS_LETTER,
-    [100] = CLASS_LETTER,
-    [101] = CLASS_LETTER,
-    [102] = CLASS_LETTER,
-    [103] = CLASS_LETTER,
-    [104] = CLASS_LETTER,
-    [105] = CLASS_LETTER,
-    [106] = CLASS_LETTER,
-    [107] = CLASS_LETTER,
-    [108] = CLASS_LETTER,
-    [109] = CLASS_LETTER,
-    [110] = CLASS_LETTER,
-    [111] = CLASS_LETTER,
-    [112] = CLASS_LETTER,
-    [113] = CLASS_LETTER,
-    [114] = CLASS_LETTER,
-    [115] = CLASS_LETTER,
-    [116] = CLASS_LETTER,
-    [117] = CLASS_LETTER,
-    [118] = CLASS_LETTER,
-    [119] = CLASS_LETTER,
-    [120] = CLASS_LETTER,
-    [121] = CLASS_LETTER,
-    [122] = CLASS_LETTER,
+/* What a marker does to the tree. Decided per row of the marker table,
+ * not per marker id: \k is CHAR but \k1 is PARA. */
+enum USFM_Role {
+    USFM_ROLE_PARA = 1,                 /* \p \q \s: paragraph container */
+    USFM_ROLE_HEADER,                   /* \ide \h \toc \usfm \sts */
+    USFM_ROLE_ID,                       /* \id */
+    USFM_ROLE_CHAPTER,                  /* \c */
+    USFM_ROLE_VERSE,                    /* \v */
+    USFM_ROLE_CHAR,                     /* \nd \w \add, closed by \X* */
+    USFM_ROLE_NOTE,                     /* \f \x \fe \ef \ex \efe */
+    USFM_ROLE_NOTE_PART,                /* \fr \ft \xo: closed implicitly */
+    USFM_ROLE_ROW,                      /* \tr */
+    USFM_ROLE_CELL,                     /* \tc# \th# ... */
+    USFM_ROLE_MILESTONE,                /* \ts; also any -s/-e marker */
+    USFM_ROLE_SIDEBAR,                  /* \esb */
+    USFM_ROLE_SIDEBAR_END,              /* \esbe */
+    USFM_ROLE_PERIPH,                   /* \periph */
+    USFM_ROLE_FIGURE                    /* \fig */
 };
+
+/* Marker properties (USFM_MarkerRow.props). */
+enum {
+    USFM_MP_ARG_WORD = 0x01,            /* next word is an ARGUMENT */
+    USFM_MP_ARG_LINE = 0x02,            /* rest of line up to | is one */
+    USFM_MP_HEADING = 0x04              /* heading paragraph */
+};
+
+typedef struct USFM_MarkerRow {
+    const char *name;
+    uint8_t     name_length;
+    uint8_t     role;                   /* enum USFM_Role */
+    uint8_t     level;                  /* fixed level of a full-name
+                                           key such as k1, else 0 */
+    uint8_t     props;                  /* USFM_MP_* */
+    USFM_Marker marker;
+} USFM_MarkerRow;
+
+#define USFM_ROW_NONE 0xFFFFu
+
+/* Byte classes (USFM_ByteClass, generated). */
+enum {
+    USFM_BC_STOP = 0x01,                /* ends a fast text run:
+                                           \ | / ~ CR LF TAB */
+    USFM_BC_NAME = 0x02,                /* marker name: A-Z a-z 0-9 - */
+    USFM_BC_ALPHA = 0x04,
+    USFM_BC_DIGIT = 0x08,
+    USFM_BC_SPACE = 0x10,               /* space, tab */
+    USFM_BC_NEWLINE = 0x20,             /* CR, LF */
+    USFM_BC_ESCAPE = 0x40               /* may follow \ as an escape:
+                                           \ / | ~ " */
+};
+
+/* Perfect-hash input: first two and last two bytes plus the length.
+ * Bytes past the end of a short name are never read. */
+static uint32_t usfm__marker_hash(const char *name, uint32_t length)
+{
+    const uint8_t *s = (const uint8_t *)name;
+    uint32_t b0, b1, b2, b3;
+    USFM_ASSERT(name != NULL && length > 0);
+    b0 = s[0];
+    b1 = length > 1 ? s[1] : 0u;
+    b2 = length > 2 ? s[length - 2] : 0u;
+    b3 = length > 1 ? s[length - 1] : 0u;
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) ^ (length * 0x9E3779B1u);
+}
+
+/* Multiply-shift reduction: any slot_count, no division. */
+static uint32_t usfm__marker_slot(uint32_t hash, uint32_t seed, uint32_t slot_count)
+{
+    uint32_t mixed = (uint32_t)(((uint64_t)hash * seed) >> 32);
+    return (uint32_t)(((uint64_t)mixed * slot_count) >> 32);
+}
+
+#ifndef USFM_CODEGEN_BOOTSTRAP
+/* ---------------------------------------------------------------------
+ * Generated tables (codegen/codegen.c; do not edit by hand)
+ * ------------------------------------------------------------------- */
+// USFM_CODEGEN character_class start
 // USFM_CODEGEN character_class end
 
-static const USFM_TokenType USFM_TokenType_From_CharacterClass[10] = {
-    [CLASS_OTHER] = USFM_TOKEN_UNKNOWN,
-    [CLASS_WHITESPACE] = USFM_TOKEN_WHITESPACE,
-    [CLASS_CARRIAGE_RETURN] = USFM_TOKEN_NEWLINE,
-    [CLASS_LINE_FEED] = USFM_TOKEN_NEWLINE,
-    [CLASS_BACKSLASH] = USFM_TOKEN_MARKER_START,
-    [CLASS_PLUS] = USFM_TOKEN_PLUS,
-    [CLASS_MINUS] = USFM_TOKEN_MINUS,
-    [CLASS_ASTERISK] = USFM_TOKEN_ASTERISK,
-    [CLASS_LETTER] = USFM_TOKEN_TEXT,
-    [CLASS_DIGIT] = USFM_TOKEN_NUMBER,
-};
+// USFM_CODEGEN marker_table start
+// USFM_CODEGEN marker_table end
 
-// USFM_CODEGEN marker_text start
-/* USFM_CODEGEN_COMMENT --------------------------------------------------- *
- * NOTE: This code is generated via codegen. Please do not modify manually!
- * Last generated: 2026-09-16 00:18:17 GMT
- * Hash: 5910522e
- * USFM_CODEGEN_COMMENT --------------------------------------------------- */
-static const char *USFM_MarkerText_From_MarkerType[145] = {
-    "",
-    "id",
-    "usfm",
-    "ide",
-    "sts",
-    "rem",
-    "h",
-    "toc",
-    "toca",
-    "imt",
-    "is",
-    "ip",
-    "ipi",
-    "im",
-    "imi",
-    "ipq",
-    "imq",
-    "ipr",
-    "iq",
-    "ib",
-    "ili",
-    "iot",
-    "io",
-    "ior",
-    "iqt",
-    "iex",
-    "imte",
-    "ie",
-    "mt",
-    "mte",
-    "ms",
-    "mr",
-    "s",
-    "sr",
-    "r",
-    "rq",
-    "d",
-    "sp",
-    "sd",
-    "c",
-    "ca",
-    "cl",
-    "cp",
-    "cd",
-    "v",
-    "va",
-    "vp",
-    "p",
-    "m",
-    "po",
-    "pr",
-    "cls",
-    "pmo",
-    "pm",
-    "pmc",
-    "pmr",
-    "pi",
-    "mi",
-    "nb",
-    "pc",
-    "ph",
-    "b",
-    "q",
-    "qr",
-    "qc",
-    "qs",
-    "qa",
-    "qac",
-    "qm",
-    "qd",
-    "lh",
-    "li",
-    "lf",
-    "lim",
-    "litl",
-    "lik",
-    "liv",
-    "tr",
-    "th",
-    "thr",
-    "tc",
-    "tcr",
-    "f",
-    "fe",
-    "fr",
-    "fq",
-    "fqa",
-    "fk",
-    "fl",
-    "fw",
-    "fp",
-    "fv",
-    "ft",
-    "fdc",
-    "fm",
-    "x",
-    "xo",
-    "xk",
-    "xq",
-    "xt",
-    "xta",
-    "xop",
-    "xot",
-    "xnt",
-    "xdc",
-    "add",
-    "bk",
-    "dc",
-    "k",
-    "lit",
-    "nd",
-    "ord",
-    "pn",
-    "png",
-    "addpn",
-    "qt",
-    "sig",
-    "sls",
-    "tl",
-    "wj",
-    "em",
-    "bd",
-    "it",
-    "bdit",
-    "no",
-    "sc",
-    "sup",
-    "pb",
-    "fig",
-    "ndx",
-    "rb",
-    "pro",
-    "w",
-    "wg",
-    "wh",
-    "wa",
-    "jmp",
-    "ts",
-    "ef",
-    "ex",
-    "esb",
-    "esbe",
-    "cat",
-    "periph",
-    "*",
-};
-// USFM_CODEGEN marker_text end
+/* ===== Allocator ===== */
 
-typedef struct {
-    const char *str;
-    uint32_t hash;
-    uint8_t length;
-} USFM_Marker;
+/* ===== Errors and diagnostics ===== */
 
-// static uint32_t USFM_Marker_Hash(const char *marker_text, uint8_t length)
-// {
-//     assert(marker_text != NULL && length > 0);
-//
-//     uint8_t index_2 = length > 1 ? 1 : 0;
-//     uint8_t index_n_1 = length > 1 ? length-1 : 0;
-//     uint8_t index_n = length-1;
-//     uint32_t hash = (uint32_t)marker_text[0] & 0xFF;
-//     hash |= (uint32_t)marker_text[index_2] << 8;
-//     hash |= (uint32_t)marker_text[index_n_1] << 16;
-//     hash |= (uint32_t)marker_text[index_n] << 24;
-//     return hash;
-// }
+/* ===== Marker lookup ===== */
 
-#if USFM_CODEGEN
-USFM_Marker *USFM_MarkerMap_Generate(const char **markers, size_t *length)
-{
-    // TODO(mattg): allocate a USFM_Marker buffer, resizing it if necessary to make a perfect hash
-    (void)markers;
-    (void)length;
-    return NULL;
-}
-#endif
+/* ===== Scanner ===== */
 
-USFM_TokenArrayResult USFM_Tokenize(uint8_t *input_buffer, uint32_t input_length,
-    uint8_t *output_buffer, uint32_t output_size, uint32_t *output_buffer_length)
-{
-    USFM_TokenArrayResult result = {
-        .tokens = {
-            .buffer = (USFM_Token *)output_buffer,
-            .length = 0,
-            .capacity = output_size / sizeof(USFM_Token),
-        },
-        .type = USFM_OK,
-    };
-    if (input_buffer == NULL || output_buffer == NULL)
-    {
-        result.tokens.capacity = 0;
-        result.type = USFM_OUT_OF_MEMORY;
-        return result;
-    }
+/* ===== AST handle ===== */
 
-    // TODO(mattg): Convert the tokenization into a function which returns one token at a time.
-    USFM_CharacterClass previous_c = CLASS_OTHER;
-    USFM_Token previous = {0};
-    uint32_t i = 0;
-    while (i < input_length)
-    {
-        USFM_CharacterClass c = USFM_CharacterClass_From_Character[input_buffer[i]];
-        USFM_Token token = {
-            .offset = i,
-            .length = 1,
-            .type = USFM_TokenType_From_CharacterClass[c],
-        };
-        bool push_previous = previous.type == USFM_TOKEN_MARKER_START;
-        switch (token.type)
-        {
-        case USFM_TOKEN_UNKNOWN:
-        case USFM_TOKEN_WHITESPACE:
-            if (previous.type == USFM_TOKEN_WHITESPACE || previous.type == USFM_TOKEN_TEXT)
-            {
-                previous.length++;
-            }
-            else
-            {
-                push_previous = true;
-            }
-            break;
-        case USFM_TOKEN_NEWLINE:
-            if (previous.type == USFM_TOKEN_NEWLINE &&
-                (previous_c == CLASS_CARRIAGE_RETURN && c == CLASS_LINE_FEED))
-            {
-                previous.length++;
-            }
-            else
-            {
-                push_previous = true;
-            }
-            break;
-        case USFM_TOKEN_MARKER_START:
-            push_previous = true;
-            break;
-        case USFM_TOKEN_MARKER_TEXT:
-        case USFM_TOKEN_MARKER_NUMBER:
-        case USFM_TOKEN_MARKER_NESTED:
-        case USFM_TOKEN_MARKER_CLOSE:
-        case USFM_TOKEN_MARKER_SUFFIX:
-            // NOTE(mattg): these should be converted to, but never created by the table.
-            assert(false);
-            break;
-        case USFM_TOKEN_TEXT:
-            if (previous.type == USFM_TOKEN_MARKER_START || previous.type == USFM_TOKEN_MARKER_NESTED)
-            {
-                token.type = USFM_TOKEN_MARKER_TEXT;
-                push_previous = true;
-            }
-            else if (previous.type == USFM_TOKEN_TEXT || previous.type == USFM_TOKEN_MARKER_TEXT ||
-                previous.type == USFM_TOKEN_MARKER_SUFFIX)
-            {
-                previous.length++;
-            }
-            else
-            {
-                push_previous = true;
-            }
-            break;
-        case USFM_TOKEN_NUMBER:
-            if (previous.type == USFM_TOKEN_MARKER_TEXT)
-            {
-                token.type = USFM_TOKEN_MARKER_NUMBER;
-                push_previous = true;
-            }
-            else if (previous.type == USFM_TOKEN_NUMBER || previous.type == USFM_TOKEN_MARKER_NUMBER)
-            {
-                previous.length++;
-            }
-            else
-            {
-                push_previous = true;
-            }
-            break;
-        case USFM_TOKEN_PLUS:
-            if (previous.type == USFM_TOKEN_MARKER_START)
-            {
-                token.type = USFM_TOKEN_MARKER_NESTED;
-            }
-            push_previous = true;
-            break;
-        case USFM_TOKEN_MINUS:
-            if (previous.type == USFM_TOKEN_MARKER_TEXT || previous.type == USFM_TOKEN_MARKER_NUMBER)
-            {
-                token.type = USFM_TOKEN_MARKER_SUFFIX;
-            }
-            push_previous = true;
-            break;
-        case USFM_TOKEN_ASTERISK:
-            if (previous.type == USFM_TOKEN_MARKER_START || previous.type == USFM_TOKEN_MARKER_TEXT ||
-                previous.type == USFM_TOKEN_MARKER_NUMBER || previous.type == USFM_TOKEN_MARKER_SUFFIX)
-            {
-                token.type = USFM_TOKEN_MARKER_CLOSE;
-            }
-            push_previous = true;
-            break;
-        }
-        if (push_previous)
-        {
-            if (i > 0)
-            {
-                if (result.tokens.length < result.tokens.capacity)
-                {
-                    result.tokens.buffer[result.tokens.length] = previous;
-                    result.tokens.length++;
-                }
-                else
-                {
-                    result.type = USFM_OUT_OF_MEMORY;
-                    break;
-                }
-            }
-            previous = token;
-        }
-        previous_c = c;
-        i++;
-    }
-    if (result.tokens.length < result.tokens.capacity)
-    {
-        result.tokens.buffer[result.tokens.length] = previous;
-        result.tokens.length++;
-    }
-    else
-    {
-        result.type = USFM_OUT_OF_MEMORY;
-    }
-    result.tokens.capacity = result.tokens.length;
-    if (output_buffer_length != NULL)
-    {
-        *output_buffer_length = result.tokens.capacity * sizeof(USFM_Token);
-    }
+/* ===== Parser ===== */
 
-    return result;
-}
+/* ===== Lookups ===== */
 
-#endif // USFM_IMPLEMENTATION
+/* ===== Iterators ===== */
+
+#endif /* USFM_CODEGEN_BOOTSTRAP */
+#endif /* USFM_IMPLEMENTATION_INCLUDED */
+#endif /* USFM_IMPLEMENTATION */
