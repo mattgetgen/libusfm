@@ -19,6 +19,7 @@
 #include "test_notes.c"
 #include "test_structure.c"
 #include "test_versions.c"
+#include "test_iter.c"
 
 int main(void)
 {
@@ -40,6 +41,8 @@ int main(void)
     run_structure_tests();
     fprintf(stderr, "versions\n");
     run_versions_tests();
+    fprintf(stderr, "iterators\n");
+    run_iter_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;

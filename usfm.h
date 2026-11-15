@@ -2611,7 +2611,183 @@ USFM_API uint8_t USFM_Ast_GetVersion(const USFM_Ast *ast)
     return ast ? ast->version : (uint8_t)USFM_VERSION_AUTO;
 }
 
+static uint32_t usfm__find_chapter_index(const USFM_Ast *ast, uint16_t number)
+{
+    uint32_t lo = 0, hi = ast->chapter_count, i;
+    if (ast->chapters_sorted) {
+        /* Bounded: the range halves each pass. */
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2u;
+            if (ast->chapters[mid].number < number) lo = mid + 1;
+            else hi = mid;
+        }
+        return (lo < ast->chapter_count && ast->chapters[lo].number == number) ? lo : USFM_NIL;
+    }
+    /* Bounded by chapter_count. */
+    for (i = 0; i < ast->chapter_count; i++) {
+        if (ast->chapters[i].number == number) return i;
+    }
+    return USFM_NIL;
+}
+
+USFM_API uint32_t USFM_Ast_FindChapter(const USFM_Ast *ast, uint16_t chapter,
+                                       USFM_ChapterEntry *out)
+{
+    uint32_t index;
+    if (ast == NULL) return USFM_NIL;
+    index = usfm__find_chapter_index(ast, chapter);
+    if (index == USFM_NIL) return USFM_NIL;
+    if (out) *out = ast->chapters[index];
+    return ast->chapters[index].node;
+}
+
+USFM_API uint32_t USFM_Ast_FindVerse(const USFM_Ast *ast, uint16_t chapter, uint16_t verse,
+                                     USFM_VerseEntry *out)
+{
+    uint32_t ci, first, end, i, found = USFM_NIL;
+    if (ast == NULL) return USFM_NIL;
+    ci = usfm__find_chapter_index(ast, chapter);
+    if (ci == USFM_NIL) return USFM_NIL;
+    first = ast->chapters[ci].first_verse;
+    end = first + ast->chapters[ci].verse_count;
+    if (ast->verses_sorted) {
+        /* Lower bound: the first entry whose verse_last >= verse (this
+         * is the first segment of a split verse), then check its start.
+         * Bounded: the range halves each pass. */
+        uint32_t lo = first, hi = end;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2u;
+            if (ast->verses[mid].ref.verse_last < verse) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < end && ast->verses[lo].ref.verse_first <= verse) found = lo;
+    } else {
+        /* Bounded by verse_count. */
+        for (i = first; i < end; i++) {
+            if (ast->verses[i].ref.verse_first <= verse && verse <= ast->verses[i].ref.verse_last) {
+                found = i;
+                break;
+            }
+        }
+    }
+    if (found == USFM_NIL) return USFM_NIL;
+    if (out) *out = ast->verses[found];
+    return ast->verses[found].node;
+}
+
 /* ===== Iterators ===== */
+
+USFM_API void USFM_ChapterIter_Init(USFM_ChapterIter *it, const USFM_Ast *ast)
+{
+    it->ast = ast;
+    it->position = 0;
+    it->end = ast ? ast->chapter_count : 0;
+}
+
+USFM_API int USFM_ChapterIter_Next(USFM_ChapterIter *it, USFM_ChapterEntry *chapter)
+{
+    if (it->ast == NULL || it->position >= it->end) return 0;
+    *chapter = it->ast->chapters[it->position++];
+    return 1;
+}
+
+USFM_API void USFM_ChapterVerseIter_Init(USFM_ChapterVerseIter *it, const USFM_Ast *ast,
+                                         const USFM_ChapterEntry *chapter)
+{
+    it->ast = ast;
+    it->position = 0;
+    it->end = 0;
+    if (ast == NULL || chapter == NULL) return;
+    it->position = chapter->first_verse;
+    it->end = chapter->first_verse + chapter->verse_count;
+    if (it->end > ast->verse_count) it->end = ast->verse_count;
+}
+
+USFM_API int USFM_ChapterVerseIter_Next(USFM_ChapterVerseIter *it, USFM_VerseEntry *verse)
+{
+    if (it->ast == NULL || it->position >= it->end) return 0;
+    *verse = it->ast->verses[it->position++];
+    return 1;
+}
+
+USFM_API void USFM_VerseIter_Init(USFM_VerseIter *it, const USFM_Ast *ast,
+                                  const USFM_VerseEntry *entry, uint32_t flags)
+{
+    it->ast = ast;
+    it->flags = flags;
+    it->position = 0;
+    it->end = 0;
+    if (ast == NULL || entry == NULL || entry->node >= ast->node_count) return;
+    it->position = ast->nodes[entry->node].end;   /* skip VERSE + ARGUMENT */
+    it->end = entry->end_node <= ast->node_count ? entry->end_node : ast->node_count;
+}
+
+static void usfm__verse_item(const USFM_Ast *ast, uint32_t node, uint8_t kind,
+                             USFM_VerseItem *item)
+{
+    const USFM_Node *nodes = ast->nodes;
+    uint32_t a = nodes[node].parent, steps;
+    memset(item, 0, sizeof *item);
+    item->kind = kind;
+    item->node = node;
+    item->para = kind == USFM_VITEM_PARA_BREAK ? node : USFM_NIL;
+    item->style = USFM_NIL;
+    item->text = (kind == USFM_VITEM_TEXT || kind == USFM_VITEM_OPTBREAK)
+                     ? nodes[node].span : usfm__span(nodes[node].span.offset, 0);
+    /* Bounded: a node has at most USFM_STACK_DEPTH ancestors. */
+    for (steps = 0; a != USFM_NIL && steps <= USFM_STACK_DEPTH; steps++) {
+        uint8_t k = nodes[a].kind;
+        if (k == USFM_AST_CHAR && item->style == USFM_NIL) item->style = a;
+        if (k == USFM_AST_NOTE) item->in_note = 1;
+        if (k == USFM_AST_PARA && item->para == USFM_NIL) item->para = a;
+        a = nodes[a].parent;
+    }
+}
+
+USFM_API int USFM_VerseIter_Next(USFM_VerseIter *it, USFM_VerseItem *item)
+{
+    const USFM_Ast *ast = it->ast;
+    if (ast == NULL) return 0;
+    /* Bounded: position strictly increases and never passes end. */
+    while (it->position < it->end) {
+        uint32_t i = it->position;
+        const USFM_Node *n = &ast->nodes[i];
+        uint32_t skip_to = n->end < it->end ? n->end : it->end;
+        switch (n->kind) {
+        case USFM_AST_TEXT:
+            it->position = i + 1;
+            usfm__verse_item(ast, i, USFM_VITEM_TEXT, item);
+            return 1;
+        case USFM_AST_OPTBREAK:
+            it->position = i + 1;
+            usfm__verse_item(ast, i, USFM_VITEM_OPTBREAK, item);
+            return 1;
+        case USFM_AST_NOTE:
+            it->position = (it->flags & USFM_VI_INCLUDE_NOTES) ? i + 1 : skip_to;
+            if (it->flags & USFM_VI_REPORT_NOTES) {
+                usfm__verse_item(ast, i, USFM_VITEM_NOTE, item);
+                return 1;
+            }
+            break;
+        case USFM_AST_PARA:
+            if ((n->level_flags & USFM_NF_HEADING) && !(it->flags & USFM_VI_INCLUDE_HEADINGS)) {
+                it->position = skip_to;
+                break;
+            }
+            it->position = i + 1;
+            if (it->flags & USFM_VI_REPORT_BREAKS) {
+                usfm__verse_item(ast, i, USFM_VITEM_PARA_BREAK, item);
+                return 1;
+            }
+            break;
+        default:                        /* containers: step in; leaves:
+                                           ARGUMENT / ATTRIBUTES skipped */
+            it->position = i + 1;
+            break;
+        }
+    }
+    return 0;
+}
 
 #endif /* USFM_CODEGEN_BOOTSTRAP */
 #endif /* USFM_IMPLEMENTATION_INCLUDED */
