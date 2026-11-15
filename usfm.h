@@ -1467,6 +1467,7 @@ typedef struct USFM_Frame {
 /* One past the largest USFM_Marker id (USFM_M_WL = 180). A test checks
  * every USFM_MarkerRows entry against it. */
 #define USFM__MARKER_ID_COUNT 181u
+USFM_STATIC_ASSERT(marker_id_count, USFM_M_WL < USFM__MARKER_ID_COUNT && USFM_M_CUSTOM_BASE >= USFM__MARKER_ID_COUNT);
 /* Slots in a closer table's unknown-name hash set (a power of two). */
 #define USFM__NAME_SLOTS 64u
 
