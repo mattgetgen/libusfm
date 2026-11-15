@@ -183,6 +183,10 @@ WHITESPACE, NEWLINE, MARKER, MARKER_END, ARGUMENT, ATTRIBUTES, OPTBREAK.
   - A CR, LF or TAB inside the text sets `USFM_TF_HAS_LOOSE_WS`. Runs of
     spaces are not detected: doing so would put the space byte on the hot
     path.
+  - The flags are exact for every TEXT node: when trailing whitespace is
+    trimmed (below), `HAS_LOOSE_WS` is recomputed from what is left, and
+    text made from another token (an overflowing marker, an unclaimed
+    ARGUMENT or ATTRIBUTES) gets its flags from a scan of its span.
   - `//` is an OPTBREAK token.
 - **Arguments.** The next word after `\c`, `\v`, `\id`, `\periph` or a note
   opener is an ARGUMENT. For notes, that word is the caller.
@@ -215,6 +219,12 @@ The chapter and verse tables are filled in the same pass. Recording a `\c`
 or `\v` node also adds its table entry and sets the previous entry's
 `end_node`.
 
+`\id` and `\periph` start a new top-level division: they end the open
+verse and chapter (`end_node`). Until the next `\c` no chapter is open,
+so verses there are chapterless, exactly like verses before the first
+`\c`: `ref.chapter` is 0, they count in no chapter's `verse_count`, and
+each gets `VERSE_BEFORE_CHAPTER`.
+
 ### AST shape
 
 - `BOOK` is the root.
@@ -236,16 +246,29 @@ These follow `docs/usfm-field-guide.md` §3.
 
 | Token | Closes | Then |
 | --- | --- | --- |
-| Paragraph-level marker (`\p`, `\q#`, `\s#`, `\c`, `\id`, `\tr`, `\esb`/`\esbe`, `\periph`) | `\c`, `\id` and `\periph` close everything down to BOOK (they start a new top-level division). Other paragraph-level markers close down to the nearest BOOK, SIDEBAR or PERIPHERAL. `\tr` stops at an open TABLE; any other marker also closes the TABLE. Unclosed notes get a diagnostic. | Opens PARA, ROW, etc. (`\tr` opens a TABLE first if none is open). `\c` appends a CHAPTER leaf. |
-| `\v` | Open CHAR spans. A `\v` inside a note closes the note, with a diagnostic. | Appends a VERSE leaf. With no PARA open, it first opens an implied `\p` with a diagnostic. |
+| Paragraph-level marker (`\p`, `\q#`, `\s#`, `\c`, `\id`, `\tr`, `\esb`/`\esbe`, `\periph`) | `\c`, `\id` and `\periph` close everything down to BOOK (they start a new top-level division). Other paragraph-level markers close down to the nearest BOOK, SIDEBAR or PERIPHERAL. `\tr` stops at an open TABLE; any other marker also closes the TABLE. Unclosed notes get a diagnostic. `\esb` while a sidebar is open closes it (sidebars can't nest) with `UNCLOSED_MARKER`; `\esbe` closes the open sidebar, and with none open gets `UNEXPECTED_CLOSE` and is dropped. | Opens PARA, ROW, etc. (`\tr` opens a TABLE first if none is open). `\c` appends a CHAPTER leaf. |
+| `\v` | Open CHAR, MILESTONE and FIGURE frames, then an open heading PARA (`USFM_NF_HEADING`) or HEADER. A `\v` inside a note closes the note, with a diagnostic. | Appends a VERSE leaf. With no PARA open (at block level), it first opens an implied `\p` with a diagnostic. |
 | Note opener (`\f \x \fe \ef \ex \efe`) | An open note, with a diagnostic (notes can't nest). | Opens NOTE, with the caller as its ARGUMENT. |
 | Note part (`\fr \ft \fq \xo \xt` ...) | Every CHAR opened since the note's last note part. | Opens CHAR. |
 | `\f*`, `\x*` ... | Everything inside the note, then the note. | — |
 | `\X*` / `\+X*` | If `X` is open in the current paragraph or note: everything up to and including it. A stray note-part closer is ignored. Any other stray closer gets a diagnostic and is dropped. | — |
 | Plain char marker inside an open char span | Nests if it has a `+`, or if the outer span's `\outer*` appears before the next stop (bounded lookahead; see below). Otherwise it closes open character spans, innermost first, until one whose end marker appears before the next stop; it nests inside that one. Note parts are never closed this way. | Opens CHAR. |
-| Cell (`\tc# \th# \tcr#` ...) | The previous cell. | Opens CELL. |
-| Unknown marker | Followed by `\*` or `|`: a MILESTONE. At line start: a PARA. A matching `\name*` later in the same paragraph: a CHAR. Otherwise: an inline MILESTONE leaf with `USFM_M_UNKNOWN`. Its text is never dropped. | — |
+| Cell (`\tc# \th# \tcr#` ...) | The previous cell. Outside a row: `INVALID_NESTING`, then everything down to the nearest BOOK, SIDEBAR, PERIPHERAL or TABLE closes, and a TABLE (unless one is open) and a ROW (`\tr`) are synthesized with zero-length spans. | Opens CELL. |
+| Unknown marker | Followed by `\*` or `|`: a MILESTONE. At line start: a PARA. A matching `\name*` later in the same paragraph: a CHAR. Otherwise: an inline MILESTONE leaf with `USFM_M_UNKNOWN`. Its text is never dropped. Gets `UNKNOWN_MARKER`, except for names starting with `z` (user-defined `\z` markers are valid USFM). | — |
 | End of input | Everything. Unclosed notes get a diagnostic. | — |
+
+**Implied paragraphs.** Inline content arriving at block level (directly
+under BOOK, SIDEBAR, PERIPHERAL or TABLE) first opens an implied `\p`
+(`USFM_NF_IMPLIED`) with `IMPLIED_PARAGRAPH`. Inline content means a
+non-blank TEXT, an OPTBREAK, a character marker (including an unknown
+marker that becomes a CHAR, and a note part outside a note) and `\v`.
+Notes, milestones and figures never open one: USFM 3.1 allows a note
+directly after `\c`, and milestones and figures may sit anywhere.
+
+**Stack overflow.** A marker that would push the stack past
+`USFM_STACK_DEPTH` gets `TOO_DEEP` and its marker bytes become a TEXT
+node. Its argument, if it takes one, is not claimed and becomes a
+separate TEXT node.
 
 Two rules are judgement calls that the corpus counts will check:
 
@@ -257,11 +280,26 @@ Two rules are judgement calls that the corpus counts will check:
   small hash set for unknown names), so every question is O(1) and all
   lookahead is linear in the input.
 
+Two more judgement calls are documented here and deliberately kept:
+
+- A lone `\` or `\+` (no name) is an unknown marker with an empty name.
+  It gets `UNKNOWN_MARKER` and follows the unknown-marker row (a PARA at
+  line start, otherwise a MILESTONE); with no name it can never become a
+  CHAR.
+- Outside a note, notes, note parts and note end markers do not stop the
+  lookahead segment, so the segment also sees closers written inside a
+  note. In `\p \w a \nd b\nd* \f + \ft x\w*\f* c`, the `\w*` inside the
+  note makes `\nd` nest inside `\w`; that `\w*` then gets
+  `UNEXPECTED_CLOSE` (a closer never reaches past a note), and `\w` is
+  closed implicitly at the end of the paragraph.
+
 ### Versions
 
 One algorithm handles every version. The version only selects which
-diagnostics fire. For example, an unclosed character marker is accepted
-silently in 2.x and reported in 3.1.
+diagnostics fire. An unclosed character span (closed implicitly, not by
+its `\X*`) is reported with `UNCLOSED_MARKER` only for version 3.1 and
+later; 1.x, 2.x and 3.0 accept it silently. Unclosed note parts are never
+reported; unclosed notes and figures are reported in every version.
 
 `USFM_VERSION_AUTO` reads `\usfm X.Y` and otherwise assumes 3.1.
 `USFM_Ast_GetVersion` returns the resolved version.
@@ -276,14 +314,17 @@ silently in 2.x and reported in 3.1.
   - Non-NULL with `USFM_ERR_NOMEM` means the tree is complete, but some
     diagnostics were dropped.
 - Going past the stack depth is not an error. The overflowing marker is
-  treated as text and gets a diagnostic.
+  treated as text (see "Stack overflow" above) and gets `TOO_DEEP`.
 - v0.1 implements these diagnostic codes, each with a fixed severity and
   message: `UNKNOWN_MARKER`, `UNCLOSED_MARKER`, `UNEXPECTED_CLOSE`,
   `INVALID_NESTING`, `INVALID_NUMBER`, `VERSE_BEFORE_CHAPTER`,
-  `INVALID_BOOK_CODE`, `MISSING_CALLER`, `IMPLIED_PARAGRAPH`.
+  `INVALID_BOOK_CODE`, `MISSING_CALLER`, `UNSUPPORTED_VERSION`,
+  `IMPLIED_PARAGRAPH`, `TOO_DEEP`.
 - These arrays grow geometrically (x2) through `USFM_Alc`, keeping the old
-  block when a resize fails: nodes, chapters, verses, diagnostics. Initial
-  sizes are estimated from the input length.
+  block when a resize fails: nodes, chapters, verses, diagnostics. Only
+  the node array is pre-sized, from the input length (one node per 8
+  bytes plus 16, capped at 2^20 nodes so a huge input never fails on the
+  estimate alone); the other arrays start empty and grow on first use.
 - The handle owns its arrays, a copy of `USFM_Alc`, and, with
   `USFM_PARSE_COPY_INPUT`, a copy of the input. `USFM_Ast_Free` releases
   everything in one call.
@@ -299,9 +340,14 @@ silently in 2.x and reported in 3.1.
   compiled into the library, so callers' parses never pay for it. It verifies:
   - preorder ranges nest correctly;
   - every span lies inside the input;
-  - chapter and verse entries point at CHAPTER and VERSE nodes.
+  - chapter and verse entries point at CHAPTER and VERSE nodes;
+  - every verse in a chapter's range lies strictly between the chapter's
+    node and its `end_node`;
+  - every TEXT node's `HAS_LOOSE_WS`, `HAS_NBSP` and `HAS_ESCAPE` flags
+    match an independent scan of its text.
 - **The corpus test** parses the 83 WEB `.usfm` files and checks the totals
-  in the Goal section.
+  in the Goal section. It also counts TEXT nodes whose text flags disagree
+  with their text, per flag, and fails unless every count is 0.
   - The files are committed as a single archive, `tests/corpus/WEB.tar.gz`,
     together with the WEB copyright page (`copr.htm`). WEB is public domain;
     the name is a trademark of eBible.org.
