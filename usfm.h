@@ -44,8 +44,8 @@
 
 #define USFM_VERSION_MAJOR 0
 #define USFM_VERSION_MINOR 1
-#define USFM_VERSION_PATCH 0
-#define USFM_VERSION "0.1.0-dev"
+#define USFM_VERSION_PATCH 1
+#define USFM_VERSION "0.1.1-dev"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -1418,6 +1418,199 @@ static void usfm__classify(const char *name, uint32_t length, USFM_ScanToken *t)
     t->tok.marker = USFM_MarkerRows[row].marker;
     t->tok.level_flags |= (uint8_t)(level | flags);
 }
+
+/* ===== SIMD block classifier ===== */
+
+/* The path is chosen at compile time from the compiler's target macros;
+ * there is no runtime CPU detection. USFM__USE_BLOCKS is 1 when a SIMD
+ * classifier exists; otherwise the scanner keeps its byte loops. */
+#if defined(USFM_SIMD_NONE)
+#  define USFM__SIMD_PATH "scalar (USFM_SIMD_NONE)"
+#  define USFM__USE_BLOCKS 0
+#elif defined(__AVX512BW__)
+#  include <immintrin.h>
+#  define USFM__SIMD_PATH "avx512bw"
+#  define USFM__SIMD_AVX512 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__AVX2__)
+#  include <immintrin.h>
+#  define USFM__SIMD_PATH "avx2"
+#  define USFM__SIMD_AVX2 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#  define USFM__SIMD_PATH "sse2"
+#  define USFM__SIMD_SSE2 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#  include <arm_neon.h>
+#  define USFM__SIMD_PATH "neon"
+#  define USFM__SIMD_NEON 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__wasm_simd128__)
+#  include <wasm_simd128.h>
+#  define USFM__SIMD_PATH "wasm-simd128"
+#  define USFM__SIMD_WASM 1
+#  define USFM__USE_BLOCKS 1
+#else
+#  define USFM__SIMD_PATH "scalar (no SIMD for this target)"
+#  define USFM__USE_BLOCKS 0
+#endif
+
+/* Bit i of each mask describes byte i of a 64-byte block. */
+typedef struct USFM_BlockMasks {
+    uint64_t backslash;                 /* '\\' */
+    uint64_t pipe;                      /* '|' */
+    uint64_t slash;                     /* '/' */
+    uint64_t nbsp;                      /* '~' (flag only) */
+    uint64_t loose_ws;                  /* CR, LF, TAB (flag only) */
+} USFM_BlockMasks;
+
+#if USFM__USE_BLOCKS && defined(USFM_TEST_SCAN_REFERENCE)
+/* Reference classifier: every SIMD classifier is tested against it. */
+static void usfm__classify_block_scalar(const char *p, USFM_BlockMasks *m)
+{
+    uint32_t i;
+    memset(m, 0, sizeof *m);
+    for (i = 0; i < 64u; i++) {
+        uint64_t bit = (uint64_t)1 << i;
+        switch (p[i]) {
+        case '\\': m->backslash |= bit; break;
+        case '|': m->pipe |= bit; break;
+        case '/': m->slash |= bit; break;
+        case '~': m->nbsp |= bit; break;
+        case '\r': case '\n': case '\t': m->loose_ws |= bit; break;
+        default: break;
+        }
+    }
+}
+#endif
+
+#if USFM__USE_BLOCKS
+#if defined(__GNUC__) || defined(__clang__)
+static uint32_t usfm__popcount64(uint64_t x) { return (uint32_t)__builtin_popcountll(x); }
+static uint32_t usfm__ctz64(uint64_t x) { return (uint32_t)__builtin_ctzll(x); }
+#else
+static uint32_t usfm__popcount64(uint64_t x)
+{
+    x = x - ((x >> 1) & 0x5555555555555555ull);
+    x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+    return (uint32_t)((x * 0x0101010101010101ull) >> 56);
+}
+/* x must not be 0. */
+static uint32_t usfm__ctz64(uint64_t x) { return usfm__popcount64((x & (0 - x)) - 1u); }
+#endif
+
+/* Bits [from, to) of a block, 0 <= from <= to <= 64. */
+static uint64_t usfm__bit_range(uint32_t from, uint32_t to)
+{
+    uint64_t hi = to >= 64u ? ~(uint64_t)0 : (((uint64_t)1 << to) - 1u);
+    uint64_t lo = from >= 64u ? ~(uint64_t)0 : (((uint64_t)1 << from) - 1u);
+    return hi & ~lo;
+}
+
+#if defined(USFM__SIMD_AVX512)
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    __m512i x = _mm512_loadu_si512((const void *)p);
+    m->backslash = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\\'));
+    m->pipe = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('|'));
+    m->slash = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('/'));
+    m->nbsp = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('~'));
+    m->loose_ws = (uint64_t)(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\r')) |
+                             _mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\n')) |
+                             _mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\t')));
+}
+#elif defined(USFM__SIMD_AVX2)
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    const __m256i bs = _mm256_set1_epi8('\\'), pi = _mm256_set1_epi8('|');
+    const __m256i sl = _mm256_set1_epi8('/'), tl = _mm256_set1_epi8('~');
+    const __m256i cr = _mm256_set1_epi8('\r'), lf = _mm256_set1_epi8('\n');
+    const __m256i tab = _mm256_set1_epi8('\t');
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 2u; k++) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32u * k));
+        uint32_t shift = 32u * k;
+        __m256i ws = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(x, cr),
+                                                     _mm256_cmpeq_epi8(x, lf)),
+                                     _mm256_cmpeq_epi8(x, tab));
+        m->backslash |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, bs)) << shift;
+        m->pipe |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, pi)) << shift;
+        m->slash |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, sl)) << shift;
+        m->nbsp |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, tl)) << shift;
+        m->loose_ws |= (uint64_t)(uint32_t)_mm256_movemask_epi8(ws) << shift;
+    }
+}
+#elif defined(USFM__SIMD_SSE2)
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    const __m128i bs = _mm_set1_epi8('\\'), pi = _mm_set1_epi8('|');
+    const __m128i sl = _mm_set1_epi8('/'), tl = _mm_set1_epi8('~');
+    const __m128i cr = _mm_set1_epi8('\r'), lf = _mm_set1_epi8('\n');
+    const __m128i tab = _mm_set1_epi8('\t');
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 4u; k++) {
+        __m128i x = _mm_loadu_si128((const __m128i *)(const void *)(p + 16u * k));
+        uint32_t shift = 16u * k;
+        __m128i ws = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, cr), _mm_cmpeq_epi8(x, lf)),
+                                  _mm_cmpeq_epi8(x, tab));
+        m->backslash |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, bs)) << shift;
+        m->pipe |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, pi)) << shift;
+        m->slash |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, sl)) << shift;
+        m->nbsp |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, tl)) << shift;
+        m->loose_ws |= (uint64_t)(uint32_t)_mm_movemask_epi8(ws) << shift;
+    }
+}
+#elif defined(USFM__SIMD_NEON)
+/* NEON has no movemask: weight each lane by its bit and add the halves. */
+static uint64_t usfm__neon_bits(uint8x16_t eq)
+{
+    static const uint8_t weights[16] = { 1, 2, 4, 8, 16, 32, 64, 128,
+                                         1, 2, 4, 8, 16, 32, 64, 128 };
+    uint8x16_t b = vandq_u8(eq, vld1q_u8(weights));
+    return (uint64_t)vaddv_u8(vget_low_u8(b)) | ((uint64_t)vaddv_u8(vget_high_u8(b)) << 8);
+}
+
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 4u; k++) {
+        uint8x16_t x = vld1q_u8((const uint8_t *)p + 16u * k);
+        uint32_t shift = 16u * k;
+        uint8x16_t ws = vorrq_u8(vorrq_u8(vceqq_u8(x, vdupq_n_u8('\r')), vceqq_u8(x, vdupq_n_u8('\n'))),
+                                 vceqq_u8(x, vdupq_n_u8('\t')));
+        m->backslash |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('\\'))) << shift;
+        m->pipe |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('|'))) << shift;
+        m->slash |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('/'))) << shift;
+        m->nbsp |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('~'))) << shift;
+        m->loose_ws |= usfm__neon_bits(ws) << shift;
+    }
+}
+#elif defined(USFM__SIMD_WASM)
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 4u; k++) {
+        v128_t x = wasm_v128_load(p + 16u * k);
+        uint32_t shift = 16u * k;
+        v128_t ws = wasm_v128_or(wasm_v128_or(wasm_i8x16_eq(x, wasm_i8x16_splat('\r')),
+                                              wasm_i8x16_eq(x, wasm_i8x16_splat('\n'))),
+                                 wasm_i8x16_eq(x, wasm_i8x16_splat('\t')));
+        m->backslash |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('\\'))) << shift;
+        m->pipe |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('|'))) << shift;
+        m->slash |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('/'))) << shift;
+        m->nbsp |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('~'))) << shift;
+        m->loose_ws |= (uint64_t)wasm_i8x16_bitmask(ws) << shift;
+    }
+}
+#endif
+#endif /* USFM__USE_BLOCKS */
 
 /* ===== Scanner ===== */
 
