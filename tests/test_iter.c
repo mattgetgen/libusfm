@@ -158,6 +158,32 @@ static void test_find_verse_segments_and_overlap(void)
     USFM_Ast_Free(ast);
 }
 
+static void test_find_verse_reversed_range(void)
+{
+    USFM_Ast *ast = parse_with_version("\\c 1\n\\p \\v 3-6 a \\v 7-4 b \\v 8 c", USFM_VERSION_AUTO);
+    USFM_VerseEntry verse;
+    CHECK(USFM_Ast_FindVerse(ast, 1, 5, &verse) != USFM_NIL);
+    CHECK_EQ(verse.ref.verse_first, 3);
+    CHECK(USFM_Ast_FindVerse(ast, 1, 8, &verse) != USFM_NIL);
+    CHECK_EQ(verse.ref.verse_first, 8);
+    USFM_Ast_Free(ast);
+}
+
+static void test_last_verse_ends_at_periph(void)
+{
+    USFM_Ast *ast = parse_with_version(
+        "\\id GEN\n\\c 1\n\\p \\v 1 a\n\\periph X\n\\p peripheral text", USFM_VERSION_AUTO);
+    char text[256];
+    uint32_t count;
+    const USFM_ChapterEntry *chapters = USFM_Ast_GetChapters(ast, &count);
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    verse_text(ast, 1, 1, 0, text, sizeof text);
+    CHECK_STR(text, "a");
+    CHECK_EQ(nodes[chapters[0].end_node].kind, USFM_AST_PERIPHERAL);
+    CHECK_EQ(check_ast(ast), 0);
+    USFM_Ast_Free(ast);
+}
+
 static void run_iter_tests(void)
 {
     RUN(test_find_chapter_and_verse);
@@ -167,4 +193,6 @@ static void run_iter_tests(void)
     RUN(test_verse_iterator_flags);
     RUN(test_verse_iterator_items);
     RUN(test_chapter_iterators);
+    RUN(test_find_verse_reversed_range);
+    RUN(test_last_verse_ends_at_periph);
 }

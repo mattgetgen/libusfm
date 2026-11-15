@@ -1807,7 +1807,7 @@ static void usfm__add_chapter(USFM_Parser *p, uint32_t node, uint32_t number)
     usfm__end_open_verse(p, node);
     if (ast->chapter_count > 0) {
         USFM_ChapterEntry *prev = &ast->chapters[ast->chapter_count - 1];
-        prev->end_node = node;
+        if (prev->end_node == USFM_NIL) prev->end_node = node;
         if (number <= prev->number) ast->chapters_sorted = 0;
     }
     grown = usfm__grow(&ast->alc, ast->chapters, &ast->chapter_capacity,
@@ -1824,6 +1824,17 @@ static void usfm__add_chapter(USFM_Parser *p, uint32_t node, uint32_t number)
     e->end_node = USFM_NIL;
     e->first_verse = ast->verse_count;
     if (number > ast->max_chapter) ast->max_chapter = number;
+}
+
+/* \id and \periph start a new top-level division: the open verse and
+ * chapter end there, so their content never runs into it. */
+static void usfm__end_division(USFM_Parser *p, uint32_t node)
+{
+    USFM_Ast *ast = p->ast;
+    usfm__end_open_verse(p, node);
+    if (ast->chapter_count > 0 && ast->chapters[ast->chapter_count - 1].end_node == USFM_NIL) {
+        ast->chapters[ast->chapter_count - 1].end_node = node;
+    }
 }
 
 /* True if `next` can follow `prev` in a chapter's verse table without
@@ -1854,6 +1865,9 @@ static void usfm__add_verse(USFM_Parser *p, uint32_t node, const USFM_VerseRef *
     e->ref = *ref;
     e->node = node;
     e->end_node = USFM_NIL;
+    /* A reversed range (\v 7-4, diagnosed) breaks the binary search's
+     * assumption that verse_last never decreases. */
+    if (ref->verse_first > ref->verse_last) ast->verses_sorted = 0;
     if (ast->chapter_count > 0) {
         USFM_ChapterEntry *chapter = &ast->chapters[ast->chapter_count - 1];
         if (chapter->verse_count > 0 &&
@@ -1927,6 +1941,7 @@ static void usfm__on_id(USFM_Parser *p, const USFM_ScanToken *t)
     int has;
     usfm__trim_last_text(p);
     usfm__close_to_depth(p, 1);
+    usfm__end_division(p, p->ast->node_count);
     if (usfm__open_tok(p, USFM_AST_HEADER, t, 0, 0) == USFM_NIL) return;
     has = usfm__take_argument(p, &arg, usfm__tok_end(t));
     if (!has || !usfm__valid_book_code(ast->input, arg)) {
@@ -2359,6 +2374,7 @@ static void usfm__on_periph(USFM_Parser *p, const USFM_ScanToken *t)
     USFM_Span arg;
     usfm__trim_last_text(p);
     usfm__close_to_depth(p, 1);
+    usfm__end_division(p, p->ast->node_count);
     if (usfm__open_tok(p, USFM_AST_PERIPHERAL, t, 0, 0) == USFM_NIL) return;
     usfm__take_argument(p, &arg, usfm__tok_end(t));
 }
