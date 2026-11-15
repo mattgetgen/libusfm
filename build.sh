@@ -144,6 +144,30 @@ case "$MODE" in
         echo "neon $(grep 'AST checksum' build/corpus_neon.log | cut -d' ' -f3)" >> build/checksums.txt
         check_checksums
         ;;
+    test-wasm)
+        run_codegen
+        unpack_corpus
+        if ! command -v zig > /dev/null || ! command -v node > /dev/null; then
+            echo "test-wasm: skipped (needs zig and node)"
+            exit 0
+        fi
+        WASM_FLAGS=(-target wasm32-wasi -msimd128 -std=c99 -O2 -Wl,-z,stack-size=8388608)
+        zig cc "${WASM_FLAGS[@]}" tests/run_tests.c -o build/run_tests_wasm.wasm
+        zig cc "${WASM_FLAGS[@]}" tests/corpus_test.c -o build/corpus_test_wasm.wasm
+        gcc "${COMMON_FLAGS[@]}" -O1 -DUSFM_SIMD_NONE tests/corpus_test.c -o build/corpus_test_ref
+        if ! node --no-warnings tests/wasi_run.mjs build/run_tests_wasm.wasm 2> build/run_tests_wasm.log; then
+            cat build/run_tests_wasm.log >&2
+            exit 1
+        fi
+        grep 'SIMD path' build/run_tests_wasm.log
+        echo "wasm: $(tail -n 1 build/run_tests_wasm.log)"
+        rm -f build/checksums.txt
+        ./build/corpus_test_ref build/corpus/WEB > build/corpus_ref.log
+        echo "scalar $(grep 'AST checksum' build/corpus_ref.log | cut -d' ' -f3)" >> build/checksums.txt
+        node --no-warnings tests/wasi_run.mjs build/corpus_test_wasm.wasm "$PWD/build/corpus/WEB" | tee build/corpus_wasm.log
+        echo "wasm $(grep 'AST checksum' build/corpus_wasm.log | cut -d' ' -f3)" >> build/checksums.txt
+        check_checksums
+        ;;
     fuzz)
         run_codegen
         mkdir -p build/fuzz/corpus
