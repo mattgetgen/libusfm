@@ -3,12 +3,14 @@
  * USFM_IMPLEMENTATION. */
 #include <stdlib.h>
 #include <time.h>
+#define USFM_TEST_SCAN_REFERENCE
 #define USFM_IMPLEMENTATION
 #include "../usfm.h"
 #include "test.h"
 #include "dump.h"
 #include "check.h"
 #include "helpers.h"
+#include "scan_compare.h"
 
 #include "test_basics.c"
 #include "test_markers.c"
@@ -21,6 +23,7 @@
 #include "test_versions.c"
 #include "test_iter.c"
 #include "test_parse_alloc.c"
+#include "test_simd.c"
 
 int main(void)
 {
@@ -46,6 +49,8 @@ int main(void)
     run_iter_tests();
     fprintf(stderr, "parse alloc\n");
     run_parse_alloc_tests();
+    fprintf(stderr, "simd\n");
+    run_simd_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;

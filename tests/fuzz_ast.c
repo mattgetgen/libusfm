@@ -13,9 +13,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define USFM_TEST_SCAN_REFERENCE
 #define USFM_IMPLEMENTATION
 #include "../usfm.h"
 #include "check.h"
+#include "scan_compare.h"
 
 typedef struct FuzzAlc {
     size_t   live_bytes;
@@ -85,6 +87,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     USFM_Ast *ast;
     uint32_t flags;
     if (size < 2 || size - 2 > USFM_INPUT_MAX) return 0;
+    {
+        const char *text = (const char *)data + 2;
+        uint32_t text_length = (uint32_t)(size - 2);
+        if (scan_compare(text, text_length, 0u, 1) || scan_compare(text, text_length, 1u, 1) ||
+            scan_compare(text, text_length, 2u + data[1], 1)) {
+            abort();
+        }
+#if USFM__USE_BLOCKS
+        if (classifier_mismatches(text, text_length) != 0) abort();
+#endif
+    }
     memset(&config, 0, sizeof config);
     config.version = (uint8_t)(data[0] % 5);
     flags = (data[1] & 0x01) ? USFM_PARSE_COPY_INPUT : USFM_PARSE_DEFAULT;

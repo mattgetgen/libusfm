@@ -37,7 +37,7 @@ static void printTimeData(Timer start, Timer end, size_t size)
 
 int main(int argc, char **argv)
 {
-    const char *path = argc > 1 ? argv[1] : "build/corpus/WEB/25-JEReng-web.usfm";
+    const char *path = argc > 1 ? argv[1] : "build/corpus/WEB-STRONGS/25-JEReng-web.usfm";
     unsigned iterations = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 100u;
     FILE *f = fopen(path, "rb");
     if (f == NULL)
