@@ -376,6 +376,8 @@ reported; unclosed notes and figures are reported in every version.
   - v0.1 requires a 30-minute fuzz run with no findings.
 - **The benchmark** is `main.c`, rewritten as a timing harness that
   reports cycles per byte on JER.
+  (Superseded: `main.c` is now the `usfm` command-line tool, whose
+  `--bench` mode times parsing; see `2026-11-16-cli-design.md`.)
 - **`build.sh`** gains `test` and `fuzz` modes. Debug builds keep ASan and UBSan.
   `build.sh` reruns codegen whenever `codegen/codegen.c` or
   `codegen/markers.h` is newer than `build/codegen.stamp`.
