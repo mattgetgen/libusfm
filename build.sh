@@ -10,7 +10,6 @@ COMMON_FLAGS=(
     -Wall
     -Wextra
     -pedantic
-    -fshort-enums
 )
 
 DEBUG_FLAGS=(
@@ -62,15 +61,13 @@ case "$MODE" in
         gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" tests/run_tests.c -o build/run_tests
         g++ -std=c++11 -Wall -Wextra -fsyntax-only tests/cpp_check.cpp
         ./build/run_tests
-        # Consumers use the default enum ABI: run the unit tests once more
-        # without -fshort-enums.
-        gcc -std=c99 -Wall -Wextra -pedantic "${DEBUG_FLAGS[@]}" tests/run_tests.c \
-            -o build/run_tests_default_enums
-        if ! ./build/run_tests_default_enums 2> build/run_tests_default_enums.log; then
-            cat build/run_tests_default_enums.log >&2
+        # The ABI must not depend on how a compiler sizes enums: no field,
+        # parameter or return value in usfm.h may have an enum type (store
+        # enum values in fixed-width integers instead).
+        if grep -nE '(^|[(,;]|USFM_API)[[:space:]]*(const[[:space:]]+)?enum[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\**[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[;,)(=[]' usfm.h; then
+            echo "usfm.h: enum type used for storage (see above)" >&2
             exit 1
         fi
-        echo "default enums: $(tail -n 1 build/run_tests_default_enums.log)"
         unpack_corpus
         gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" tests/corpus_test.c -o build/corpus_test
         ./build/corpus_test build/corpus/WEB
