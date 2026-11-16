@@ -167,7 +167,11 @@ typedef struct USFM_Span {
     uint32_t length;                    /* byte length */
 } USFM_Span;
 
-typedef enum USFM_Status {
+/* Enum types are never used for storage: every struct field, parameter
+ * and return value that holds an enum value is a fixed-width integer
+ * (uint8_t, uint16_t or uint32_t), so the ABI does not depend on how a
+ * compiler sizes enums (for example -fshort-enums). */
+enum USFM_Status {
     USFM_OK = 0,
     USFM_ERR_CAPACITY,                  /* reserved: caller's output buffer
                                            too small (no v0.1 function
@@ -177,12 +181,12 @@ typedef enum USFM_Status {
     USFM_ERR_INVALID_ARG,
     USFM_ERR_NOMEM,                     /* allocator returned NULL */
     USFM_ERR_NO_ALLOCATOR               /* NULL allocator + USFM_NO_LIBC */
-} USFM_Status;
+};
 
 /* Filled by every function that can fail (pass NULL to ignore). */
 typedef struct USFM_Err {
     const char *msg;                    /* static string, never NULL */
-    uint32_t    code;                   /* USFM_Status */
+    uint32_t    code;                   /* enum USFM_Status */
     uint32_t    pos;                    /* byte offset reached in input */
 } USFM_Err;
 

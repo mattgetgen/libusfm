@@ -8,7 +8,6 @@ CFLAGS=(
     -Wall
     -Wextra
     -pedantic
-    -fshort-enums
     -O2
     -g
     -fsanitize=address
