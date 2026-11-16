@@ -37,7 +37,8 @@ static int scan_compare(const char *input, uint32_t length, uint32_t pipe_mode, 
                     ta.tok.span.length != tb.tok.span.length ||
                     ta.tok.kind != tb.tok.kind || ta.tok.marker != tb.tok.marker ||
                     ta.tok.level_flags != tb.tok.level_flags || ta.row != tb.row ||
-                    ta.name_offset != tb.name_offset || ta.name_length != tb.name_length))) {
+                    ta.name_offset != tb.name_offset || ta.name_length != tb.name_length ||
+                    ta.first_loose != tb.first_loose))) {
             if (report) {
                 fprintf(stderr,
                         "scanner difference at token %u (pipe %u): blocks kind %u span %u+%u "
