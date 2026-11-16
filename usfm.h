@@ -1373,6 +1373,10 @@ typedef struct USFM_ScanToken {
     uint16_t   reserved;
     uint32_t   name_offset;             /* marker name in the input */
     uint32_t   name_length;             /* 0 for "\*" and a lone "\" */
+    uint32_t   first_loose;             /* TEXT: offset of the first CR, LF
+                                           or TAB, or USFM_NIL; lets the
+                                           parser keep USFM_TF_HAS_LOOSE_WS
+                                           exact after trimming in O(1) */
 } USFM_ScanToken;
 
 /* Sets t->row, t->tok.marker and the level / milestone bits of
@@ -1677,6 +1681,7 @@ static void usfm__tok(USFM_ScanToken *t, uint8_t kind, uint32_t start, uint32_t 
     t->tok.span = usfm__span(start, end - start);
     t->tok.kind = kind;
     t->row = USFM_ROW_NONE;
+    t->first_loose = USFM_NIL;
 }
 
 /* Consumes the one whitespace character that ends an opening marker or
@@ -1764,7 +1769,8 @@ static int usfm__scan_argument(USFM_Scanner *s, USFM_ScanToken *t, uint8_t mode)
 }
 
 /* End of a text run starting at `start` (byte loop); sets *flags. */
-static uint32_t usfm__text_end_scalar(const USFM_Scanner *s, uint32_t start, uint8_t *flags)
+static uint32_t usfm__text_end_scalar(const USFM_Scanner *s, uint32_t start, uint8_t *flags,
+                                      uint32_t *first_loose)
 {
     const char *in = s->input;
     uint32_t len = s->length, i = start;
@@ -1793,8 +1799,12 @@ static uint32_t usfm__text_end_scalar(const USFM_Scanner *s, uint32_t start, uin
             i++;
             continue;
         }
-        if (b == '~') f |= USFM_TF_HAS_NBSP;
-        else f |= USFM_TF_HAS_LOOSE_WS;          /* CR, LF, TAB */
+        if (b == '~') {
+            f |= USFM_TF_HAS_NBSP;
+        } else {                                 /* CR, LF, TAB */
+            if (!(f & USFM_TF_HAS_LOOSE_WS)) *first_loose = i;
+            f |= USFM_TF_HAS_LOOSE_WS;
+        }
         i++;
     }
     *flags = f;
@@ -1841,13 +1851,15 @@ static void usfm__load_block(USFM_Scanner *s, uint32_t base)
 /* Adds the flag-only bits of the cached block in [from, to) (input
  * offsets inside the cached block) to the running results. */
 static void usfm__flag_span(const USFM_Scanner *s, uint32_t from, uint32_t to,
-                            uint64_t *nbsp, uint64_t *loose)
+                            uint64_t *nbsp, uint64_t *loose, uint32_t *first_loose)
 {
-    uint64_t r;
+    uint64_t r, lw;
     if (to <= from) return;
     r = usfm__bit_range(from - s->block_base, to - s->block_base);
+    lw = s->block.loose_ws & r;
     *nbsp |= s->block.nbsp & r;
-    *loose |= s->block.loose_ws & r;
+    if (lw != 0 && *loose == 0) *first_loose = s->block_base + usfm__ctz64(lw);
+    *loose |= lw;
 }
 
 /* End of a text run starting at `start`, from cached block masks. Gives
@@ -1855,7 +1867,8 @@ static void usfm__flag_span(const USFM_Scanner *s, uint32_t from, uint32_t to,
  * skipped (so an escaped '~' sets no NBSP flag), and only the stop
  * candidates ('\', '/', and '|' where attributes are allowed) are
  * inspected one by one. Bounded: each pass ends the run or advances i. */
-static uint32_t usfm__text_end_blocks(USFM_Scanner *s, uint32_t start, uint8_t *flags)
+static uint32_t usfm__text_end_blocks(USFM_Scanner *s, uint32_t start, uint8_t *flags,
+                                      uint32_t *first_loose)
 {
     const char *in = s->input;
     uint32_t len = s->length, i = start;
@@ -1868,12 +1881,12 @@ static uint32_t usfm__text_end_blocks(USFM_Scanner *s, uint32_t start, uint8_t *
         stops = s->block.backslash | s->block.slash | (s->pipe_is_attr ? s->block.pipe : 0u);
         stops &= usfm__bit_range(i - base, 64u);
         if (stops == 0) {                   /* no stop in the rest of this block */
-            usfm__flag_span(s, i, block_end < len ? block_end : len, &nbsp, &loose);
+            usfm__flag_span(s, i, block_end < len ? block_end : len, &nbsp, &loose, first_loose);
             i = block_end;
             continue;
         }
         j = base + usfm__ctz64(stops);
-        usfm__flag_span(s, i, j, &nbsp, &loose);
+        usfm__flag_span(s, i, j, &nbsp, &loose, first_loose);
         if (in[j] == '\\') {
             if (!usfm__is_escape(in, len, j)) {
                 i = j;
@@ -1929,7 +1942,7 @@ static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_bloc
 {
     const char *in = s->input;
     uint32_t len = s->length;
-    uint32_t start, i;
+    uint32_t start, i, first_loose = USFM_NIL;
     uint8_t flags = 0;
 #if !USFM__USE_BLOCKS
     (void)use_blocks;
@@ -1962,12 +1975,14 @@ static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_bloc
         return 1;
     }
 #if USFM__USE_BLOCKS
-    i = use_blocks ? usfm__text_end_blocks(s, start, &flags) : usfm__text_end_scalar(s, start, &flags);
+    i = use_blocks ? usfm__text_end_blocks(s, start, &flags, &first_loose)
+                   : usfm__text_end_scalar(s, start, &flags, &first_loose);
 #else
-    i = usfm__text_end_scalar(s, start, &flags);
+    i = usfm__text_end_scalar(s, start, &flags, &first_loose);
 #endif
     USFM_ASSERT(i > start);
     usfm__tok(t, USFM_TOK_TEXT, start, i);
+    t->first_loose = first_loose;
     t->tok.level_flags = flags;
     s->position = i;
     return 1;
@@ -2081,6 +2096,10 @@ typedef struct USFM_Parser {
     uint8_t          reserved[2];
     uint32_t         depth;
     uint32_t         last_end;          /* end of the last token placed */
+    uint32_t         text_node;         /* last TEXT node made from a TEXT
+                                           token, or USFM_NIL ... */
+    uint32_t         text_offset;       /* ... its span offset ... */
+    uint32_t         text_first_loose;  /* ... and its first CR/LF/TAB */
     USFM_CloserTable closers[2];        /* [in_note]: see usfm__closer_ahead */
     USFM_Frame       stack[USFM_STACK_DEPTH];
 } USFM_Parser;
@@ -2423,9 +2442,18 @@ static void usfm__trim_last_text(USFM_Parser *p)
     if (n->span.length == 0) {
         ast->node_count--;
     } else if (n->level_flags & USFM_TF_HAS_LOOSE_WS) {
-        /* Only ASCII whitespace was removed, so validity is unchanged. */
-        n->level_flags = (uint8_t)(usfm__text_flags(ast->input, n->span) |
-                                   (n->level_flags & USFM_TF_INVALID_UTF8));
+        /* Only the CR/LF/TAB flag can change: trimmed bytes are ASCII
+         * blanks, so validity (USFM_TF_INVALID_UTF8) is unchanged too.
+         * For a node straight from a TEXT token the scanner recorded its
+         * first CR/LF/TAB, so this is O(1); otherwise rescan (rare). */
+        if (ast->node_count - 1 == p->text_node && n->span.offset == p->text_offset) {
+            if (p->text_first_loose >= n->span.offset + n->span.length) {
+                n->level_flags &= (uint8_t)~USFM_TF_HAS_LOOSE_WS;
+            }
+        } else {
+            n->level_flags = (uint8_t)(usfm__text_flags(ast->input, n->span) |
+                                       (n->level_flags & USFM_TF_INVALID_UTF8));
+        }
     }
 }
 
@@ -2631,6 +2659,7 @@ static void usfm__set_version(USFM_Parser *p, USFM_Span arg)
 static void usfm__on_text(USFM_Parser *p, const USFM_ScanToken *t)
 {
     uint8_t k = usfm__top_kind(p);
+    uint32_t node;
     if ((usfm__is_block(k) || k == USFM_AST_TABLE || k == USFM_AST_MILESTONE) &&
         usfm__is_blank(p->ast->input, t->tok.span)) {
         return;                         /* layout whitespace between blocks */
@@ -2638,11 +2667,16 @@ static void usfm__on_text(USFM_Parser *p, const USFM_ScanToken *t)
     usfm__ensure_inline(p, t->tok.span.offset);
     /* An unclaimed ARGUMENT or stray ATTRIBUTES token has no text flags
      * from the scanner; compute them (rare). */
-    usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
-                 (uint8_t)((t->tok.kind == USFM_TOK_TEXT
-                                ? (t->tok.level_flags & USFM_TEXT_FLAGS_COOK)
-                                : usfm__text_flags(p->ast->input, t->tok.span)) |
-                           (t->tok.level_flags & USFM_TF_INVALID_UTF8)));
+    node = usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
+                        (uint8_t)((t->tok.kind == USFM_TOK_TEXT
+                                       ? (t->tok.level_flags & USFM_TEXT_FLAGS_COOK)
+                                       : usfm__text_flags(p->ast->input, t->tok.span)) |
+                                  (t->tok.level_flags & USFM_TF_INVALID_UTF8)));
+    if (t->tok.kind == USFM_TOK_TEXT && node != USFM_NIL) {
+        p->text_node = node;
+        p->text_offset = t->tok.span.offset;
+        p->text_first_loose = t->first_loose;
+    }
 }
 
 static void usfm__on_optbreak(USFM_Parser *p, const USFM_ScanToken *t)
@@ -3305,6 +3339,7 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     p.version_auto = version == USFM_VERSION_AUTO;
     p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
+    p.text_node = USFM_NIL;
     usfm__scan_init(&p.scan, text, input_length);
     usfm__open(&p, USFM_AST_BOOK, usfm__span(0, input_length), USFM_M_NONE, 0, 0);
     /* The BOOK span covers the whole input, which would otherwise make
