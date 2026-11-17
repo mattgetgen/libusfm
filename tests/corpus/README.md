@@ -15,7 +15,8 @@ Every line is externally verified. On 2026-11-15, three independent
 parsers counted every corpus exactly as `expected.txt` says: books,
 chapters, verses, paragraphs, character spans, notes and milestones. The
 three are ParatextData 9.5.0.24 (C#), usfm3 0.2.1 (Rust, AST mode) and
-usfmtc 0.4.8 (Python, the USFM committee's parser), each run with its own
+usfmtc 0.4.8 (Python, the USFM committee's parser; 0.4.10 gives the
+same counts, checked on 2026-11-17), each run with its own
 harness from the parser benchmark repository.
 `paratextdata-web.csv` has ParatextData's per-book counts for
 WEB-STRONGS (compare with `build/corpus/libusfm-WEB-STRONGS.csv`). Every
