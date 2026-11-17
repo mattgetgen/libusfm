@@ -1,0 +1,23 @@
+\id GEN Sample book for the usfm tool tests
+\usfm 3.1
+\h Genesis
+\toc1 The First Book of Moses
+\mt1 Genesis
+\c 1
+\s1 The Creation
+\p
+\v 1 In the \w beginning|strong="H7225"\w*, God created the heavens and the earth.
+\v 2 The earth was formless~and empty.\f + \fr 1:2 \ft Or, \fq void\fq*.\f*
+\q1
+\v 3-4 God said, \wj “Let there be \+w light|strong="H216"\+w*,”\wj* and
+\q2 there was light. // God saw the light.
+\p
+\v 5 God called the light “day.” \qt-s |who="God"\*Evening\qt-e\* came.
+\c 2
+\p
+\v 1 The heavens and the earth were finished, a\\b.
+\tr \th1 Day \tc2 Work
+\tr \tc1 1 \tc2 Light
+\v 2 On the seventh day God finished his work.
+\p
+\v 3 \fig A picture|src="a.jpg" size="col"\fig* God blessed the seventh day.
