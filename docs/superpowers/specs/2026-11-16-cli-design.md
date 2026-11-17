@@ -82,17 +82,28 @@ span), up to the first space, `*`, `\` or end of span. A PARA with
 
 - **Walk:** the tool walks the nodes in preorder with an explicit stack,
   with no recursion.
-- **Line breaks:** a newline is written before every BOOK, HEADER,
-  CHAPTER, PARA, TABLE row, SIDEBAR and PERIPHERAL node, except at the
-  very start of output. A PARA flagged `IMPLIED` writes nothing itself,
-  but its children are written.
+- **Line breaks:** a newline is written before every HEADER, CHAPTER,
+  VERSE, PARA, TABLE row, SIDEBAR and PERIPHERAL node, except at the very
+  start of output. `\v` on its own line is the usual USFM layout; the
+  parser drops that newline when it reads the text back, so the tree
+  does not change. BOOK and TABLE nodes have no marker and write
+  nothing. A PARA flagged `IMPLIED` writes no marker, but still starts a
+  line, and its children are written.
 - **Markers:** each marker is written as `\name`. If the node has an
   ARGUMENT child, a space and the argument's bytes follow. A space
-  separates the marker from following text.
-- **ATTRIBUTES** are written as `|` followed by the node's raw bytes.
-- **Closing:** a CHAR or NOTE node ends with `\name*`, or `\+name*` when
-  nested. A MILESTONE always ends with `\*`. Every closer is written
-  even where the source closed it implicitly.
+  separates the marker from following text or markers. A cell marker
+  (`\tc2`) also gets a space before it, because the parser trims the
+  space at the end of cell text.
+- **ATTRIBUTES:** the node's raw bytes, which include the leading `|`.
+- **Closing:** an end marker is written only where the source had one,
+  copied as written: `\w*`, `\+w*`, `\*` for a milestone, `\esbe` for a
+  sidebar. A span the source closed implicitly (such as `\fr` and `\ft`
+  inside a footnote) stays implicit, so the output parses back to the
+  same tree.
+- **Stability:**
+  - On the test fixture the view prints the input byte for byte.
+  - On every corpus file, printing the view's own output again changes
+    nothing.
 - **TEXT:** the node's bytes are copied, except that each run of CR, LF
   and TAB becomes one space. OPTBREAK is written as `//`.
 - **Colors (ANSI SGR):**
@@ -135,7 +146,10 @@ span), up to the first space, `*`, `\` or end of span. A PARA with
   yellow.
 - **Paragraphs:** a PARA starts a new line. A heading PARA (`heading`
   flag) is printed in bold on its own line.
-- **Verses:** a VERSE prints its number and a space, in yellow, inline.
+- **Verses:** a VERSE prints its number and a space, in yellow, inline,
+  with a space before it unless it starts the line.
+- **Tables:** a row starts a new line, and cells are separated by a TAB.
+- **Figures:** the caption is printed.
 - **Removed:** NOTE subtrees, ATTRIBUTES, OPTBREAK and ARGUMENT nodes
   (other than chapter and verse numbers).
 - **Escapes are cooked:**
@@ -152,6 +166,10 @@ span), up to the first space, `*`, `\` or end of span. A PARA with
 - **Selected nodes:** from the first matched entry's VERSE node up to the
   `end_node` of the last. A chapter covers its CHAPTER node up to its
   `end_node`.
+- **Trimming:** trailing nodes with none of their content selected are
+  dropped. A verse ends at the next `\v`, which lies inside the next
+  paragraph, so without this every range would end with that
+  paragraph's opening `\p`.
 - **USFM and text views:** if the first selected node is not a direct
   child of the root, the views first open each enclosing PARA (USFM
   writes its marker, text starts its line) and close each enclosing
@@ -164,8 +182,11 @@ span), up to the first space, `*`, `\` or end of span. A PARA with
 
 - **What runs:** each input is read into memory once, then parsed N
   times, N ≥ 1.
-- **What's timed:** each parse alone, with nothing printed and nothing
-  freed between passes.
+- **What's timed:** each parse alone, with nothing printed.
+- **Freeing:** the AST is freed after each pass, outside the timed
+  region. Keeping every tree would hold N whole trees in memory (about
+  6 GB for 100 passes over WEB-STRONGS). This is the only place the tool
+  frees memory.
 - **Per input:** a line `PATH  BYTES bytes  BEST ns  MiB/s` with the
   fastest pass.
 - **After all inputs:** a total line, summing the best times and the
@@ -190,8 +211,9 @@ span), up to the first space, `*`, `\` or end of span. A PARA with
 
 - **Input:** a file is read with `fopen`/`fread`; stdin is read in
   chunks into a growing buffer.
-- **Memory:** the tool never frees memory; the process exit releases
-  it.
+- **Memory:** the tool never frees memory, except for the benchmark's
+  ASTs; the process exit releases it. Debug builds use AddressSanitizer,
+  so `main.c` turns off its leak report (`__asan_default_options`).
 - **Output:** written with `fwrite` through stdio's buffer.
 
 ## Build and files
@@ -217,7 +239,9 @@ span), up to the first space, `*`, `\` or end of span. A PARA with
   - `-M -u` and `-M -x` for `1`, `1:3`, `1:3-5`, `1:3-2:2`, and a
     bridge verse.
 
-  `diff` must find no difference.
+  `diff` must find no difference. File names use `.` instead of `:`
+  (`usfm-1.3-5.txt`), because Windows can't check out names containing
+  `:`.
 - **Exit status:**
   - A reference that matches nothing exits 1 with empty stdout.
   - A missing path exits 2.
