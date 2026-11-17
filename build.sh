@@ -73,6 +73,12 @@ case "$MODE" in
         ./build/corpus_test build/corpus/WEB
         gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" -DUSFM_FUZZ_REPLAY tests/fuzz_ast.c -o build/fuzz_replay
         ./build/fuzz_replay tests/fuzz/seeds/*
+        gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" main.c -o build/usfm_cli
+        tests/cli_test.sh build/usfm_cli build/corpus/WEB
+        if command -v zig > /dev/null; then
+            zig cc -target x86_64-windows-gnu -std=c99 -Wall -Wextra -pedantic -O1 \
+                -c main.c -o build/usfm_windows.o && echo "usfm tool: windows compiles"
+        fi
         ;;
     fuzz)
         run_codegen
