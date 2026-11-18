@@ -1651,6 +1651,7 @@ static int usfm__wide_bom(const char *input, uint32_t length)
     if ((u[0] == 0xFFu && u[1] == 0xFEu) || (u[0] == 0xFEu && u[1] == 0xFFu)) return 1;
     return length >= 4 && u[0] == 0 && u[1] == 0 && u[2] == 0xFEu && u[3] == 0xFFu;
 }
+
 #define USFM__NO_BLOCK 0xFFFFFFFFu
 
 static void usfm__scan_init(USFM_Scanner *s, const char *input, uint32_t length)
