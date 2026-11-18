@@ -1,0 +1,7 @@
+BOOK @0+727 (context)
+  TABLE @555+92 (context)
+    ROW \tr @578+69 (context)
+      CELL \tc2 level 2 @589+58 (context)
+        VERSE \v @600+4
+          ARGUMENT "2" @603+1
+        TEXT "On the seventh day God finished his work." @605+41

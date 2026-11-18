@@ -1,0 +1,87 @@
+BOOK @0+727
+  HEADER \id @0+44
+    ARGUMENT "GEN" @4+3
+    TEXT "Sample book for the usfm tool tests" @8+35
+  HEADER \usfm @44+9
+    ARGUMENT "3.1" @50+3
+  HEADER \h @54+11
+    TEXT "Genesis" @57+7
+  HEADER \toc1 level 1 @65+30
+    TEXT "The First Book of Moses" @71+23
+  PARA \mt1 level 1 heading @95+13
+    TEXT "Genesis" @100+7
+  CHAPTER \c @108+4
+    ARGUMENT "1" @111+1
+  PARA \s1 level 1 heading @113+17
+    TEXT "The Creation" @117+12
+  PARA \p @130+162
+    VERSE \v @133+4
+      ARGUMENT "1" @136+1
+    TEXT "In the " @138+7
+    CHAR \w @145+30
+      TEXT "beginning" @148+9
+      ATTRIBUTES "|strong=\"H7225\"" @157+15
+    TEXT ", God created the heavens and the earth." @175+40
+    VERSE \v @216+4
+      ARGUMENT "2" @219+1
+    TEXT nbsp "The earth was formless~and empty." @221+33
+    NOTE \f @254+37
+      ARGUMENT "+" @257+1
+      CHAR \fr @259+8
+        TEXT "1:2 " @263+4
+      CHAR \ft @267+8
+        TEXT "Or, " @271+4
+      CHAR \fq @275+12
+        TEXT "void" @279+4
+      TEXT "." @287+1
+  PARA \q1 level 1 @292+81
+    VERSE \v @296+6
+      ARGUMENT "3-4" @299+3
+    TEXT "God said, " @303+10
+    CHAR \wj @313+55
+      TEXT "“Let there be " @317+16
+      CHAR \+w nested @333+27
+        TEXT "light" @337+5
+        ATTRIBUTES "|strong=\"H216\"" @342+14
+      TEXT ",”" @360+4
+    TEXT " and" @368+4
+  PARA \q2 level 2 @373+43
+    TEXT "there was light. " @377+17
+    OPTBREAK @394+2
+    TEXT " God saw the light." @396+19
+  PARA \p @416+79
+    VERSE \v @419+4
+      ARGUMENT "5" @422+1
+    TEXT "God called the light “day.” " @424+32
+    MILESTONE \qt-s milestone-start self-closed @456+18
+      ATTRIBUTES "|who=\"God\"" @462+10
+    TEXT "Evening" @474+7
+    MILESTONE \qt-e milestone-end self-closed @481+7
+    TEXT " came." @488+6
+  CHAPTER \c @495+4
+    ARGUMENT "2" @498+1
+  PARA \p @500+55
+    VERSE \v @503+4
+      ARGUMENT "1" @506+1
+    TEXT escape "The heavens and the earth were finished, a\\\\b." @508+46
+  TABLE @555+92
+    ROW \tr @555+23
+      CELL \th1 level 1 @559+9
+        TEXT "Day" @564+3
+      CELL \tc2 level 2 @568+10
+        TEXT "Work" @573+4
+    ROW \tr @578+69
+      CELL \tc1 level 1 @582+7
+        TEXT "1" @587+1
+      CELL \tc2 level 2 @589+58
+        TEXT "Light" @594+5
+        VERSE \v @600+4
+          ARGUMENT "2" @603+1
+        TEXT "On the seventh day God finished his work." @605+41
+  PARA \p @647+80
+    VERSE \v @650+4
+      ARGUMENT "3" @653+1
+    FIGURE \fig @655+42
+      TEXT "A picture" @660+9
+      ATTRIBUTES "|src=\"a.jpg\" size=\"col\"" @669+23
+    TEXT " God blessed the seventh day." @697+29

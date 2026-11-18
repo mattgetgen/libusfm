@@ -1,9 +1,12 @@
 #define USFM_IMPLEMENTATION
-#define USFM_CODEGEN 1
-#define _POSIX_C_SOURCE 1
+#define USFM_CODEGEN_BOOTSTRAP
+#define _POSIX_C_SOURCE 200809L
 #include "../usfm.h"
+#include "markers.h"
 
 #include <fcntl.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +16,6 @@
 #include <unistd.h>
 
 #define TEMP_BUFFER_SIZE 128
-#define CODEGEN_MARKER_TEXT_CAPACITY 200
 
 typedef enum {
     START,
@@ -52,11 +54,51 @@ typedef struct {
     size_t capacity;
 } CodeGen_WriteBuffer;
 
+uint64_t CodeGen_ContentHash_Calculate(char *input, size_t start, size_t end);
+void CodeGen_GenerationComments_Serialize(CodeGen_WriteBuffer *buffer, uint64_t content_hash);
+
 void CodeGen_WriteBuffer_Append(CodeGen_WriteBuffer *buffer, const char *text, size_t length)
 {
     assert(buffer->length + length <= buffer->capacity);
     memcpy(&buffer->buffer[buffer->length], text, length);
     buffer->length += length;
+}
+
+void CodeGen_WriteBuffer_Appendf(CodeGen_WriteBuffer *buffer, const char *format, ...)
+{
+    char line[512];
+    va_list args;
+    va_start(args, format);
+    int length = vsnprintf(line, sizeof line, format, args);
+    va_end(args);
+    assert(length >= 0 && (size_t)length < sizeof line);
+    CodeGen_WriteBuffer_Append(buffer, line, (size_t)length);
+}
+
+bool CodeGen_Block_Finish(CodeGen_WriteBuffer *buffer, CodeGen_WriteBuffer *content,
+    uint64_t current_hash, const char *name)
+{
+    uint64_t hash = CodeGen_ContentHash_Calculate(content->buffer, 0, content->length);
+    bool unchanged = hash == current_hash;
+    if (!unchanged)
+    {
+        printf("Writing new version of %s\n", name);
+        CodeGen_GenerationComments_Serialize(buffer, hash);
+        CodeGen_WriteBuffer_Append(buffer, content->buffer, content->length);
+    }
+    free(content->buffer);
+    return unchanged;
+}
+
+CodeGen_WriteBuffer CodeGen_WriteBuffer_Temp(size_t capacity)
+{
+    CodeGen_WriteBuffer temp = {
+        .buffer = malloc(capacity),
+        .length = 0,
+        .capacity = capacity,
+    };
+    assert(temp.buffer != NULL);
+    return temp;
 }
 
 CodeGen_ParseResult CodeGen_Comment_Parse(char *input, size_t *index,
@@ -209,217 +251,265 @@ void CodeGen_GenerationComments_Serialize(CodeGen_WriteBuffer *buffer, uint64_t 
     CodeGen_WriteBuffer_Append(buffer, end, strlen(end));
 }
 
-bool CodeGen_USFM_CharacterClass_Serialize(USFM_CharacterClass *character_class, CodeGen_WriteBuffer *buffer,
-    uint64_t current_hash)
+void CodeGen_ByteClass_Generate(uint8_t classes[256])
 {
-    CodeGen_WriteBuffer temp_buffer = {
-        .buffer = malloc(sizeof(char) * buffer->capacity),
-        .capacity = buffer->capacity,
-    };
-    assert(temp_buffer.buffer != NULL);
-    const char *start = "static const USFM_CharacterClass USFM_CharacterClass_From_Character[256] = {\n";
-    CodeGen_WriteBuffer_Append(&temp_buffer, start, strlen(start));
-
-    for (size_t i = 0; i < 256; i++)
+    memset(classes, 0, 256);
+    const char *stops = "\\|/~\r\n\t";
+    for (size_t i = 0; stops[i] != '\0'; i++)
     {
-        USFM_CharacterClass class = character_class[i];
-        if (class != CLASS_OTHER)
-        {
-            char *class_enum_str = NULL;
-            switch (class)
-            {
-            case CLASS_OTHER:
-                class_enum_str = "CLASS_OTHER";
-                break;
-            case CLASS_WHITESPACE:
-                class_enum_str = "CLASS_WHITESPACE";
-                break;
-            case CLASS_CARRIAGE_RETURN:
-                class_enum_str = "CLASS_CARRIAGE_RETURN";
-                break;
-            case CLASS_LINE_FEED:
-                class_enum_str = "CLASS_LINE_FEED";
-                break;
-            case CLASS_BACKSLASH:
-                class_enum_str = "CLASS_BACKSLASH";
-                break;
-            case CLASS_PLUS:
-                class_enum_str = "CLASS_PLUS";
-                break;
-            case CLASS_MINUS:
-                class_enum_str = "CLASS_MINUS";
-                break;
-            case CLASS_ASTERISK:
-                class_enum_str = "CLASS_ASTERISK";
-                break;
-            case CLASS_LETTER:
-                class_enum_str = "CLASS_LETTER";
-                break;
-            case CLASS_DIGIT:
-                class_enum_str = "CLASS_DIGIT";
-                break;
-            }
-            char temp_line_buffer[TEMP_BUFFER_SIZE] = {0};
-            int len = snprintf(temp_line_buffer, TEMP_BUFFER_SIZE, "    [%ld] = %s,\n", i, class_enum_str);
-            assert(len <= TEMP_BUFFER_SIZE && len > 0);
-            CodeGen_WriteBuffer_Append(&temp_buffer, (const char *)temp_line_buffer, len);
-        }
+        classes[(uint8_t)stops[i]] |= USFM_BC_STOP;
     }
-
-    const char *end = "};\n";
-    CodeGen_WriteBuffer_Append(&temp_buffer, end, strlen(end));
-
-    uint64_t hash = CodeGen_ContentHash_Calculate(temp_buffer.buffer, 0, temp_buffer.length);
-    bool dont_rewrite = hash == current_hash;
-    if (!dont_rewrite)
+    for (int c = 'A'; c <= 'Z'; c++)
     {
-        printf("Writing new version of character_class\n");
-        CodeGen_GenerationComments_Serialize(buffer, hash);
-        CodeGen_WriteBuffer_Append(buffer, temp_buffer.buffer, temp_buffer.length);
+        classes[c] |= USFM_BC_NAME | USFM_BC_ALPHA;
     }
-    free(temp_buffer.buffer);
-    return dont_rewrite;
+    for (int c = 'a'; c <= 'z'; c++)
+    {
+        classes[c] |= USFM_BC_NAME | USFM_BC_ALPHA;
+    }
+    for (int c = '0'; c <= '9'; c++)
+    {
+        classes[c] |= USFM_BC_NAME | USFM_BC_DIGIT;
+    }
+    classes['-'] |= USFM_BC_NAME;
+    classes[' '] |= USFM_BC_SPACE;
+    classes['\t'] |= USFM_BC_SPACE;
+    classes['\r'] |= USFM_BC_NEWLINE;
+    classes['\n'] |= USFM_BC_NEWLINE;
+    const char *escapes = "\\/|~\"";
+    for (size_t i = 0; escapes[i] != '\0'; i++)
+    {
+        classes[(uint8_t)escapes[i]] |= USFM_BC_ESCAPE;
+    }
 }
 
-char **CodeGen_USFM_MarkerType_Parse(char *input, CodeGen_CommentBlock block, size_t *length)
-{
-    const char *usfm_marker_prefix = "    USFM_MARKER_";
-    const size_t usfm_marker_prefix_len = strlen(usfm_marker_prefix);
-    bool usfm_marker_prefix_found = false;
-
-    const char *unknown_marker = "UNKNOWN";
-    const size_t unknown_marker_len = strlen(unknown_marker);
-    bool unknown_marker_found = false;
-
-    const char *close_marker = "CLOSE";
-    const size_t close_marker_len = strlen(close_marker);
-    bool close_marker_found = false;
-    const char *close_marker_text = "*";
-
-    *length = 0;
-    char **array = malloc(sizeof(char *) * CODEGEN_MARKER_TEXT_CAPACITY);
-    assert(array != NULL);
-
-    size_t line_start = block.start_comment_index_start;
-    size_t index = block.start_comment_index_start;
-
-    while (index <= block.end_comment_index_start)
-    {
-        if (memcmp(&input[line_start], usfm_marker_prefix, usfm_marker_prefix_len) == 0)
-        {
-            usfm_marker_prefix_found = true;
-            index += usfm_marker_prefix_len;
-            char *marker = &input[index];
-            size_t marker_length = 0;
-            while (input[index] >= 'A' && input[index] <= 'Z')
-            {
-                marker_length++;
-                index++;
-            }
-            if (memcmp(marker, unknown_marker, unknown_marker_len) == 0)
-            {
-                unknown_marker_found = true;
-                marker = NULL;
-                marker_length = 0;
-
-            }
-            else if (memcmp(marker, close_marker, close_marker_len) == 0)
-            {
-                close_marker_found = true;
-                marker = (char *)close_marker_text;
-                marker_length = 1;
-            }
-            char *text = malloc(marker_length+1);
-            assert(text != NULL);
-            memset(text, 0, marker_length+1);
-            for (size_t i = 0; i < marker_length; i++)
-            {
-                if (marker[i] >= 'A' && marker[i] <= 'Z')
-                {
-                    text[i] = marker[i] + (97-65);
-                }
-                else
-                {
-                    text[i] = marker[i];
-                }
-            }
-            if (*length < CODEGEN_MARKER_TEXT_CAPACITY)
-            {
-                array[*length] = text;
-                (*length)++;
-            }
-            else
-            {
-                printf("CodeGen Error: Too many markers to fit in the default capacity of %d!\n", CODEGEN_MARKER_TEXT_CAPACITY);
-                exit(1);
-            }
-        }
-        // NOTE(mattg): go to end of newline
-        while (index <= block.end_comment_index_start && input[index] != '\n')
-        {
-            index++;
-            if (input[index] == '\n')
-            {
-                index++;
-                line_start = index;
-                break;
-            }
-        }
-    }
-    if (!usfm_marker_prefix_found)
-    {
-        printf("CodeGen Warning: \"%s\" prefix not found!\n", usfm_marker_prefix);
-    }
-    if (!unknown_marker_found)
-    {
-        printf("CodeGen Warning: \"%s\" marker not found!\n", unknown_marker);
-    }
-    if (!close_marker_found)
-    {
-        printf("CodeGen Warning: \"%s\" marker not found!\n", close_marker);
-    }
-    return array;
-}
-
-bool CodeGen_USFM_MarkerText_Serialize(CodeGen_WriteBuffer *buffer, char **array, size_t length,
+bool CodeGen_ByteClass_Serialize(const uint8_t classes[256], CodeGen_WriteBuffer *buffer,
     uint64_t current_hash)
 {
-    CodeGen_WriteBuffer temp_buffer = {
-        .buffer = malloc(sizeof(char) * buffer->capacity),
-        .capacity = buffer->capacity,
-    };
-    char start_temp_buffer[TEMP_BUFFER_SIZE] = {0};
-    size_t start_len = snprintf(start_temp_buffer, TEMP_BUFFER_SIZE, "static const char *USFM_MarkerText_From_MarkerType[%ld] = {\n", length);
-    assert(start_len <= TEMP_BUFFER_SIZE);
-    CodeGen_WriteBuffer_Append(&temp_buffer, (const char *)start_temp_buffer, start_len);
-
-    for (size_t i = 0; i < length; i++)
+    CodeGen_WriteBuffer temp = CodeGen_WriteBuffer_Temp(buffer->capacity);
+    CodeGen_WriteBuffer_Appendf(&temp, "static const uint8_t USFM_ByteClass[256] = {\n");
+    for (size_t i = 0; i < 256; i += 16)
     {
-        char temp_line_buffer[TEMP_BUFFER_SIZE] = {0};
-        size_t len = snprintf(temp_line_buffer, TEMP_BUFFER_SIZE, "    \"%s\",\n", array[i]);
-        assert(len <= TEMP_BUFFER_SIZE);
-        CodeGen_WriteBuffer_Append(&temp_buffer, (const char *)temp_line_buffer, len);
+        CodeGen_WriteBuffer_Appendf(&temp, "   ");
+        for (size_t j = i; j < i + 16; j++)
+        {
+            CodeGen_WriteBuffer_Appendf(&temp, " 0x%02x,", classes[j]);
+        }
+        CodeGen_WriteBuffer_Appendf(&temp, "\n");
+    }
+    CodeGen_WriteBuffer_Appendf(&temp, "};\n");
+    return CodeGen_Block_Finish(buffer, &temp, current_hash, "character_class");
+}
+
+/* UTF-8 validity as a shift DFA: each state is a bit offset (a multiple
+ * of 6) into a byte's 64-bit table entry, whose 6-bit field there is the
+ * next state. 0 starts and accepts; CODEGEN_U8_ERR absorbs. RFC 3629. */
+enum {
+    CODEGEN_U8_ACC = 0, CODEGEN_U8_ERR = 6, CODEGEN_U8_C1 = 12, CODEGEN_U8_C2 = 18,
+    CODEGEN_U8_C3 = 24, CODEGEN_U8_E0 = 30, CODEGEN_U8_ED = 36, CODEGEN_U8_F0 = 42,
+    CODEGEN_U8_F4 = 48
+};
+
+static void CodeGen_Utf8Dfa_Put(uint64_t *entry, unsigned from, unsigned to)
+{
+    *entry = (*entry & ~(63ull << from)) | ((uint64_t)to << from);
+}
+
+void CodeGen_Utf8Dfa_Generate(uint64_t table[256])
+{
+    for (unsigned b = 0; b < 256; b++)
+    {
+        uint64_t *e = &table[b];
+        *e = 0;
+        for (unsigned s = 0; s <= CODEGEN_U8_F4; s += 6)
+        {
+            CodeGen_Utf8Dfa_Put(e, s, CODEGEN_U8_ERR);
+        }
+        if (b < 0x80) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_ACC);
+        else if (b >= 0xC2 && b <= 0xDF) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_C1);
+        else if (b == 0xE0) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_E0);
+        else if ((b >= 0xE1 && b <= 0xEC) || b == 0xEE || b == 0xEF)
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_C2);
+        else if (b == 0xED) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_ED);
+        else if (b == 0xF0) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_F0);
+        else if (b >= 0xF1 && b <= 0xF3) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_C3);
+        else if (b == 0xF4) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_F4);
+        if (b >= 0x80 && b <= 0xBF)
+        {
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_C1, CODEGEN_U8_ACC);
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_C2, CODEGEN_U8_C1);
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_C3, CODEGEN_U8_C2);
+        }
+        if (b >= 0xA0 && b <= 0xBF) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_E0, CODEGEN_U8_C1);
+        if (b >= 0x80 && b <= 0x9F) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ED, CODEGEN_U8_C1);
+        if (b >= 0x90 && b <= 0xBF) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_F0, CODEGEN_U8_C2);
+        if (b >= 0x80 && b <= 0x8F) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_F4, CODEGEN_U8_C2);
+    }
+}
+
+bool CodeGen_Utf8Dfa_Serialize(const uint64_t table[256], CodeGen_WriteBuffer *buffer,
+    uint64_t current_hash)
+{
+    CodeGen_WriteBuffer temp = CodeGen_WriteBuffer_Temp(buffer->capacity);
+    CodeGen_WriteBuffer_Appendf(&temp,
+        "/* UTF-8 validity as a shift DFA: state = (USFM_Utf8Dfa[byte] >> state)\n"
+        " * & 63, starting and accepting at 0; 6 is the error state. */\n");
+    CodeGen_WriteBuffer_Appendf(&temp, "static const uint64_t USFM_Utf8Dfa[256] = {\n");
+    for (size_t i = 0; i < 256; i += 4)
+    {
+        CodeGen_WriteBuffer_Appendf(&temp, "   ");
+        for (size_t j = i; j < i + 4; j++)
+        {
+            CodeGen_WriteBuffer_Appendf(&temp, " 0x%016llxull,", (unsigned long long)table[j]);
+        }
+        CodeGen_WriteBuffer_Appendf(&temp, "\n");
+    }
+    CodeGen_WriteBuffer_Appendf(&temp, "};\n");
+    return CodeGen_Block_Finish(buffer, &temp, current_hash, "utf8_dfa");
+}
+
+/* Seeds tried per table size, and the largest size tried (as a multiple
+ * of the key count). Both bound the search so codegen always ends. */
+#define CODEGEN_HASH_SEED_LIMIT 65536u
+#define CODEGEN_HASH_SIZE_FACTOR 64u
+
+typedef struct {
+    uint32_t seed;
+    uint32_t slot_count;
+    size_t name_max;
+    uint16_t *slots;        /* slot -> row index + 1; 0 = empty */
+} CodeGen_PerfectHash;
+
+/* Finds the smallest slot count (and a seed) that puts every key in
+ * its own slot. Prints an error and returns false if the bounds are hit
+ * or two keys have identical hash input. */
+bool CodeGen_PerfectHash_Search(const CodeGen_MarkerDef *defs, size_t count,
+    CodeGen_PerfectHash *out)
+{
+    assert(count > 0 && count < 0xFFFF);
+    uint32_t *hashes = malloc(count * sizeof *hashes);
+    assert(hashes != NULL);
+    size_t name_max = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        size_t length = strlen(defs[i].name);
+        if (length == 0 || length > 255)
+        {
+            printf("CodeGen Error: marker name \"%s\" must be 1..255 bytes\n", defs[i].name);
+            free(hashes);
+            return false;
+        }
+        hashes[i] = usfm__marker_hash(defs[i].name, (uint32_t)length);
+        if (length > name_max)
+        {
+            name_max = length;
+        }
+        for (size_t j = 0; j < i; j++)
+        {
+            if (strcmp(defs[i].name, defs[j].name) == 0)
+            {
+                printf("CodeGen Error: marker \"%s\" is listed twice\n", defs[i].name);
+                free(hashes);
+                return false;
+            }
+            if (hashes[i] == hashes[j])
+            {
+                printf("CodeGen Error: \"%s\" and \"%s\" have identical hash input; "
+                    "extend usfm__marker_hash\n", defs[i].name, defs[j].name);
+                free(hashes);
+                return false;
+            }
+        }
     }
 
-    const char *end = "};\n";
-    CodeGen_WriteBuffer_Append(&temp_buffer, end, strlen(end));
-
-    uint64_t hash = CodeGen_ContentHash_Calculate(temp_buffer.buffer, 0, temp_buffer.length);
-    bool dont_rewrite = hash == current_hash;
-    if (!dont_rewrite)
+    uint32_t max_size = (uint32_t)count * CODEGEN_HASH_SIZE_FACTOR;
+    uint32_t *stamp = calloc(max_size, sizeof *stamp);
+    assert(stamp != NULL);
+    uint32_t generation = 0;
+    for (uint32_t size = (uint32_t)count; size <= max_size; size++)
     {
-        printf("Writing new version of marker_text\n");
-        CodeGen_GenerationComments_Serialize(buffer, hash);
-        CodeGen_WriteBuffer_Append(buffer, temp_buffer.buffer, temp_buffer.length);
+        for (uint32_t k = 0; k < CODEGEN_HASH_SEED_LIMIT; k++)
+        {
+            uint32_t seed = (k + 1u) * 0x9E3779B1u;
+            generation++;
+            bool collision = false;
+            for (size_t i = 0; i < count; i++)
+            {
+                uint32_t slot = usfm__marker_slot(hashes[i], seed, size);
+                if (stamp[slot] == generation)
+                {
+                    collision = true;
+                    break;
+                }
+                stamp[slot] = generation;
+            }
+            if (!collision)
+            {
+                out->seed = seed;
+                out->slot_count = size;
+                out->name_max = name_max;
+                out->slots = calloc(size, sizeof *out->slots);
+                assert(out->slots != NULL);
+                for (size_t i = 0; i < count; i++)
+                {
+                    out->slots[usfm__marker_slot(hashes[i], seed, size)] = (uint16_t)(i + 1);
+                }
+                printf("Perfect hash: %zu keys in %u slots (seed 0x%08x)\n", count, size, seed);
+                free(stamp);
+                free(hashes);
+                return true;
+            }
+        }
     }
-    free(temp_buffer.buffer);
-    return dont_rewrite;
+    printf("CodeGen Error: no collision-free hash for %zu markers with up to %u slots "
+        "and %u seeds per size\n", count, max_size, CODEGEN_HASH_SEED_LIMIT);
+    free(stamp);
+    free(hashes);
+    return false;
+}
+
+bool CodeGen_MarkerTable_Serialize(CodeGen_WriteBuffer *buffer, uint64_t current_hash)
+{
+    size_t count = sizeof CodeGen_Markers / sizeof CodeGen_Markers[0];
+    CodeGen_PerfectHash hash = {0};
+    if (!CodeGen_PerfectHash_Search(CodeGen_Markers, count, &hash))
+    {
+        exit(1);
+    }
+    CodeGen_WriteBuffer temp = CodeGen_WriteBuffer_Temp(buffer->capacity);
+    CodeGen_WriteBuffer_Appendf(&temp, "#define USFM_MARKER_NAME_MAX %zuu\n", hash.name_max);
+    CodeGen_WriteBuffer_Appendf(&temp, "#define USFM_MARKER_HASH_SEED 0x%08xu\n", hash.seed);
+    CodeGen_WriteBuffer_Appendf(&temp, "#define USFM_MARKER_SLOT_COUNT %uu\n", hash.slot_count);
+    CodeGen_WriteBuffer_Appendf(&temp, "static const USFM_MarkerRow USFM_MarkerRows[%zu] = {\n", count);
+    for (size_t i = 0; i < count; i++)
+    {
+        const CodeGen_MarkerDef *def = &CodeGen_Markers[i];
+        CodeGen_WriteBuffer_Appendf(&temp, "    { \"%s\", %zu, %s, %u, %s, %s },\n",
+            def->name, strlen(def->name), def->role, def->level, def->props, def->marker);
+    }
+    CodeGen_WriteBuffer_Appendf(&temp, "};\n");
+    CodeGen_WriteBuffer_Appendf(&temp, "static const %s USFM_MarkerSlots[%u] = {\n",
+        count < 255 ? "uint8_t" : "uint16_t", hash.slot_count);
+    for (uint32_t i = 0; i < hash.slot_count; i += 16)
+    {
+        CodeGen_WriteBuffer_Appendf(&temp, "   ");
+        for (uint32_t j = i; j < i + 16 && j < hash.slot_count; j++)
+        {
+            CodeGen_WriteBuffer_Appendf(&temp, " %u,", hash.slots[j]);
+        }
+        CodeGen_WriteBuffer_Appendf(&temp, "\n");
+    }
+    CodeGen_WriteBuffer_Appendf(&temp, "};\n");
+    free(hash.slots);
+    return CodeGen_Block_Finish(buffer, &temp, current_hash, "marker_table");
 }
 
 int main(int argc, char **argv)
 {
-    uint8_t character_class[256] = {0};
-    USFM_CharacterClass_Generate((uint8_t *)&character_class);
+    uint8_t byte_class[256];
+    CodeGen_ByteClass_Generate(byte_class);
+    uint64_t utf8_dfa[256];
+    CodeGen_Utf8Dfa_Generate(utf8_dfa);
 
     bool overwrite = false;
     const char *overwrite_arg_short = "-o";
@@ -562,20 +652,9 @@ int main(int argc, char **argv)
         block_length++;
     }
     
-    const char *mt = "marker_type";
-    const size_t mt_len = strlen(mt);
-    char **marker_texts = NULL;
-    size_t marker_texts_length = 0;
     for (size_t i = 0; i < block_length; i++)
     {
-        if (blocks[i].is_data)
-        {
-            if (memcmp(blocks[i].name, mt, mt_len) == 0)
-            {
-                marker_texts = CodeGen_USFM_MarkerType_Parse(readbuf, blocks[i], &marker_texts_length);
-            }
-        }
-        else
+        if (!blocks[i].is_data)
         {
             CodeGen_CommentBlock_GetHash(readbuf, &blocks[i]);
         }
@@ -601,30 +680,34 @@ int main(int argc, char **argv)
         else
         {
             const char *cc = "character_class";
-            const char *mt = "marker_text";
-            if (memcmp(block.name, cc, strlen(cc)) == 0)
+            const char *mt = "marker_table";
+            const char *ud = "utf8_dfa";
+            bool unchanged = true;
+            if (block.name_length == strlen(cc) && memcmp(block.name, cc, strlen(cc)) == 0)
             {
-                if (CodeGen_USFM_CharacterClass_Serialize((uint8_t *)character_class, &writebuf,
-                    block.content_hash))
-                {
-                    should_copy_content = true;
-                }
-                else
-                {
-                    content_changed = true;
-                }
+                unchanged = CodeGen_ByteClass_Serialize(byte_class, &writebuf, block.content_hash);
             }
-            else if (memcmp(block.name, mt, strlen(mt)) == 0)
+            else if (block.name_length == strlen(mt) && memcmp(block.name, mt, strlen(mt)) == 0)
             {
-                if (CodeGen_USFM_MarkerText_Serialize(&writebuf, marker_texts, marker_texts_length,
-                    block.content_hash))
-                {
-                    should_copy_content = true;
-                }
-                else
-                {
-                    content_changed = true;
-                }
+                unchanged = CodeGen_MarkerTable_Serialize(&writebuf, block.content_hash);
+            }
+            else if (block.name_length == strlen(ud) && memcmp(block.name, ud, strlen(ud)) == 0)
+            {
+                unchanged = CodeGen_Utf8Dfa_Serialize(utf8_dfa, &writebuf, block.content_hash);
+            }
+            else
+            {
+                printf("CodeGen Error: unknown codegen block \"%.*s\"\n",
+                    (int)block.name_length, block.name);
+                exit(1);
+            }
+            if (unchanged)
+            {
+                should_copy_content = true;
+            }
+            else
+            {
+                content_changed = true;
             }
         }
         if (should_copy_content)
@@ -651,12 +734,6 @@ int main(int argc, char **argv)
     {
         printf("No content changed!\n");
     }
-
-    for (size_t i = 0; i < marker_texts_length; i++)
-    {
-        free(marker_texts[i]);
-    }
-    free(marker_texts);
 
     free(readbuf);
     free(writebuf.buffer);
