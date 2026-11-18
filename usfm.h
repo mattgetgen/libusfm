@@ -91,7 +91,9 @@ extern "C" {
  *   validation off. Input starting with a UTF-16 or UTF-32 byte-order
  *   mark returns NULL with USFM_ERR_UNSUPPORTED_ENCODING, even with
  *   validation off. UTF-16 or UTF-32 without a byte-order mark is not
- *   detected.
+ *   detected. SIMD builds (see SIMD) validate the whole input in one
+ *   pass and re-check runs only if it is invalid; the results are the
+ *   same on every build.
  *
  * Failure semantics
  *   NULL                          -> failed, nothing to free; err.code
@@ -156,7 +158,16 @@ extern "C" {
  * else uses byte loops. There is no runtime CPU detection, so build with
  * the flags for the machines you target (e.g. -march=native). Define
  * USFM_SIMD_NONE to force the byte loops. Every path produces identical
- * results, and none reads past the end of the input. */
+ * results, and none reads past the end of the input.
+ *
+ * UTF-8 validation uses a Keiser-Lemire validator on the same targets:
+ * AVX-512BW (64 bytes per step), AVX2 (32), SSSE3 (16), NEON and wasm
+ * simd128 (16). USFM_Ast_ParseOpts validates the whole input once; only if
+ * it is invalid are the runs checked one by one, so diagnostics and
+ * flags are identical everywhere. SSE2 without SSSE3 and scalar builds
+ * (USFM_SIMD_NONE, targets with no SIMD) validate per run. A plain
+ * x86-64 build gets SSE2 for the scanner but no SIMD UTF-8 validation;
+ * enable SSSE3 (-mssse3, -march=x86-64-v2, -march=native) for it. */
 
 #define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
 
@@ -2302,6 +2313,11 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
     USFM__U8_C(USFM__U8_TOO_SHORT)
 /* The last 3 bytes of the "incomplete" threshold: a lead byte there needs more bytes. */
 #define USFM__U8_INCOMPLETE_LAST3 (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1)
+/* Saturating-subtract threshold byte for positions that can never be incomplete. */
+#define USFM__U8_FF USFM__U8_C(0xFF)
+#define USFM__U8_FF13 USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, \
+    USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF
+#define USFM__U8_FF16 USFM__U8_FF13, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF
 
 /* Whole-input validation is SIMD-only: on scalar builds a separate DFA
  * pass is slower than checking runs while parsing (see the spec). */
@@ -2319,10 +2335,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
     const __m512i b2h = _mm512_broadcast_i32x4(_mm_setr_epi8(USFM__U8_B2H));
     /* A lead byte in the last 3 positions still needs continuation bytes. */
     static const char incomplete_bytes[64] = {
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        USFM__U8_FF16, USFM__U8_FF16, USFM__U8_FF16, USFM__U8_FF13,
         USFM__U8_INCOMPLETE_LAST3};
     const __m512i incomplete_max = _mm512_loadu_si512((const void *)incomplete_bytes);
     const __m512i nib = _mm512_set1_epi8(0x0F);
@@ -2381,8 +2394,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
     const __m256i b2h = _mm256_broadcastsi128_si256(b2h_);
     /* A lead byte in the last 3 positions still needs continuation bytes. */
     const __m256i incomplete_max = _mm256_setr_epi8(
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        USFM__U8_FF16, USFM__U8_FF13,
         USFM__U8_INCOMPLETE_LAST3);
     const __m256i nib = _mm256_set1_epi8(0x0F);
     __m256i prev = _mm256_setzero_si256(), err = _mm256_setzero_si256(), pending = _mm256_setzero_si256();
@@ -2435,7 +2447,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
     const __m128i b1l = _mm_setr_epi8(USFM__U8_B1L);
     const __m128i b2h = _mm_setr_epi8(USFM__U8_B2H);
     /* A lead byte in the last 3 positions still needs continuation bytes. */
-    const __m128i incomplete_max = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    const __m128i incomplete_max = _mm_setr_epi8(USFM__U8_FF13,
                                                  USFM__U8_INCOMPLETE_LAST3);
     const __m128i nib = _mm_set1_epi8(0x0F);
     __m128i prev = _mm_setzero_si128(), err = _mm_setzero_si128(), pending = _mm_setzero_si128();
@@ -2486,7 +2498,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
     static const char b1l_t[16] = {USFM__U8_B1L};
     static const char b2h_t[16] = {USFM__U8_B2H};
     /* A lead byte in the last 3 positions still needs continuation bytes. */
-    static const char inc_t[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    static const char inc_t[16] = {USFM__U8_FF13,
                                    USFM__U8_INCOMPLETE_LAST3};
     const uint8x16_t b1h = vld1q_u8((const uint8_t *)b1h_t);
     const uint8x16_t b1l = vld1q_u8((const uint8_t *)b1l_t);
@@ -2541,7 +2553,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
     static const char b1l_t[16] = {USFM__U8_B1L};
     static const char b2h_t[16] = {USFM__U8_B2H};
     /* A lead byte in the last 3 positions still needs continuation bytes. */
-    static const char inc_t[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    static const char inc_t[16] = {USFM__U8_FF13,
                                    USFM__U8_INCOMPLETE_LAST3};
     const v128_t b1h = wasm_v128_load(b1h_t);
     const v128_t b1l = wasm_v128_load(b1l_t);
