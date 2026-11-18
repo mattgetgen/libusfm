@@ -139,6 +139,15 @@ int main(int argc, char **argv)
                 fprintf(stderr, "%s: invariants failed\n", names[i]);
                 failures++;
             }
+            if (check_utf8_coverage(ast) != 0) {
+                fprintf(stderr, "%s: bytes >= 0x80 outside every validated run\n", names[i]);
+                failures++;
+            }
+            if (check_utf8_flags(ast) != 0) {
+                fprintf(stderr, "%s: INVALID_UTF8 flags disagree with the reference validator\n",
+                        names[i]);
+                failures++;
+            }
             {
                 uint32_t diag_count, k;
                 const USFM_Diagnostic *diags = USFM_Ast_GetDiagnostics(ast, &diag_count);

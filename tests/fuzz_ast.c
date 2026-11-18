@@ -98,11 +98,48 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     ast = USFM_Ast_ParseOpts((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
                              &alc, &err);
     if (ast == NULL) {
-        if (err.code != USFM_ERR_NOMEM || state.live_bytes != 0) abort();
+        if (state.live_bytes != 0) abort();
+        if (err.code == USFM_ERR_UNSUPPORTED_ENCODING) {
+            if (!usfm__wide_bom((const char *)data + 2, (uint32_t)(size - 2)) || err.pos != 0) abort();
+            return 0;
+        }
+        if (err.code != USFM_ERR_NOMEM) abort();
         return 0;
     }
     if (err.code != USFM_OK && err.code != USFM_ERR_NOMEM) abort();
     if (check_ast(ast) != 0) abort();
+    if (check_utf8_coverage(ast) != 0) abort();
+    if (state.calls_left == UINT32_MAX && check_utf8_flags(ast) != 0) abort();
+    if (state.calls_left == UINT32_MAX) {
+        /* Validation adds diagnostics and the flag bit, nothing else. */
+        USFM_Ast *plain = USFM_Ast_ParseOpts((const char *)data + 2, (uint32_t)(size - 2), &config,
+                                             flags | USFM_PARSE_NO_UTF8_CHECK, NULL, &err);
+        uint32_t na, nb, da, db, i, j;
+        const USFM_Node *x, *y;
+        const USFM_Diagnostic *dx, *dy;
+        if (plain == NULL) abort();
+        x = USFM_Ast_GetNodes(ast, &na);
+        y = USFM_Ast_GetNodes(plain, &nb);
+        if (na != nb) abort();
+        for (i = 0; i < na; i++) {
+            uint8_t k = x[i].kind;
+            uint8_t ignore = (k == USFM_AST_TEXT || k == USFM_AST_ARGUMENT ||
+                              k == USFM_AST_ATTRIBUTES) ? USFM_TF_INVALID_UTF8 : 0;
+            if (x[i].kind != y[i].kind || x[i].marker != y[i].marker || x[i].parent != y[i].parent ||
+                x[i].end != y[i].end || x[i].span.offset != y[i].span.offset ||
+                x[i].span.length != y[i].span.length ||
+                (uint8_t)(x[i].level_flags & ~ignore) != y[i].level_flags) abort();
+        }
+        dx = USFM_Ast_GetDiagnostics(ast, &da);
+        dy = USFM_Ast_GetDiagnostics(plain, &db);
+        for (i = 0, j = 0; i < da; i++) {
+            if (dx[i].code == USFM_DIAGNOSTIC_INVALID_UTF8) continue;
+            if (j >= db || dx[i].code != dy[j].code || dx[i].span.offset != dy[j].span.offset) abort();
+            j++;
+        }
+        if (j != db) abort();
+        USFM_Ast_Free(plain);
+    }
     {
         /* Exercise the iterators on every verse. */
         USFM_ChapterIter chapters;

@@ -632,6 +632,10 @@ static int tree_open(const Doc *doc, uint32_t i, uint32_t depth, int context)
         if (flags & USFM_TF_MILESTONE_END) tree_flag("milestone-end");
         if (flags & USFM_TF_SELF_CLOSED) tree_flag("self-closed");
     }
+    if ((n->kind == USFM_AST_TEXT || n->kind == USFM_AST_ARGUMENT || n->kind == USFM_AST_ATTRIBUTES) &&
+        (n->level_flags & USFM_TF_INVALID_UTF8)) {
+        tree_flag("invalid-utf8");
+    }
     if (n->kind == USFM_AST_TEXT || n->kind == USFM_AST_ARGUMENT || n->kind == USFM_AST_ATTRIBUTES) {
         out_char(' ');
         tree_quoted(doc->input + n->span.offset, n->span.length);
