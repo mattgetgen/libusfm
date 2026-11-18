@@ -162,7 +162,7 @@ static void test_utf8_simd_validator(void)
         0, 1, 2, 3, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31, 32, 33,
         44, 45, 46, 47, 48, 49, 60, 61, 62, 63, 64, 65
     };
-    unsigned char buf[128], seq[4];
+    unsigned char buf[256], seq[4];
 
     uint32_t len, a, b, c, d, k, off, tail, seed, i, j;
     int before = usfm_test_failures;
@@ -176,6 +176,24 @@ static void test_utf8_simd_validator(void)
     CHECK_EQ(usfm__utf8_valid_simd((const char *)buf, 42), 0);
     CHECK_EQ(usfm__utf8_valid((const char *)buf, 42), 0);
     check_simd_matches(buf, 42);
+    /* 32-wide: lead at chunk position 31, a whole ASCII chunk, then more text. */
+    memset(buf, 'x', 31);
+    buf[31] = 0xC3;
+    memset(buf + 32, 'x', 40);
+    buf[72] = 0xC3;
+    buf[73] = 0xA9;
+    CHECK_EQ(usfm__utf8_valid_simd((const char *)buf, 74), 0);
+    CHECK_EQ(usfm__utf8_valid((const char *)buf, 74), 0);
+    check_simd_matches(buf, 74);
+    /* 64-wide: lead at chunk position 63, a whole ASCII chunk, then more text. */
+    memset(buf, 'x', 63);
+    buf[63] = 0xC3;
+    memset(buf + 64, 'x', 72);
+    buf[136] = 0xC3;
+    buf[137] = 0xA9;
+    CHECK_EQ(usfm__utf8_valid_simd((const char *)buf, 138), 0);
+    CHECK_EQ(usfm__utf8_valid((const char *)buf, 138), 0);
+    check_simd_matches(buf, 138);
     /* Edge sequences at chunk-boundary offsets. */
     for (len = 1; len <= 4; len++) {
         uint32_t total = 1;
@@ -189,8 +207,8 @@ static void test_utf8_simd_validator(void)
                 if (len == 4 && (off & 15u) != 0u && (off & 15u) < 13u) continue;   /* keeps the run short */
                 for (tail = 0; tail < 3; tail++) {
                     if (len == 4 && tail == 1) continue;   /* keeps the run short */
-                    /* End of buffer; 5 'x' after; 32 'x' (a whole ASCII chunk) then U+00E9. */
-                    uint32_t n = off + len + (tail == 0 ? 0u : tail == 1 ? 5u : 34u);
+                    /* End of buffer; 5 'x' after; 128 'x' (whole ASCII chunks at 32/64 wide) then U+00E9. */
+                    uint32_t n = off + len + (tail == 0 ? 0u : tail == 1 ? 5u : 130u);
                     memset(buf, 'x', sizeof buf);
                     memcpy(buf + off, seq, len);
                     if (tail == 2) { buf[n - 2] = 0xC3; buf[n - 1] = 0xA9; }
