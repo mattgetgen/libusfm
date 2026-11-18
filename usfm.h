@@ -1689,7 +1689,9 @@ typedef struct USFM_Parser {
     uint8_t          version_auto;      /* config said AUTO */
     uint8_t          chapter_open;      /* a \c is open: set by \c, cleared
                                            by \id and \periph */
-    uint8_t          reserved[3];
+    uint8_t          check_utf8;        /* validate TEXT, ARGUMENT and
+                                           ATTRIBUTES runs */
+    uint8_t          reserved[2];
     uint32_t         depth;
     uint32_t         last_end;          /* end of the last token placed */
     USFM_CloserTable closers[2];        /* [in_note]: see usfm__closer_ahead */
@@ -1737,6 +1739,108 @@ static uint8_t usfm__text_flags(const char *in, USFM_Span s)
     return flags;
 }
 
+/* Are s[0, n) valid UTF-8? 8 bytes at a time: pure-ASCII words are
+ * skipped, others go through the DFA without branching. */
+static int usfm__utf8_valid(const char *s, uint32_t n)
+{
+    const uint8_t *u = (const uint8_t *)s;
+    uint32_t i = 0;
+    uint64_t st = 0;
+    while (n - i >= 8u) {               /* bounded: i grows by 8 */
+        uint64_t w;
+        memcpy(&w, u + i, 8);
+        if (st == 0 && (w & 0x8080808080808080ull) == 0) {
+            i += 8u;
+            continue;
+        }
+        st = (USFM_Utf8Dfa[u[i]] >> st) & 63u;
+        st = (USFM_Utf8Dfa[u[i + 1]] >> st) & 63u;
+        st = (USFM_Utf8Dfa[u[i + 2]] >> st) & 63u;
+        st = (USFM_Utf8Dfa[u[i + 3]] >> st) & 63u;
+        st = (USFM_Utf8Dfa[u[i + 4]] >> st) & 63u;
+        st = (USFM_Utf8Dfa[u[i + 5]] >> st) & 63u;
+        st = (USFM_Utf8Dfa[u[i + 6]] >> st) & 63u;
+        st = (USFM_Utf8Dfa[u[i + 7]] >> st) & 63u;
+        i += 8u;
+    }
+    while (i < n) st = (USFM_Utf8Dfa[u[i++]] >> st) & 63u;   /* bounded: i grows */
+    return st == 0;
+}
+
+/* Offset (from s) of the first invalid UTF-8 sequence in s[0, n), or n if
+ * the bytes are valid. *bad is the invalid sequence's length (1-3): from
+ * its first byte up to, not including, the first byte that cannot
+ * continue it. Valid means RFC 3629: no overlong forms, no surrogates,
+ * nothing above U+10FFFF, no sequence cut short by the end. Runs of
+ * ASCII are skipped 8 bytes at a time. Bounded: every pass advances i. */
+static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
+{
+    const uint8_t *u = (const uint8_t *)s;
+    uint32_t i = 0;
+    *bad = 0;
+    while (i < n) {
+        uint8_t b, lo = 0x80u, hi = 0xBFu;
+        uint32_t need, k;
+        if (n - i >= 8u) {
+            uint64_t w;
+            memcpy(&w, u + i, 8);
+            if ((w & 0x8080808080808080ull) == 0) {
+                i += 8u;
+                continue;
+            }
+        }
+        b = u[i];
+        if (b < 0x80u) {
+            i++;
+            continue;
+        }
+        if (b >= 0xC2u && b <= 0xDFu) need = 1;
+        else if (b == 0xE0u) { need = 2; lo = 0xA0u; }
+        else if (b >= 0xE1u && b <= 0xECu) need = 2;
+        else if (b == 0xEDu) { need = 2; hi = 0x9Fu; }
+        else if (b >= 0xEEu && b <= 0xEFu) need = 2;
+        else if (b == 0xF0u) { need = 3; lo = 0x90u; }
+        else if (b >= 0xF1u && b <= 0xF3u) need = 3;
+        else if (b == 0xF4u) { need = 3; hi = 0x8Fu; }
+        else {
+            *bad = 1;
+            return i;
+        }
+        for (k = 1; k <= need; k++) {   /* bounded: need <= 3 */
+            uint8_t c;
+            if (i + k >= n) {
+                *bad = k;
+                return i;
+            }
+            c = u[i + k];
+            if (k == 1 ? (c < lo || c > hi) : (c < 0x80u || c > 0xBFu)) {
+                *bad = k;
+                return i;
+            }
+        }
+        i += need + 1u;
+    }
+    return n;
+}
+
+static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marker marker);
+
+/* Validates a TEXT, ARGUMENT or ATTRIBUTES token just scanned: on
+ * invalid bytes, sets USFM_TF_INVALID_UTF8 on the token and reports one
+ * diagnostic for the run, spanning its first invalid sequence. */
+static void usfm__check_utf8(USFM_Parser *p, USFM_ScanToken *t)
+{
+    uint32_t at, bad;
+    USFM_Marker context = USFM_M_NONE;
+    if (t->tok.kind != USFM_TOK_TEXT && t->tok.kind != USFM_TOK_ARGUMENT &&
+        t->tok.kind != USFM_TOK_ATTRIBUTES) return;
+    if (usfm__utf8_valid(p->ast->input + t->tok.span.offset, t->tok.span.length)) return;
+    at = usfm__utf8_check(p->ast->input + t->tok.span.offset, t->tok.span.length, &bad);
+    t->tok.level_flags |= USFM_TF_INVALID_UTF8;
+    if (p->depth > 0) context = p->ast->nodes[p->stack[p->depth - 1].node].marker;
+    usfm__diag(p, USFM_DIAGNOSTIC_INVALID_UTF8, usfm__span(t->tok.span.offset + at, bad), context);
+}
+
 static int usfm__next(USFM_Parser *p, USFM_ScanToken *t)
 {
     uint8_t top;
@@ -1748,7 +1852,9 @@ static int usfm__next(USFM_Parser *p, USFM_ScanToken *t)
     top = usfm__top_kind(p);
     p->scan.pipe_is_attr = (uint8_t)(top == USFM_AST_CHAR || top == USFM_AST_MILESTONE ||
                                      top == USFM_AST_FIGURE || top == USFM_AST_PERIPHERAL);
-    return usfm__scan_next(&p->scan, t);
+    if (!usfm__scan_next(&p->scan, t)) return 0;
+    if (p->check_utf8) usfm__check_utf8(p, t);
+    return 1;
 }
 
 static void usfm__push_back(USFM_Parser *p, const USFM_ScanToken *t)
@@ -1918,7 +2024,9 @@ static void usfm__trim_last_text(USFM_Parser *p)
     if (n->span.length == 0) {
         ast->node_count--;
     } else if (n->level_flags & USFM_TF_HAS_LOOSE_WS) {
-        n->level_flags = usfm__text_flags(ast->input, n->span);
+        /* Only ASCII whitespace was removed, so validity is unchanged. */
+        n->level_flags = (uint8_t)(usfm__text_flags(ast->input, n->span) |
+                                   (n->level_flags & USFM_TF_INVALID_UTF8));
     }
 }
 
@@ -1941,7 +2049,8 @@ static int usfm__take_argument(USFM_Parser *p, USFM_Span *arg, uint32_t missing_
     USFM_ScanToken t;
     if (usfm__next(p, &t)) {
         if (t.tok.kind == USFM_TOK_ARGUMENT) {
-            usfm__append(p, USFM_AST_ARGUMENT, t.tok.span, USFM_M_NONE, 0);
+            usfm__append(p, USFM_AST_ARGUMENT, t.tok.span, USFM_M_NONE,
+                         (uint8_t)(t.tok.level_flags & USFM_TF_INVALID_UTF8));
             *arg = t.tok.span;
             return 1;
         }
@@ -2131,9 +2240,10 @@ static void usfm__on_text(USFM_Parser *p, const USFM_ScanToken *t)
     /* An unclaimed ARGUMENT or stray ATTRIBUTES token has no text flags
      * from the scanner; compute them (rare). */
     usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
-                 t->tok.kind == USFM_TOK_TEXT
-                     ? (uint8_t)(t->tok.level_flags & USFM_TEXT_FLAGS_COOK)
-                     : usfm__text_flags(p->ast->input, t->tok.span));
+                 (uint8_t)((t->tok.kind == USFM_TOK_TEXT
+                                ? (t->tok.level_flags & USFM_TEXT_FLAGS_COOK)
+                                : usfm__text_flags(p->ast->input, t->tok.span)) |
+                           (t->tok.level_flags & USFM_TF_INVALID_UTF8)));
 }
 
 static void usfm__on_optbreak(USFM_Parser *p, const USFM_ScanToken *t)
@@ -2475,7 +2585,8 @@ static void usfm__on_attributes(USFM_Parser *p, const USFM_ScanToken *t)
     uint8_t k = usfm__top_kind(p);
     if (k == USFM_AST_CHAR || k == USFM_AST_MILESTONE || k == USFM_AST_FIGURE ||
         k == USFM_AST_PERIPHERAL) {
-        usfm__append(p, USFM_AST_ATTRIBUTES, t->tok.span, USFM_M_NONE, 0);
+        usfm__append(p, USFM_AST_ATTRIBUTES, t->tok.span, USFM_M_NONE,
+                     (uint8_t)(t->tok.level_flags & USFM_TF_INVALID_UTF8));
     } else {
         usfm__on_text(p, t);
     }
@@ -2789,6 +2900,7 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     memset(&p, 0, sizeof p);
     p.ast = ast;
     p.version_auto = version == USFM_VERSION_AUTO;
+    p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
     usfm__scan_init(&p.scan, text, input_length);
     usfm__open(&p, USFM_AST_BOOK, usfm__span(0, input_length), USFM_M_NONE, 0, 0);

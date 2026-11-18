@@ -21,6 +21,7 @@
 #include "test_versions.c"
 #include "test_iter.c"
 #include "test_parse_alloc.c"
+#include "test_utf8.c"
 
 int main(void)
 {
@@ -46,6 +47,8 @@ int main(void)
     run_iter_tests();
     fprintf(stderr, "parse alloc\n");
     run_parse_alloc_tests();
+    fprintf(stderr, "utf8\n");
+    run_utf8_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;

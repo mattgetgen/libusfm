@@ -1,5 +1,6 @@
 #ifndef USFM_CHECK_H
 #define USFM_CHECK_H
+#include <stdlib.h>
 /* check_ast: verifies every structural invariant of a parsed AST.
  * Returns 0 if all hold; otherwise prints the first violation to stderr
  * and returns 1. Used by the unit, corpus and fuzz tests. */
@@ -36,6 +37,54 @@ static uint8_t check_text_flags(const char *input, USFM_Span span)
     return flags;
 }
 
+/* Reference UTF-8 validator, written independently of usfm__utf8_check:
+ * a prefix of a multi-byte sequence is acceptable if some completion of
+ * it decodes to a scalar value of the right length (no overlong form,
+ * no surrogate, at most U+10FFFF). Returns the offset of the first
+ * invalid sequence in s[0, n), or n; *bad is the length of its longest
+ * acceptable prefix, at least 1. */
+static int check_utf8_prefix_ok(const unsigned char *s, uint32_t k, uint32_t len)
+{
+    static const uint32_t min_cp[5] = { 0, 0, 0x80, 0x800, 0x10000 };
+    static const uint32_t max_cp[5] = { 0, 0, 0x7FF, 0xFFFF, 0x10FFFF };
+    uint32_t lo, hi, j, a, b;
+    lo = hi = (uint32_t)s[0] & (0x7Fu >> len);
+    for (j = 1; j < len; j++) {
+        uint32_t c_lo = j < k ? (uint32_t)(s[j] & 0x3F) : 0x00, c_hi = j < k ? c_lo : 0x3F;
+        lo = (lo << 6) | c_lo;
+        hi = (hi << 6) | c_hi;
+    }
+    a = lo > min_cp[len] ? lo : min_cp[len];
+    b = hi < max_cp[len] ? hi : max_cp[len];
+    if (a > b) return 0;
+    if (a >= 0xD800 && b <= 0xDFFF) return 0;   /* only surrogates left */
+    return 1;
+}
+
+static uint32_t check_utf8_first_bad(const char *str, uint32_t n, uint32_t *bad)
+{
+    const unsigned char *s = (const unsigned char *)str;
+    uint32_t i = 0;
+    *bad = 0;
+    while (i < n) {
+        uint32_t len, k;
+        if (s[i] < 0x80) { i++; continue; }
+        if ((s[i] & 0xE0) == 0xC0) len = 2;
+        else if ((s[i] & 0xF0) == 0xE0) len = 3;
+        else if ((s[i] & 0xF8) == 0xF0) len = 4;
+        else { *bad = 1; return i; }
+        if (!check_utf8_prefix_ok(s + i, 1, len)) { *bad = 1; return i; }
+        for (k = 1; k < len; k++) {
+            if (i + k >= n || (s[i + k] & 0xC0) != 0x80 || !check_utf8_prefix_ok(s + i, k + 1, len)) {
+                *bad = k;
+                return i;
+            }
+        }
+        i += len;
+    }
+    return n;
+}
+
 static int check_ast(const USFM_Ast *ast)
 {
     uint32_t count, input_length, chapter_count, verse_count, diag_count, i;
@@ -59,10 +108,17 @@ static int check_ast(const USFM_Ast *ast)
         if (k == USFM_AST_TEXT && n->span.length == 0)
             CHECK_AST_FAIL("TEXT node %u has length 0", i);
         if (k == USFM_AST_TEXT && (uint64_t)n->span.offset + n->span.length <= input_length &&
-            USFM_FLAGS(n->level_flags) != check_text_flags(input, n->span))
+            (USFM_FLAGS(n->level_flags) & USFM_TEXT_FLAGS_COOK) != check_text_flags(input, n->span))
             CHECK_AST_FAIL("TEXT node %u flags 0x%02x, its text needs 0x%02x", i,
                            (unsigned)USFM_FLAGS(n->level_flags),
                            (unsigned)check_text_flags(input, n->span));
+        if ((k == USFM_AST_TEXT || k == USFM_AST_ARGUMENT || k == USFM_AST_ATTRIBUTES) &&
+            (n->level_flags & USFM_TF_INVALID_UTF8) &&
+            (uint64_t)n->span.offset + n->span.length <= input_length) {
+            uint32_t bad;
+            if (check_utf8_first_bad(input + n->span.offset, n->span.length, &bad) == n->span.length)
+                CHECK_AST_FAIL("node %u is flagged invalid UTF-8 but its bytes are valid", i);
+        }
         if (n->end < count &&
             nodes[n->end].span.offset < (uint64_t)n->span.offset + n->span.length)
             CHECK_AST_FAIL("node %u (span %u+%u) overlaps next node %u at offset %u", i,
@@ -117,6 +173,53 @@ static int check_ast(const USFM_Ast *ast)
             CHECK_AST_FAIL("diagnostic %u code %u", i, diags[i].code);
     }
     return 0;
+}
+
+/* With validation on (the default), the INVALID_UTF8 flag must be set on
+ * exactly the TEXT, ARGUMENT and ATTRIBUTES nodes whose bytes are not
+ * valid UTF-8. Returns the number of nodes that disagree. */
+static uint32_t check_utf8_flags(const USFM_Ast *ast)
+{
+    uint32_t count, input_length, i, wrong = 0;
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    const char *input = USFM_Ast_GetInput(ast, &input_length);
+    for (i = 0; i < count; i++) {
+        const USFM_Node *n = &nodes[i];
+        uint32_t bad;
+        int invalid;
+        if (n->kind != USFM_AST_TEXT && n->kind != USFM_AST_ARGUMENT &&
+            n->kind != USFM_AST_ATTRIBUTES) continue;
+        invalid = check_utf8_first_bad(input + n->span.offset, n->span.length, &bad) !=
+                  n->span.length;
+        if (invalid != ((n->level_flags & USFM_TF_INVALID_UTF8) != 0)) wrong++;
+    }
+    return wrong;
+}
+
+/* Every byte >= 0x80 of the input must lie inside a TEXT, ARGUMENT or
+ * ATTRIBUTES node: those are the only runs that are validated. Returns
+ * the number of such bytes outside every one of them. */
+static uint32_t check_utf8_coverage(const USFM_Ast *ast)
+{
+    uint32_t count, input_length, i, missing = 0;
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    const unsigned char *input = (const unsigned char *)USFM_Ast_GetInput(ast, &input_length);
+    unsigned char *covered = (unsigned char *)calloc(input_length + 1u, 1);
+    if (covered == NULL) return 1;
+    for (i = 0; i < count; i++) {
+        const USFM_Node *n = &nodes[i];
+        if (n->kind == USFM_AST_TEXT || n->kind == USFM_AST_ARGUMENT ||
+            n->kind == USFM_AST_ATTRIBUTES) {
+            memset(covered + n->span.offset, 1, n->span.length);
+        }
+    }
+    /* The scanner skips a leading UTF-8 byte-order mark: no node covers it. */
+    i = (input_length >= 3 && input[0] == 0xEF && input[1] == 0xBB && input[2] == 0xBF) ? 3u : 0u;
+    for (; i < input_length; i++) {
+        if (input[i] >= 0x80 && !covered[i]) missing++;
+    }
+    free(covered);
+    return missing;
 }
 
 #endif
