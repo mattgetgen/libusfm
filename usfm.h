@@ -2250,7 +2250,113 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
 
 /* Whole-input validation is SIMD-only: on scalar builds a separate DFA
  * pass is slower than checking runs while parsing (see the spec). */
-#if !defined(USFM_SIMD_NONE) && defined(__SSSE3__) && !defined(__AVX2__) && !defined(__AVX512BW__)
+#if !defined(USFM_SIMD_NONE) && defined(__AVX2__) && !defined(__AVX512BW__)
+#  include <immintrin.h>
+#  define USFM__UTF8_SIMD 1
+/* Keiser-Lemire UTF-8 validation, 32 bytes per step (AVX2). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    const __m128i b1h_ = _mm_setr_epi8(
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_2),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_3 | USFM__U8_SURROGATE),
+        USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4));
+    const __m128i b1l_ = _mm_setr_epi8(
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_OVERLONG_3 | USFM__U8_OVERLONG_2 | USFM__U8_OVERLONG_4),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_OVERLONG_2),
+        USFM__U8_C(USFM__U8_CARRY),
+        USFM__U8_C(USFM__U8_CARRY),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_SURROGATE),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000));
+    const __m128i b2h_ = _mm_setr_epi8(
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT));
+    const __m256i b1h = _mm256_broadcastsi128_si256(b1h_);
+    const __m256i b1l = _mm256_broadcastsi128_si256(b1l_);
+    const __m256i b2h = _mm256_broadcastsi128_si256(b2h_);
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    const __m256i incomplete_max = _mm256_setr_epi8(
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1));
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    __m256i prev = _mm256_setzero_si256(), err = _mm256_setzero_si256(), pending = _mm256_setzero_si256();
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 32, then the tail ends it */
+        __m256i in;
+        if (n - i >= 32u) {
+            in = _mm256_loadu_si256((const __m256i *)(const void *)(s + i));
+            i += 32u;
+        } else if (i < n) {
+            char tail[32];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = _mm256_loadu_si256((const __m256i *)(const void *)tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (_mm256_movemask_epi8(in) == 0) {
+            err = _mm256_or_si256(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            __m256i t = _mm256_permute2x128_si256(prev, in, 0x21);   /* prev.hi : in.lo */
+            __m256i p1 = _mm256_alignr_epi8(in, t, 15);
+            __m256i p2 = _mm256_alignr_epi8(in, t, 14);
+            __m256i p3 = _mm256_alignr_epi8(in, t, 13);
+            __m256i sc = _mm256_and_si256(
+                _mm256_and_si256(_mm256_shuffle_epi8(b1h, _mm256_and_si256(_mm256_srli_epi16(p1, 4), nib)),
+                                 _mm256_shuffle_epi8(b1l, _mm256_and_si256(p1, nib))),
+                _mm256_shuffle_epi8(b2h, _mm256_and_si256(_mm256_srli_epi16(in, 4), nib)));
+            __m256i m23 = _mm256_or_si256(_mm256_subs_epu8(p2, _mm256_set1_epi8((char)(0xE0 - 0x80))),
+                                          _mm256_subs_epu8(p3, _mm256_set1_epi8((char)(0xF0 - 0x80))));
+            err = _mm256_or_si256(err, _mm256_xor_si256(_mm256_and_si256(m23, _mm256_set1_epi8((char)0x80)), sc));
+            pending = _mm256_subs_epu8(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = _mm256_or_si256(err, pending);   /* the input ended inside a sequence */
+    return _mm256_testz_si256(err, err);
+}
+#elif !defined(USFM_SIMD_NONE) && defined(__SSSE3__) && !defined(__AVX512BW__)
 #  include <tmmintrin.h>
 #  define USFM__UTF8_SIMD 1
 /* Keiser-Lemire UTF-8 validation, 16 bytes per step (SSSE3). Returns 1
@@ -2316,7 +2422,6 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
     const __m128i nib = _mm_set1_epi8(0x0F);
     __m128i prev = _mm_setzero_si128(), err = _mm_setzero_si128(), pending = _mm_setzero_si128();
     uint32_t i = 0;
-    int last = 0;
     for (;;) {                          /* bounded: i grows by 16, then the tail ends it */
         __m128i in;
         if (n - i >= 16u) {
@@ -2328,7 +2433,6 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
             memcpy(tail, s + i, n - i);
             in = _mm_loadu_si128((const __m128i *)(const void *)tail);
             i = n;
-            last = 1;
         } else {
             break;
         }
@@ -2348,7 +2452,6 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
             pending = _mm_subs_epu8(in, incomplete_max);
         }
         prev = in;
-        if (last) break;
     }
     err = _mm_or_si128(err, pending);   /* the input ended inside a sequence */
     return _mm_movemask_epi8(_mm_cmpeq_epi8(err, _mm_setzero_si128())) == 0xFFFF;
