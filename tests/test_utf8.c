@@ -375,6 +375,33 @@ static void test_utf8_unclaimed_argument(void)
     USFM_Ast_Free(ast);
 }
 
+/* Counts every allocator call, then forwards to the checking allocator. */
+typedef struct CountAlc {
+    TestAlc  inner;
+    uint32_t calls;
+} CountAlc;
+
+static void *count_alloc(void *ctx, size_t size)
+{
+    CountAlc *c = (CountAlc *)ctx;
+    c->calls++;
+    return test_alloc(&c->inner, size);
+}
+
+static void *count_resize(void *ctx, void *ptr, size_t old_size, size_t new_size)
+{
+    CountAlc *c = (CountAlc *)ctx;
+    c->calls++;
+    return test_resize(&c->inner, ptr, old_size, new_size);
+}
+
+static void count_dealloc(void *ctx, void *ptr, size_t size)
+{
+    CountAlc *c = (CountAlc *)ctx;
+    c->calls++;
+    test_dealloc(&c->inner, ptr, size);
+}
+
 static void test_utf8_byte_order_marks(void)
 {
     static const struct { const char *bytes; uint32_t length; } wide[] = {
@@ -397,6 +424,40 @@ static void test_utf8_byte_order_marks(void)
             USFM_Ast_Free(ast);
         }
     }
+    /* Exact two-byte marks are rejected; near-misses parse. */
+    {
+        static const struct { const char *bytes; uint32_t length; int rejected; } edge[] = {
+            { "\xFF\xFE", 2, 1 }, { "\xFE\xFF", 2, 1 },
+            { "\xFF", 1, 0 }, { "\xFE", 1, 0 },
+            { "\x00\x00\xFE", 3, 0 }, { "\x00\x00\xFF\xFE", 4, 0 }
+        };
+        for (i = 0; i < 6; i++) {
+            ast = utf8_parse(edge[i].bytes, edge[i].length, 0, &err);
+            if (edge[i].rejected) {
+                CHECK(ast == NULL);
+                CHECK_EQ(err.code, USFM_ERR_UNSUPPORTED_ENCODING);
+            } else {
+                CHECK(ast != NULL);
+                CHECK_EQ(err.code, USFM_OK);
+            }
+            USFM_Ast_Free(ast);
+        }
+    }
+    /* A rejected input makes no allocator call at all. */
+    {
+        CountAlc c;
+        USFM_Alc alc;
+        memset(&c, 0, sizeof c);
+        c.inner.calls_left = UINT32_MAX;
+        alc.alloc = count_alloc;
+        alc.resize = count_resize;
+        alc.dealloc = count_dealloc;
+        alc.ctx = &c;
+        ast = USFM_Ast_ParseOpts(wide[0].bytes, wide[0].length, NULL, 0, &alc, &err);
+        CHECK(ast == NULL);
+        CHECK_EQ(err.code, USFM_ERR_UNSUPPORTED_ENCODING);
+        CHECK_EQ(c.calls, 0);
+    }
     CHECK_STR(usfm__status_message(USFM_ERR_UNSUPPORTED_ENCODING), "input is UTF-16 or UTF-32, not UTF-8");
     /* A UTF-8 byte-order mark is skipped: no diagnostic, first node after it. */
     ast = utf8_parse("\xEF\xBB\xBF\\p a\n", 8, 0, &err);
@@ -407,6 +468,33 @@ static void test_utf8_byte_order_marks(void)
     nodes = USFM_Ast_GetNodes(ast, &n);
     CHECK(n >= 2 && nodes[1].span.offset == 3);
     USFM_Ast_Free(ast);
+}
+
+static void test_utf8_diagnostic_context(void)
+{
+    static const struct { const char *s; uint32_t length; uint32_t offset; uint32_t bad; uint16_t marker; } cases[] = {
+        { "\\p a\xF0\x9F\x98 ", 8, 4, 3, USFM_M_P },
+        { "\\p a\xE2\x82", 6, 4, 2, USFM_M_P },
+        { "\\p \\w a\xE9\\w*", 11, 7, 1, USFM_M_W }
+    };
+    uint32_t i;
+    for (i = 0; i < 3; i++) {
+        USFM_Err err;
+        uint32_t count;
+        USFM_Ast *ast = utf8_parse(cases[i].s, cases[i].length, 0, &err);
+        const USFM_Diagnostic *d;
+        CHECK(ast != NULL);
+        if (ast == NULL) continue;
+        d = USFM_Ast_GetDiagnostics(ast, &count);
+        CHECK_EQ(count, 1);
+        if (count == 1) {
+            CHECK_EQ(d[0].code, USFM_DIAGNOSTIC_INVALID_UTF8);
+            CHECK_EQ(d[0].span.offset, cases[i].offset);
+            CHECK_EQ(d[0].span.length, cases[i].bad);
+            CHECK_EQ(d[0].marker, cases[i].marker);
+        }
+        USFM_Ast_Free(ast);
+    }
 }
 
 static void run_utf8_tests(void)
@@ -421,4 +509,5 @@ static void run_utf8_tests(void)
     test_utf8_parser_paths();
     test_utf8_unclaimed_argument();
     test_utf8_byte_order_marks();
+    test_utf8_diagnostic_context();
 }

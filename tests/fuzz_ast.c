@@ -134,7 +134,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         dy = USFM_Ast_GetDiagnostics(plain, &db);
         for (i = 0, j = 0; i < da; i++) {
             if (dx[i].code == USFM_DIAGNOSTIC_INVALID_UTF8) continue;
-            if (j >= db || dx[i].code != dy[j].code || dx[i].span.offset != dy[j].span.offset) abort();
+            if (j >= db || dx[i].code != dy[j].code || dx[i].span.offset != dy[j].span.offset ||
+                dx[i].span.length != dy[j].span.length || dx[i].marker != dy[j].marker) abort();
             j++;
         }
         if (j != db) abort();

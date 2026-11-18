@@ -571,7 +571,7 @@ static const char *const kind_names[] = {
     "TEXT", "OPTBREAK", "ARGUMENT", "ATTRIBUTES"
 };
 
-static void tree_quoted(const char *s, uint32_t n)
+static void tree_quoted(const char *s, uint32_t n, int escape_high)
 {
     uint32_t i;
     out_color(SGR_STRING);
@@ -582,7 +582,7 @@ static void tree_quoted(const char *s, uint32_t n)
         else if (c == '\n') out_str("\\n");
         else if (c == '\r') out_str("\\r");
         else if (c == '\t') out_str("\\t");
-        else if (c < 0x20) {
+        else if (c < 0x20 || (escape_high && c >= 0x80)) {
             char hex[8];
             snprintf(hex, sizeof hex, "\\x%02X", c);
             out_str(hex);
@@ -638,7 +638,8 @@ static int tree_open(const Doc *doc, uint32_t i, uint32_t depth, int context)
     }
     if (n->kind == USFM_AST_TEXT || n->kind == USFM_AST_ARGUMENT || n->kind == USFM_AST_ATTRIBUTES) {
         out_char(' ');
-        tree_quoted(doc->input + n->span.offset, n->span.length);
+        tree_quoted(doc->input + n->span.offset, n->span.length,
+                    (n->level_flags & USFM_TF_INVALID_UTF8) != 0);
     }
     snprintf(number, sizeof number, " @%u+%u", (unsigned)n->span.offset, (unsigned)n->span.length);
     out_color(SGR_DIM);

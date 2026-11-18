@@ -88,6 +88,21 @@ else fail "diagnostics"; cat "$TMP/diag.err" >&2; fi
 if [[ "$("$BIN" -M "$TMP/diag.usfm")" == $'\\id GEN\n\\c 1\n\\v 1 a \\w b' ]]; then pass
 else fail "implied paragraph"; fi
 
+# Legacy 8-bit input: an invalid UTF-8 diagnostic, still exit 0.
+printf '\\id GEN\n\\c 1\n\\p\n\\v 1 caf\xe9\n' > "$TMP/cp1252.usfm"
+if "$BIN" -M -d "$TMP/cp1252.usfm" > /dev/null 2> "$TMP/cp.err" &&
+   grep -q ":4:9: error: invalid UTF-8" "$TMP/cp.err"; then pass
+else fail "invalid UTF-8 diagnostic"; cat "$TMP/cp.err" >&2; fi
+# -t does not print raw invalid bytes.
+"$BIN" -M -t "$TMP/cp1252.usfm" > "$TMP/cp.tree" 2> /dev/null
+if grep -q 'caf\\xE9' "$TMP/cp.tree" && ! grep -qa $'\xe9' "$TMP/cp.tree"; then pass
+else fail "tree escapes invalid bytes"; fi
+# UTF-16 input is refused with exit 2.
+printf '\xff\xfe\\\0i\0d\0' > "$TMP/utf16.usfm"
+"$BIN" -M "$TMP/utf16.usfm" > /dev/null 2> "$TMP/u16.err"; rc=$?
+if [[ $rc == 2 ]] && grep -q "input is UTF-16 or UTF-32, not UTF-8" "$TMP/u16.err"; then pass
+else fail "UTF-16 input (exit $rc)"; cat "$TMP/u16.err" >&2; fi
+
 # Benchmark.
 if "$BIN" -b 2 "$S" | grep -q 'MiB/s'; then pass; else fail "bench"; fi
 
