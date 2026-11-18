@@ -2230,6 +2230,110 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
     return n;
 }
 
+/* ---- SIMD UTF-8 validation ---- */
+
+/* Keiser-Lemire error classes ("Validating UTF-8 in less than one
+ * instruction per byte", 2021). TOO_LARGE_1000 and OVERLONG_4 share a
+ * bit by design. */
+#define USFM__U8_TOO_SHORT      (1 << 0)
+#define USFM__U8_TOO_LONG       (1 << 1)
+#define USFM__U8_OVERLONG_3     (1 << 2)
+#define USFM__U8_TOO_LARGE      (1 << 3)
+#define USFM__U8_SURROGATE      (1 << 4)
+#define USFM__U8_OVERLONG_2     (1 << 5)
+#define USFM__U8_TOO_LARGE_1000 (1 << 6)
+#define USFM__U8_OVERLONG_4     (1 << 6)
+#define USFM__U8_TWO_CONTS      ((signed char)0x80) /* -128: same bits, no char overflow */
+#define USFM__U8_CARRY (USFM__U8_TOO_SHORT | USFM__U8_TOO_LONG | USFM__U8_TWO_CONTS)
+
+/* Whole-input validation is SIMD-only: on scalar builds a separate DFA
+ * pass is slower than checking runs while parsing (see the spec). */
+#if !defined(USFM_SIMD_NONE) && defined(__SSSE3__) && !defined(__AVX2__) && !defined(__AVX512BW__)
+#  include <tmmintrin.h>
+#  define USFM__UTF8_SIMD 1
+/* Keiser-Lemire UTF-8 validation, 16 bytes per step (SSSE3). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    const __m128i b1h = _mm_setr_epi8(
+        USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG,
+        USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG,
+        USFM__U8_TWO_CONTS, USFM__U8_TWO_CONTS, USFM__U8_TWO_CONTS, USFM__U8_TWO_CONTS,
+        USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_2,
+        USFM__U8_TOO_SHORT,
+        USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_3 | USFM__U8_SURROGATE,
+        USFM__U8_TOO_SHORT | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4);
+    const __m128i b1l = _mm_setr_epi8(
+        USFM__U8_CARRY | USFM__U8_OVERLONG_3 | USFM__U8_OVERLONG_2 | USFM__U8_OVERLONG_4,
+        USFM__U8_CARRY | USFM__U8_OVERLONG_2,
+        USFM__U8_CARRY, USFM__U8_CARRY,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_SURROGATE,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
+        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000);
+    const __m128i b2h = _mm_setr_epi8(
+        USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT,
+        USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT,
+        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 |
+            USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4,
+        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 |
+            USFM__U8_TOO_LARGE,
+        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE |
+            USFM__U8_TOO_LARGE,
+        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE |
+            USFM__U8_TOO_LARGE,
+        USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT);
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    const __m128i incomplete_max = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                                 (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1));
+    const __m128i nib = _mm_set1_epi8(0x0F);
+    __m128i prev = _mm_setzero_si128(), err = _mm_setzero_si128(), pending = _mm_setzero_si128();
+    uint32_t i = 0;
+    while (i < n) {                     /* bounded: i grows by 16 */
+        __m128i in;
+        if (n - i >= 16u) {
+            in = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
+        } else {
+            char tail[16];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = _mm_loadu_si128((const __m128i *)(const void *)tail);
+        }
+        if (_mm_movemask_epi8(in) == 0) {
+            err = _mm_or_si128(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            __m128i p1 = _mm_alignr_epi8(in, prev, 15);
+            __m128i p2 = _mm_alignr_epi8(in, prev, 14);
+            __m128i p3 = _mm_alignr_epi8(in, prev, 13);
+            __m128i sc = _mm_and_si128(
+                _mm_and_si128(_mm_shuffle_epi8(b1h, _mm_and_si128(_mm_srli_epi16(p1, 4), nib)),
+                              _mm_shuffle_epi8(b1l, _mm_and_si128(p1, nib))),
+                _mm_shuffle_epi8(b2h, _mm_and_si128(_mm_srli_epi16(in, 4), nib)));
+            __m128i m23 = _mm_or_si128(_mm_subs_epu8(p2, _mm_set1_epi8((char)(0xE0 - 0x80))),
+                                       _mm_subs_epu8(p3, _mm_set1_epi8((char)(0xF0 - 0x80))));
+            err = _mm_or_si128(err, _mm_xor_si128(_mm_and_si128(m23, _mm_set1_epi8((char)0x80)), sc));
+            pending = _mm_subs_epu8(in, incomplete_max);
+        }
+        prev = in;
+        i += 16u;
+    }
+    err = _mm_or_si128(err, pending);   /* the input ended inside a sequence */
+    return _mm_movemask_epi8(_mm_cmpeq_epi8(err, _mm_setzero_si128())) == 0xFFFF;
+}
+#else
+#  define USFM__UTF8_SIMD 0
+#endif
+
 static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marker marker);
 
 /* Keeps a rarely-needed slow path out of the hot token loop. */
@@ -3339,6 +3443,13 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     p.ast = ast;
     p.version_auto = version == USFM_VERSION_AUTO;
     p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
+#if USFM__UTF8_SIMD
+    /* Valid as a whole means every run is valid: bytes outside runs are
+     * ASCII (or the UTF-8 BOM) and no sequence contains an ASCII byte. So
+     * one SIMD pass replaces the per-run checks; on invalid input every
+     * run is still checked, and diagnostics match the scalar build. */
+    if (p.check_utf8 && usfm__utf8_valid_simd(text, input_length)) p.check_utf8 = 0;
+#endif
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
     p.text_node = USFM_NIL;
     usfm__scan_init(&p.scan, text, input_length);

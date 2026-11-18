@@ -100,7 +100,7 @@ case "$MODE" in
         g++ -std=c++11 -Wall -Wextra -fsyntax-only tests/cpp_check.cpp
         rm -f build/checksums.txt
         # Every native SIMD path: unit tests and every corpus.
-        PATHS=("scalar:-DUSFM_SIMD_NONE" "sse2:")
+        PATHS=("scalar:-DUSFM_SIMD_NONE" "sse2:" "ssse3:-mssse3")
         if grep -q ' avx2' /proc/cpuinfo; then PATHS+=("avx2:-mavx2"); else echo "avx2: skipped (CPU lacks AVX2)"; fi
         for entry in "${PATHS[@]}"; do
             name="${entry%%:*}"

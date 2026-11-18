@@ -256,6 +256,12 @@ int main(int argc, char **argv)
 #if USFM__USE_BLOCKS
         block_diffs += classifier_mismatches(data, length);
 #endif
+#if USFM__UTF8_SIMD
+        if (usfm__utf8_valid_simd(data, length) != usfm__utf8_valid(data, length)) {
+            fprintf(stderr, "%s: SIMD and scalar UTF-8 validators disagree\n", names[i]);
+            failures++;
+        }
+#endif
         scan_diffs += (unsigned long long)(scan_compare(data, length, 0u, scan_diffs == 0) +
                                            scan_compare(data, length, 1u, scan_diffs == 0) +
                                            scan_compare(data, length, 7u + (uint32_t)i, scan_diffs == 0));

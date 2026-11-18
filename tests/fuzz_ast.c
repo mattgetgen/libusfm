@@ -97,6 +97,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 #if USFM__USE_BLOCKS
         if (classifier_mismatches(text, text_length) != 0) abort();
 #endif
+#if USFM__UTF8_SIMD
+        if (usfm__utf8_valid_simd(text, text_length) != usfm__utf8_valid(text, text_length)) abort();
+#endif
     }
     memset(&config, 0, sizeof config);
     config.version = (uint8_t)(data[0] % 5);
