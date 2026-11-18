@@ -375,6 +375,40 @@ static void test_utf8_unclaimed_argument(void)
     USFM_Ast_Free(ast);
 }
 
+static void test_utf8_byte_order_marks(void)
+{
+    static const struct { const char *bytes; uint32_t length; } wide[] = {
+        { "\xFF\xFE\\\0i\0d\0", 8 },            /* UTF-16 LE */
+        { "\xFE\xFF\0\\\0i\0d", 8 },            /* UTF-16 BE */
+        { "\xFF\xFE\0\0\\\0\0\0", 8 },          /* UTF-32 LE */
+        { "\0\0\xFE\xFF\0\0\0\\", 8 }           /* UTF-32 BE */
+    };
+    USFM_Err err;
+    USFM_Ast *ast;
+    uint32_t i, count, n;
+    const USFM_Node *nodes;
+    for (i = 0; i < 4; i++) {
+        uint32_t flags;
+        for (flags = 0; flags <= USFM_PARSE_NO_UTF8_CHECK; flags += USFM_PARSE_NO_UTF8_CHECK) {
+            ast = utf8_parse(wide[i].bytes, wide[i].length, flags, &err);
+            CHECK(ast == NULL);
+            CHECK_EQ(err.code, USFM_ERR_UNSUPPORTED_ENCODING);
+            CHECK_EQ(err.pos, 0);
+            USFM_Ast_Free(ast);
+        }
+    }
+    CHECK_STR(usfm__status_message(USFM_ERR_UNSUPPORTED_ENCODING), "input is UTF-16 or UTF-32, not UTF-8");
+    /* A UTF-8 byte-order mark is skipped: no diagnostic, first node after it. */
+    ast = utf8_parse("\xEF\xBB\xBF\\p a\n", 8, 0, &err);
+    CHECK(ast != NULL);
+    if (ast == NULL) return;
+    USFM_Ast_GetDiagnostics(ast, &count);
+    CHECK_EQ(count, 0);
+    nodes = USFM_Ast_GetNodes(ast, &n);
+    CHECK(n >= 2 && nodes[1].span.offset == 3);
+    USFM_Ast_Free(ast);
+}
+
 static void run_utf8_tests(void)
 {
     test_utf8_validator_table();
@@ -386,4 +420,5 @@ static void run_utf8_tests(void)
     test_utf8_legacy_book();
     test_utf8_parser_paths();
     test_utf8_unclaimed_argument();
+    test_utf8_byte_order_marks();
 }

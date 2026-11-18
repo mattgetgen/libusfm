@@ -1407,6 +1407,16 @@ typedef struct USFM_Scanner {
     uint16_t    reserved;
 } USFM_Scanner;
 
+/* Does the input start with a UTF-16 (FF FE, FE FF) or UTF-32
+ * (FF FE 00 00, 00 00 FE FF) byte-order mark? */
+static int usfm__wide_bom(const char *input, uint32_t length)
+{
+    const uint8_t *u = (const uint8_t *)input;
+    if (length < 2) return 0;
+    if ((u[0] == 0xFFu && u[1] == 0xFEu) || (u[0] == 0xFEu && u[1] == 0xFFu)) return 1;
+    return length >= 4 && u[0] == 0 && u[1] == 0 && u[2] == 0xFEu && u[3] == 0xFFu;
+}
+
 static void usfm__scan_init(USFM_Scanner *s, const char *input, uint32_t length)
 {
     memset(s, 0, sizeof *s);
@@ -2854,6 +2864,10 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     }
     if (input_length > USFM_INPUT_MAX) {
         usfm__set_err(err, USFM_ERR_INPUT_TOO_LARGE, 0);
+        return NULL;
+    }
+    if (usfm__wide_bom(input, input_length)) {
+        usfm__set_err(err, USFM_ERR_UNSUPPORTED_ENCODING, 0);
         return NULL;
     }
     ast = (USFM_Ast *)usfm__alloc(alc, sizeof(USFM_Ast));
