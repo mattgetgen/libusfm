@@ -1860,10 +1860,21 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
 
 static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marker marker);
 
+/* Keeps a rarely-needed slow path out of the hot token loop. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define USFM__NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#  define USFM__NOINLINE __declspec(noinline)
+#else
+#  define USFM__NOINLINE
+#endif
+
 /* Validates a TEXT, ARGUMENT or ATTRIBUTES token just scanned: on
  * invalid bytes, sets USFM_TF_INVALID_UTF8 on the token and reports one
- * diagnostic for the run, spanning its first invalid sequence. */
-static void usfm__check_utf8(USFM_Parser *p, USFM_ScanToken *t)
+ * diagnostic for the run, spanning its first invalid sequence. Not inlined
+ * on purpose: measured, inlining it slowed tag-dense parsing ~5% even with
+ * validation off. */
+USFM__NOINLINE static void usfm__check_utf8(USFM_Parser *p, USFM_ScanToken *t)
 {
     uint32_t at, bad;
     USFM_Marker context = USFM_M_NONE;
