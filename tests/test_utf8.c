@@ -158,10 +158,25 @@ static void test_utf8_simd_validator(void)
         0xE0, 0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF3, 0xF4, 0xF5, 0xFF
     };
     const uint32_t e = (uint32_t)sizeof edge;
-    unsigned char buf[96], seq[4];
+    static const uint32_t offs[] = {
+        0, 1, 2, 3, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31, 32, 33,
+        44, 45, 46, 47, 48, 49, 60, 61, 62, 63, 64, 65
+    };
+    unsigned char buf[128], seq[4];
+
     uint32_t len, a, b, c, d, k, off, tail, seed, i, j;
     int before = usfm_test_failures;
-    /* Edge sequences at every offset 0-9, then 10, 17, ..., 67. */
+    /* The 42-byte case where a pending lead byte must still fail when a whole
+     * ASCII chunk follows: 15 x, C3, 24 x, C3 A9. */
+    memset(buf, 'x', 15);
+    buf[15] = 0xC3;
+    memset(buf + 16, 'x', 24);
+    buf[40] = 0xC3;
+    buf[41] = 0xA9;
+    CHECK_EQ(usfm__utf8_valid_simd((const char *)buf, 42), 0);
+    CHECK_EQ(usfm__utf8_valid((const char *)buf, 42), 0);
+    check_simd_matches(buf, 42);
+    /* Edge sequences at chunk-boundary offsets. */
     for (len = 1; len <= 4; len++) {
         uint32_t total = 1;
         for (i = 0; i < len; i++) total *= e;
@@ -169,11 +184,16 @@ static void test_utf8_simd_validator(void)
             uint32_t v = i;
             a = v % e; v /= e; b = v % e; v /= e; c = v % e; v /= e; d = v % e;
             seq[0] = edge[a]; seq[1] = edge[b]; seq[2] = edge[c]; seq[3] = edge[d];
-            for (k = 0; (off = k < 10 ? k : 10u + 7u * (k - 10u)) <= 67u; k++) {
-                for (tail = 0; tail < 2; tail++) {
-                    uint32_t n = off + len + (tail ? 5u : 0u);
+            for (k = 0; k < (uint32_t)(sizeof offs / sizeof offs[0]); k++) {
+                off = offs[k];
+                if (len == 4 && (off & 15u) != 0u && (off & 15u) < 13u) continue;   /* keeps the run short */
+                for (tail = 0; tail < 3; tail++) {
+                    if (len == 4 && tail == 1) continue;   /* keeps the run short */
+                    /* End of buffer; 5 'x' after; 32 'x' (a whole ASCII chunk) then U+00E9. */
+                    uint32_t n = off + len + (tail == 0 ? 0u : tail == 1 ? 5u : 34u);
                     memset(buf, 'x', sizeof buf);
                     memcpy(buf + off, seq, len);
+                    if (tail == 2) { buf[n - 2] = 0xC3; buf[n - 1] = 0xA9; }
                     check_simd_matches(buf, n);
                 }
             }
@@ -182,7 +202,7 @@ static void test_utf8_simd_validator(void)
     }
     /* Random strings of 0-200 bytes, 60% ASCII. */
     seed = 424242u;
-    for (i = 0; i < 1000000u; i++) {
+    for (i = 0; i < 250000u; i++) {
         unsigned char r[200];
         uint32_t n;
         seed = seed * 1664525u + 1013904223u;

@@ -127,6 +127,8 @@ case "$MODE" in
         fi
         gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" -DUSFM_FUZZ_REPLAY tests/fuzz_ast.c -o build/fuzz_replay
         ./build/fuzz_replay tests/fuzz/seeds/*
+        gcc "${COMMON_FLAGS[@]}" "${DEBUG_FLAGS[@]}" -mssse3 -DUSFM_FUZZ_REPLAY tests/fuzz_ast.c -o build/fuzz_replay_ssse3
+        ./build/fuzz_replay_ssse3 tests/fuzz/seeds/*
         # Paths this machine can't run: make sure they at least compile.
         gcc "${COMMON_FLAGS[@]}" -O1 -mavx512bw -c tests/run_tests.c -o /dev/null && echo "avx512bw: compiles"
         if command -v aarch64-linux-gnu-gcc > /dev/null; then

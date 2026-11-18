@@ -2243,7 +2243,9 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
 #define USFM__U8_OVERLONG_2     (1 << 5)
 #define USFM__U8_TOO_LARGE_1000 (1 << 6)
 #define USFM__U8_OVERLONG_4     (1 << 6)
-#define USFM__U8_TWO_CONTS      ((signed char)0x80) /* -128: same bits, no char overflow */
+#define USFM__U8_TWO_CONTS      (1 << 7)
+/* Table entries are bytes; this keeps -Woverflow quiet for bit 7. */
+#define USFM__U8_C(x) ((char)(x))
 #define USFM__U8_CARRY (USFM__U8_TOO_SHORT | USFM__U8_TOO_LONG | USFM__U8_TWO_CONTS)
 
 /* Whole-input validation is SIMD-only: on scalar builds a separate DFA
@@ -2258,56 +2260,77 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
 static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 {
     const __m128i b1h = _mm_setr_epi8(
-        USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG,
-        USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG, USFM__U8_TOO_LONG,
-        USFM__U8_TWO_CONTS, USFM__U8_TWO_CONTS, USFM__U8_TWO_CONTS, USFM__U8_TWO_CONTS,
-        USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_2,
-        USFM__U8_TOO_SHORT,
-        USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_3 | USFM__U8_SURROGATE,
-        USFM__U8_TOO_SHORT | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4);
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TOO_LONG),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TWO_CONTS),
+        USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_2),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_3 | USFM__U8_SURROGATE),
+        USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4));
     const __m128i b1l = _mm_setr_epi8(
-        USFM__U8_CARRY | USFM__U8_OVERLONG_3 | USFM__U8_OVERLONG_2 | USFM__U8_OVERLONG_4,
-        USFM__U8_CARRY | USFM__U8_OVERLONG_2,
-        USFM__U8_CARRY, USFM__U8_CARRY,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_SURROGATE,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000,
-        USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000);
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_OVERLONG_3 | USFM__U8_OVERLONG_2 | USFM__U8_OVERLONG_4),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_OVERLONG_2),
+        USFM__U8_C(USFM__U8_CARRY),
+        USFM__U8_C(USFM__U8_CARRY),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_SURROGATE),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000),
+        USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000));
     const __m128i b2h = _mm_setr_epi8(
-        USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT,
-        USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT,
-        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 |
-            USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4,
-        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 |
-            USFM__U8_TOO_LARGE,
-        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE |
-            USFM__U8_TOO_LARGE,
-        USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE |
-            USFM__U8_TOO_LARGE,
-        USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT, USFM__U8_TOO_SHORT);
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE | USFM__U8_TOO_LARGE),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT),
+        USFM__U8_C(USFM__U8_TOO_SHORT));
     /* A lead byte in the last 3 positions still needs continuation bytes. */
     const __m128i incomplete_max = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                                  (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1));
     const __m128i nib = _mm_set1_epi8(0x0F);
     __m128i prev = _mm_setzero_si128(), err = _mm_setzero_si128(), pending = _mm_setzero_si128();
     uint32_t i = 0;
-    while (i < n) {                     /* bounded: i grows by 16 */
+    int last = 0;
+    for (;;) {                          /* bounded: i grows by 16, then the tail ends it */
         __m128i in;
         if (n - i >= 16u) {
             in = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
-        } else {
+            i += 16u;
+        } else if (i < n) {
             char tail[16];
             memset(tail, 0, sizeof tail);
             memcpy(tail, s + i, n - i);
             in = _mm_loadu_si128((const __m128i *)(const void *)tail);
+            i = n;
+            last = 1;
+        } else {
+            break;
         }
         if (_mm_movemask_epi8(in) == 0) {
             err = _mm_or_si128(err, pending);   /* a sequence ended at an ASCII byte */
@@ -2325,7 +2348,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
             pending = _mm_subs_epu8(in, incomplete_max);
         }
         prev = in;
-        i += 16u;
+        if (last) break;
     }
     err = _mm_or_si128(err, pending);   /* the input ended inside a sequence */
     return _mm_movemask_epi8(_mm_cmpeq_epi8(err, _mm_setzero_si128())) == 0xFFFF;
