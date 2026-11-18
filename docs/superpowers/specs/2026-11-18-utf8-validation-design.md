@@ -159,7 +159,8 @@ find something.
 
   | Path | Version |
   | --- | --- |
-  | SSE2 | the lookups need `pshufb` (SSSE3), so on plain SSE2 the mask is the scalar validator run over the block |
+  | SSSE3 (detected at compile time with `__SSSE3__`, e.g. `-mssse3`, `-march=x86-64-v2` or `-march=native`) | `pshufb`; the 16-byte classifier uses it for this mask only |
+  | SSE2 without SSSE3 (a plain x86-64 build) | no `pshufb`: the mask is the scalar validator run over the block |
   | AVX2, AVX-512BW | `vpshufb` |
   | NEON | `vqtbl1q_u8` |
   | wasm simd128 | `i8x16.swizzle` |
