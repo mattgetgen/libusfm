@@ -113,7 +113,12 @@ Everything else is invalid:
   blank text between blocks is dropped; it is ASCII by definition, so in
   practice this never happens.
 - **Diagnostics are emitted as runs are scanned,** interleaved with the
-  parser's other diagnostics the same way theirs are.
+  parser's other diagnostics the same way theirs are. Consequences:
+  diagnostics are in parse order, not sorted by offset; INVALID_UTF8 can
+  precede diagnostics for its owning marker (`\c 1\xE9`: INVALID_UTF8 at 4
+  before INVALID_NUMBER at 3); and its marker is the innermost open
+  container when the run is scanned, so text that opens an implied
+  paragraph reports the enclosing container (NONE at book level).
 - **A test checks the run property:** every byte of 0x80 or above in the
   input lies inside some TEXT, ARGUMENT or ATTRIBUTES token.
 

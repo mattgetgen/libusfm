@@ -79,10 +79,25 @@ extern "C" {
  *   - Every loop is bounded by the input length or a constant.
  *   - Trees use u32 indices, not pointers. Sizes are u32.
  *   - Zero-copy: all text is a (offset, length) span into the input.
- *   - Malformed USFM is never an error: it produces diagnostics.
+ *   - Malformed USFM is not an error: it produces diagnostics. (The one
+ *     exception is input in an unsupported encoding; see Encoding.)
+ *
+ * Encoding
+ *   Input is UTF-8; a leading EF BB BF is skipped. Invalid UTF-8 gives
+ *   USFM_DIAGNOSTIC_INVALID_UTF8 (one per text, argument or attribute
+ *   run, at its first bad sequence) plus USFM_TF_INVALID_UTF8 on the
+ *   node, and parsing continues, so legacy 8-bit encodings (for example
+ *   converted with TECkit) still parse. USFM_PARSE_NO_UTF8_CHECK turns
+ *   validation off. Input starting with a UTF-16 or UTF-32 byte-order
+ *   mark returns NULL with USFM_ERR_UNSUPPORTED_ENCODING, even with
+ *   validation off. UTF-16 or UTF-32 without a byte-order mark is not
+ *   detected.
  *
  * Failure semantics
- *   NULL                          -> failed, nothing to free (see err)
+ *   NULL                          -> failed, nothing to free; err.code
+ *                                    says why (bad argument, no memory,
+ *                                    input too large, unsupported
+ *                                    encoding, ...)
  *   non-NULL, err.code == OK      -> complete
  *   non-NULL, err.code == NOMEM   -> tree complete, some diagnostics
  *                                    were dropped
@@ -332,6 +347,13 @@ enum USFM_DiagnosticCode {
     USFM_DIAGNOSTIC_CODE_COUNT = 20
 };
 
+/* Diagnostics are kept in emission (parse) order, not sorted by offset;
+ * sort by span.offset if needed. INVALID_UTF8 is emitted when its run is
+ * scanned, so it can precede diagnostics for the owning marker (e.g.
+ * `\c 1\xE9`: INVALID_UTF8 at 4 comes before INVALID_NUMBER at 3). Its
+ * marker is the innermost open container at that moment: text that opens
+ * an implied paragraph reports the enclosing container (NONE at book
+ * level). */
 typedef struct USFM_Diagnostic {
     USFM_Span   span;                   /* bytes at fault; length 0 for
                                            "missing" at offset */
@@ -382,6 +404,9 @@ enum USFM_TokenKind {
 };
 
 /* level_flags: low 4 bits = number (\q2 -> 2), high 4 bits = flags.
+ * The flag groups below share bits, so test a flag only after checking
+ * node->kind (0x80 is USFM_TF_SELF_CLOSED on a MILESTONE but
+ * USFM_TF_INVALID_UTF8 on TEXT, ARGUMENT and ATTRIBUTES).
  * Marker flags: */
 enum {
     USFM_TF_NESTED = 0x10,              /* \+w */
@@ -1788,7 +1813,7 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
     const uint8_t *u = (const uint8_t *)s;
     uint32_t i = 0;
     *bad = 0;
-    while (i < n) {
+    while (i < n) { /* bounded: each pass advances i */
         uint8_t b, lo = 0x80u, hi = 0xBFu;
         uint32_t need, k;
         if (n - i >= 8u) {
@@ -1846,6 +1871,7 @@ static void usfm__check_utf8(USFM_Parser *p, USFM_ScanToken *t)
         t->tok.kind != USFM_TOK_ATTRIBUTES) return;
     if (usfm__utf8_valid(p->ast->input + t->tok.span.offset, t->tok.span.length)) return;
     at = usfm__utf8_check(p->ast->input + t->tok.span.offset, t->tok.span.length, &bad);
+    USFM_ASSERT(at < t->tok.span.length && bad >= 1 && bad <= 3);
     t->tok.level_flags |= USFM_TF_INVALID_UTF8;
     if (p->depth > 0) context = p->ast->nodes[p->stack[p->depth - 1].node].marker;
     usfm__diag(p, USFM_DIAGNOSTIC_INVALID_UTF8, usfm__span(t->tok.span.offset + at, bad), context);
@@ -2866,7 +2892,7 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
         usfm__set_err(err, USFM_ERR_INPUT_TOO_LARGE, 0);
         return NULL;
     }
-    if (usfm__wide_bom(input, input_length)) {
+    if (usfm__wide_bom(text, input_length)) {
         usfm__set_err(err, USFM_ERR_UNSUPPORTED_ENCODING, 0);
         return NULL;
     }
