@@ -2474,6 +2474,116 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
     err = _mm_or_si128(err, pending);   /* the input ended inside a sequence */
     return _mm_movemask_epi8(_mm_cmpeq_epi8(err, _mm_setzero_si128())) == 0xFFFF;
 }
+#elif !defined(USFM_SIMD_NONE) && defined(__aarch64__) && defined(__ARM_NEON)
+#  define USFM__UTF8_SIMD 1
+/* Keiser-Lemire UTF-8 validation, 16 bytes per step (NEON). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    static const char b1h_t[16] = {USFM__U8_B1H};
+    static const char b1l_t[16] = {USFM__U8_B1L};
+    static const char b2h_t[16] = {USFM__U8_B2H};
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    static const char inc_t[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                   USFM__U8_INCOMPLETE_LAST3};
+    const uint8x16_t b1h = vld1q_u8((const uint8_t *)b1h_t);
+    const uint8x16_t b1l = vld1q_u8((const uint8_t *)b1l_t);
+    const uint8x16_t b2h = vld1q_u8((const uint8_t *)b2h_t);
+    const uint8x16_t incomplete_max = vld1q_u8((const uint8_t *)inc_t);
+    const uint8x16_t nib = vdupq_n_u8(0x0F);
+    uint8x16_t prev = vdupq_n_u8(0), err = vdupq_n_u8(0), pending = vdupq_n_u8(0);
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 16, then the tail ends it */
+        uint8x16_t in;
+        if (n - i >= 16u) {
+            in = vld1q_u8((const uint8_t *)(const void *)(s + i));
+            i += 16u;
+        } else if (i < n) {
+            uint8_t tail[16];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = vld1q_u8(tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (vmaxvq_u8(in) < 0x80) {
+            err = vorrq_u8(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            uint8x16_t p1 = vextq_u8(prev, in, 15);
+            uint8x16_t p2 = vextq_u8(prev, in, 14);
+            uint8x16_t p3 = vextq_u8(prev, in, 13);
+            uint8x16_t sc = vandq_u8(
+                vandq_u8(vqtbl1q_u8(b1h, vshrq_n_u8(p1, 4)),
+                         vqtbl1q_u8(b1l, vandq_u8(p1, nib))),
+                vqtbl1q_u8(b2h, vshrq_n_u8(in, 4)));
+            uint8x16_t m23 = vorrq_u8(vqsubq_u8(p2, vdupq_n_u8(0xE0 - 0x80)),
+                                      vqsubq_u8(p3, vdupq_n_u8(0xF0 - 0x80)));
+            err = vorrq_u8(err, veorq_u8(vandq_u8(m23, vdupq_n_u8(0x80)), sc));
+            pending = vqsubq_u8(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = vorrq_u8(err, pending);   /* the input ended inside a sequence */
+    return vmaxvq_u8(err) == 0;
+}
+#elif !defined(USFM_SIMD_NONE) && defined(__wasm_simd128__)
+#  define USFM__UTF8_SIMD 1
+/* Keiser-Lemire UTF-8 validation, 16 bytes per step (wasm simd128). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    static const char b1h_t[16] = {USFM__U8_B1H};
+    static const char b1l_t[16] = {USFM__U8_B1L};
+    static const char b2h_t[16] = {USFM__U8_B2H};
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    static const char inc_t[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                   USFM__U8_INCOMPLETE_LAST3};
+    const v128_t b1h = wasm_v128_load(b1h_t);
+    const v128_t b1l = wasm_v128_load(b1l_t);
+    const v128_t b2h = wasm_v128_load(b2h_t);
+    const v128_t incomplete_max = wasm_v128_load(inc_t);
+    const v128_t nib = wasm_u8x16_splat(0x0F);
+    v128_t prev = wasm_i8x16_splat(0), err = wasm_i8x16_splat(0), pending = wasm_i8x16_splat(0);
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 16, then the tail ends it */
+        v128_t in;
+        if (n - i >= 16u) {
+            in = wasm_v128_load(s + i);
+            i += 16u;
+        } else if (i < n) {
+            char tail[16];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = wasm_v128_load(tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (wasm_i8x16_bitmask(in) == 0) {
+            err = wasm_v128_or(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            v128_t p1 = wasm_i8x16_shuffle(prev, in, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30);
+            v128_t p2 = wasm_i8x16_shuffle(prev, in, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29);
+            v128_t p3 = wasm_i8x16_shuffle(prev, in, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+            v128_t sc = wasm_v128_and(
+                wasm_v128_and(wasm_i8x16_swizzle(b1h, wasm_u8x16_shr(p1, 4)),
+                              wasm_i8x16_swizzle(b1l, wasm_v128_and(p1, nib))),
+                wasm_i8x16_swizzle(b2h, wasm_u8x16_shr(in, 4)));
+            v128_t m23 = wasm_v128_or(wasm_u8x16_sub_sat(p2, wasm_u8x16_splat(0xE0 - 0x80)),
+                                      wasm_u8x16_sub_sat(p3, wasm_u8x16_splat(0xF0 - 0x80)));
+            err = wasm_v128_or(err, wasm_v128_xor(wasm_v128_and(m23, wasm_u8x16_splat(0x80)), sc));
+            pending = wasm_u8x16_sub_sat(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = wasm_v128_or(err, pending);   /* the input ended inside a sequence */
+    return !wasm_v128_any_true(err);
+}
 #else
 #  define USFM__UTF8_SIMD 0
 #endif
