@@ -335,6 +335,7 @@ int main(int argc, char **argv)
            mismatches.loose_ws, mismatches.nbsp, mismatches.escape);
     if (mismatches.loose_ws + mismatches.nbsp + mismatches.escape != 0) failures++;
     printf("SIMD path: %s\n", USFM__SIMD_PATH);
+    printf("UTF-8 validator: %s\n", USFM__UTF8_SIMD_PATH);
     printf("Scanner differences: %llu\n", scan_diffs);
     printf("Classifier differences: %llu\n", block_diffs);
     printf("AST checksum: %016llx\n", (unsigned long long)checksum);

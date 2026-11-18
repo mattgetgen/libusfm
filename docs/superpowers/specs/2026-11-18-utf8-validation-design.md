@@ -226,11 +226,12 @@ An earlier version of this section put a UTF-8 error mask in
     before it.
   - A saturating-subtract check catches missing 3rd and 4th bytes.
   - The bytes before the input are taken to be zero, which is ASCII.
-  - The final, partial chunk is zero-padded, and one extra all-zero chunk
-    follows a full last chunk, so a sequence cut short at the end of the
-    input is an error.
-  - A chunk with no high bits skips the lookups, unless the previous
-    chunk ended inside a sequence.
+  - The final, partial chunk is zero-padded. Lead bytes pending in the
+    last chunk (a lead byte in its last 3 positions) are folded into the
+    error at the end, so a sequence cut short at the end of the input is
+    an error.
+  - A chunk with no high bits always skips the lookups, and folds in any
+    pending lead bytes from the previous chunk.
 - **Each path gets its own version:**
 
   | Path | Chunk | Lookups / shifts |
@@ -251,16 +252,24 @@ An earlier version of this section put a UTF-8 error mask in
 
 - **SIMD against the scalar DFA.** Each SIMD validator is compared with
   `usfm__utf8_valid`:
-  - every 1- to 4-byte sequence of edge bytes, at every offset 0–67
-    inside an ASCII buffer, so it crosses the 16-, 32- and 64-byte chunk
-    boundaries;
+  - every 1- to 4-byte sequence of edge bytes inside an ASCII buffer, at
+    the chunk-boundary offsets 0–3, 12–17, 28–33, 44–49 and 60–65, so it
+    crosses the 16-, 32- and 64-byte chunk boundaries; 4-byte sequences
+    only start at chunk positions 0 and 13–15;
+  - each of those at several tails: the end of the input, 5 `x` after it,
+    and 128 `x` (whole ASCII chunks) followed by é;
+  - fixed cases for each width, with a lead byte at the last position of
+    a 16-, 32- or 64-byte chunk, a whole ASCII chunk, then more text
+    (the 16-wide case is 15 `x`, C3, 24 `x`, C3 A9);
   - random strings, mostly ASCII and up to 200 bytes long;
   - encoded random scalar values and their mutations;
   - every file of every corpus.
 - **Identical diagnostics on every path.** Every corpus and fuzz input
   must give the same diagnostics and flags on every path. The fuzzer
-  compares a validated parse with a parse that only checks per run, and
-  the corpus test with the scalar path.
+  compares a validated parse with a `USFM_PARSE_NO_UTF8_CHECK` parse
+  (validation adds diagnostics and the flag bit, nothing else) and
+  separately checks the SIMD validator against the scalar DFA on every
+  input; the corpus test compares with the scalar path.
 - **Every path is run:** scalar, SSE2 and AVX2 natively, SSSE3 by
   building with `-mssse3`, NEON (qemu), wasm (Node) and AVX-512BW (SDE).
 

@@ -12,6 +12,7 @@ static uint32_t simd_rand(void)
 static void test_simd_path_name(void)
 {
     fprintf(stderr, "    SIMD path: %s\n", USFM__SIMD_PATH);
+    fprintf(stderr, "    UTF-8 validator: %s\n", USFM__UTF8_SIMD_PATH);
     CHECK(USFM__SIMD_PATH[0] != '\0');
 }
 

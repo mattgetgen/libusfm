@@ -167,7 +167,7 @@ case "$MODE" in
             cat build/run_tests_neon.log >&2
             exit 1
         fi
-        grep 'SIMD path' build/run_tests_neon.log
+        grep -E 'SIMD path|UTF-8 validator' build/run_tests_neon.log
         echo "neon: $(tail -n 1 build/run_tests_neon.log)"
         rm -f build/checksums.txt
         for corpus in "${CORPORA[@]}"; do
@@ -192,7 +192,7 @@ case "$MODE" in
             cat build/run_tests_wasm.log >&2
             exit 1
         fi
-        grep 'SIMD path' build/run_tests_wasm.log
+        grep -E 'SIMD path|UTF-8 validator' build/run_tests_wasm.log
         echo "wasm: $(tail -n 1 build/run_tests_wasm.log)"
         rm -f build/checksums.txt
         for corpus in "${CORPORA[@]}"; do
@@ -216,7 +216,7 @@ case "$MODE" in
             cat build/run_tests_avx512.log >&2
             exit 1
         fi
-        grep 'SIMD path' build/run_tests_avx512.log
+        grep -E 'SIMD path|UTF-8 validator' build/run_tests_avx512.log
         echo "avx512bw: $(tail -n 1 build/run_tests_avx512.log)"
         rm -f build/checksums.txt
         for corpus in "${CORPORA[@]}"; do

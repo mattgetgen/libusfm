@@ -167,7 +167,9 @@ extern "C" {
  * flags are identical everywhere. SSE2 without SSSE3 and scalar builds
  * (USFM_SIMD_NONE, targets with no SIMD) validate per run. A plain
  * x86-64 build gets SSE2 for the scanner but no SIMD UTF-8 validation;
- * enable SSSE3 (-mssse3, -march=x86-64-v2, -march=native) for it. */
+ * enable SSSE3 (-mssse3, -march=x86-64-v2, -march=native) for it. MSVC
+ * has no SSSE3-only switch: MSVC x64 builds validate per run unless built
+ * with /arch:AVX2 (AVX2 validator) or /arch:AVX512 (AVX-512BW validator). */
 
 #define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
 
@@ -2324,6 +2326,7 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
 #if !defined(USFM_SIMD_NONE) && defined(__AVX512BW__)
 #  include <immintrin.h>
 #  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "avx512bw"
 /* Keiser-Lemire UTF-8 validation, 64 bytes per step (AVX-512BW). Returns
  * 1 if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
  * a zero-padded last chunk and the final pending check catch a sequence
@@ -2380,6 +2383,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 #elif !defined(USFM_SIMD_NONE) && defined(__AVX2__) && !defined(__AVX512BW__)
 #  include <immintrin.h>
 #  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "avx2"
 /* Keiser-Lemire UTF-8 validation, 32 bytes per step (AVX2). Returns 1
  * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
  * a zero-padded last chunk and the final pending check catch a sequence
@@ -2437,6 +2441,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 #elif !defined(USFM_SIMD_NONE) && defined(__SSSE3__) && !defined(__AVX512BW__)
 #  include <tmmintrin.h>
 #  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "ssse3"
 /* Keiser-Lemire UTF-8 validation, 16 bytes per step (SSSE3). Returns 1
  * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
  * a zero-padded last chunk and the final pending check catch a sequence
@@ -2488,6 +2493,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 }
 #elif !defined(USFM_SIMD_NONE) && defined(__aarch64__) && defined(__ARM_NEON)
 #  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "neon"
 /* Keiser-Lemire UTF-8 validation, 16 bytes per step (NEON). Returns 1
  * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
  * a zero-padded last chunk and the final pending check catch a sequence
@@ -2543,6 +2549,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 }
 #elif !defined(USFM_SIMD_NONE) && defined(__wasm_simd128__)
 #  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "wasm-simd128"
 /* Keiser-Lemire UTF-8 validation, 16 bytes per step (wasm simd128). Returns 1
  * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
  * a zero-padded last chunk and the final pending check catch a sequence
@@ -2598,6 +2605,7 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 }
 #else
 #  define USFM__UTF8_SIMD 0
+#  define USFM__UTF8_SIMD_PATH "none"
 #endif
 
 static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marker marker);
