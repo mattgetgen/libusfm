@@ -17,7 +17,8 @@ chapters, verses, paragraphs, character spans, notes and milestones. The
 three are ParatextData 9.5.0.24 (C#), usfm3 0.2.1 (Rust, AST mode) and
 usfmtc 0.4.8 (Python, the USFM committee's parser; 0.4.10 gives the
 same counts, checked on 2026-11-17), each run with its own
-harness from the parser benchmark repository.
+harness from the parser benchmark repository. A fourth, usfm_tools 0.1.1
+(Rust), gave the same counts on 2026-11-16.
 `paratextdata-web.csv` has ParatextData's per-book counts for
 WEB-STRONGS (compare with `build/corpus/libusfm-WEB-STRONGS.csv`). Every
 corpus also parses in libusfm with 0 diagnostics, 0 scanner differences
