@@ -148,7 +148,7 @@ static const char *const dump_diag_names[USFM_DIAGNOSTIC_CODE_COUNT] = {
     "VERSE_BEFORE_CHAPTER", "INVALID_BOOK_CODE", "MISSING_CALLER",
     "UNTERMINATED_QUOTE", "UNKNOWN_ATTRIBUTE", "MISSING_ATTRIBUTE",
     "INVALID_ESCAPE", "MILESTONE_MISMATCH", "UNSUPPORTED_VERSION",
-    "DUPLICATE_STYLE", "IMPLIED_PARAGRAPH", "TOO_DEEP"
+    "DUPLICATE_STYLE", "IMPLIED_PARAGRAPH", "TOO_DEEP", "INVALID_UTF8"
 };
 
 static void dump_tree(const USFM_Ast *ast, char *out, size_t cap)
@@ -179,6 +179,9 @@ static void dump_tree(const USFM_Ast *ast, char *out, size_t cap)
         if (n->kind == USFM_AST_PARA && (n->level_flags & USFM_NF_IMPLIED)) dump_puts(&o, " implied");
         if (n->kind == USFM_AST_PARA && (n->level_flags & USFM_NF_HEADING)) dump_puts(&o, " heading");
         if (n->kind == USFM_AST_MILESTONE && (n->level_flags & USFM_TF_SELF_CLOSED)) dump_puts(&o, " closed");
+        if ((n->kind == USFM_AST_TEXT || n->kind == USFM_AST_ARGUMENT ||
+             n->kind == USFM_AST_ATTRIBUTES) && (n->level_flags & USFM_TF_INVALID_UTF8))
+            dump_puts(&o, " badutf8");
         dump_putc(&o, '\n');
         if (depth < sizeof ends / sizeof ends[0]) ends[depth++] = n->end;
     }

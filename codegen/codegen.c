@@ -301,6 +301,73 @@ bool CodeGen_ByteClass_Serialize(const uint8_t classes[256], CodeGen_WriteBuffer
     return CodeGen_Block_Finish(buffer, &temp, current_hash, "character_class");
 }
 
+/* UTF-8 validity as a shift DFA: each state is a bit offset (a multiple
+ * of 6) into a byte's 64-bit table entry, whose 6-bit field there is the
+ * next state. 0 starts and accepts; CODEGEN_U8_ERR absorbs. RFC 3629. */
+enum {
+    CODEGEN_U8_ACC = 0, CODEGEN_U8_ERR = 6, CODEGEN_U8_C1 = 12, CODEGEN_U8_C2 = 18,
+    CODEGEN_U8_C3 = 24, CODEGEN_U8_E0 = 30, CODEGEN_U8_ED = 36, CODEGEN_U8_F0 = 42,
+    CODEGEN_U8_F4 = 48
+};
+
+static void CodeGen_Utf8Dfa_Put(uint64_t *entry, unsigned from, unsigned to)
+{
+    *entry = (*entry & ~(63ull << from)) | ((uint64_t)to << from);
+}
+
+void CodeGen_Utf8Dfa_Generate(uint64_t table[256])
+{
+    for (unsigned b = 0; b < 256; b++)
+    {
+        uint64_t *e = &table[b];
+        *e = 0;
+        for (unsigned s = 0; s <= CODEGEN_U8_F4; s += 6)
+        {
+            CodeGen_Utf8Dfa_Put(e, s, CODEGEN_U8_ERR);
+        }
+        if (b < 0x80) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_ACC);
+        else if (b >= 0xC2 && b <= 0xDF) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_C1);
+        else if (b == 0xE0) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_E0);
+        else if ((b >= 0xE1 && b <= 0xEC) || b == 0xEE || b == 0xEF)
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_C2);
+        else if (b == 0xED) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_ED);
+        else if (b == 0xF0) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_F0);
+        else if (b >= 0xF1 && b <= 0xF3) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_C3);
+        else if (b == 0xF4) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ACC, CODEGEN_U8_F4);
+        if (b >= 0x80 && b <= 0xBF)
+        {
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_C1, CODEGEN_U8_ACC);
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_C2, CODEGEN_U8_C1);
+            CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_C3, CODEGEN_U8_C2);
+        }
+        if (b >= 0xA0 && b <= 0xBF) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_E0, CODEGEN_U8_C1);
+        if (b >= 0x80 && b <= 0x9F) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_ED, CODEGEN_U8_C1);
+        if (b >= 0x90 && b <= 0xBF) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_F0, CODEGEN_U8_C2);
+        if (b >= 0x80 && b <= 0x8F) CodeGen_Utf8Dfa_Put(e, CODEGEN_U8_F4, CODEGEN_U8_C2);
+    }
+}
+
+bool CodeGen_Utf8Dfa_Serialize(const uint64_t table[256], CodeGen_WriteBuffer *buffer,
+    uint64_t current_hash)
+{
+    CodeGen_WriteBuffer temp = CodeGen_WriteBuffer_Temp(buffer->capacity);
+    CodeGen_WriteBuffer_Appendf(&temp,
+        "/* UTF-8 validity as a shift DFA: state = (USFM_Utf8Dfa[byte] >> state)\n"
+        " * & 63, starting and accepting at 0; 6 is the error state. */\n");
+    CodeGen_WriteBuffer_Appendf(&temp, "static const uint64_t USFM_Utf8Dfa[256] = {\n");
+    for (size_t i = 0; i < 256; i += 4)
+    {
+        CodeGen_WriteBuffer_Appendf(&temp, "   ");
+        for (size_t j = i; j < i + 4; j++)
+        {
+            CodeGen_WriteBuffer_Appendf(&temp, " 0x%016llxull,", (unsigned long long)table[j]);
+        }
+        CodeGen_WriteBuffer_Appendf(&temp, "\n");
+    }
+    CodeGen_WriteBuffer_Appendf(&temp, "};\n");
+    return CodeGen_Block_Finish(buffer, &temp, current_hash, "utf8_dfa");
+}
+
 /* Seeds tried per table size, and the largest size tried (as a multiple
  * of the key count). Both bound the search so codegen always ends. */
 #define CODEGEN_HASH_SEED_LIMIT 65536u
@@ -441,6 +508,8 @@ int main(int argc, char **argv)
 {
     uint8_t byte_class[256];
     CodeGen_ByteClass_Generate(byte_class);
+    uint64_t utf8_dfa[256];
+    CodeGen_Utf8Dfa_Generate(utf8_dfa);
 
     bool overwrite = false;
     const char *overwrite_arg_short = "-o";
@@ -612,6 +681,7 @@ int main(int argc, char **argv)
         {
             const char *cc = "character_class";
             const char *mt = "marker_table";
+            const char *ud = "utf8_dfa";
             bool unchanged = true;
             if (block.name_length == strlen(cc) && memcmp(block.name, cc, strlen(cc)) == 0)
             {
@@ -620,6 +690,10 @@ int main(int argc, char **argv)
             else if (block.name_length == strlen(mt) && memcmp(block.name, mt, strlen(mt)) == 0)
             {
                 unchanged = CodeGen_MarkerTable_Serialize(&writebuf, block.content_hash);
+            }
+            else if (block.name_length == strlen(ud) && memcmp(block.name, ud, strlen(ud)) == 0)
+            {
+                unchanged = CodeGen_Utf8Dfa_Serialize(utf8_dfa, &writebuf, block.content_hash);
             }
             else
             {
