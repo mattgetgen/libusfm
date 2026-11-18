@@ -2305,7 +2305,66 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
 
 /* Whole-input validation is SIMD-only: on scalar builds a separate DFA
  * pass is slower than checking runs while parsing (see the spec). */
-#if !defined(USFM_SIMD_NONE) && defined(__AVX2__) && !defined(__AVX512BW__)
+#if !defined(USFM_SIMD_NONE) && defined(__AVX512BW__)
+#  include <immintrin.h>
+#  define USFM__UTF8_SIMD 1
+/* Keiser-Lemire UTF-8 validation, 64 bytes per step (AVX-512BW). Returns
+ * 1 if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    const __m512i b1h = _mm512_broadcast_i32x4(_mm_setr_epi8(USFM__U8_B1H));
+    const __m512i b1l = _mm512_broadcast_i32x4(_mm_setr_epi8(USFM__U8_B1L));
+    const __m512i b2h = _mm512_broadcast_i32x4(_mm_setr_epi8(USFM__U8_B2H));
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    static const char incomplete_bytes[64] = {
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        USFM__U8_INCOMPLETE_LAST3};
+    const __m512i incomplete_max = _mm512_loadu_si512((const void *)incomplete_bytes);
+    const __m512i nib = _mm512_set1_epi8(0x0F);
+    __m512i prev = _mm512_setzero_si512(), err = _mm512_setzero_si512(), pending = _mm512_setzero_si512();
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 64, then the tail ends it */
+        __m512i in;
+        if (n - i >= 64u) {
+            in = _mm512_loadu_si512((const void *)(s + i));
+            i += 64u;
+        } else if (i < n) {
+            char tail[64];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = _mm512_loadu_si512((const void *)tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (_mm512_movepi8_mask(in) == 0) {
+            err = _mm512_or_si512(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            /* Lane k of t is the 16 bytes just before lane k of in. */
+            __m512i t = _mm512_alignr_epi64(in, prev, 6);
+            __m512i p1 = _mm512_alignr_epi8(in, t, 15);
+            __m512i p2 = _mm512_alignr_epi8(in, t, 14);
+            __m512i p3 = _mm512_alignr_epi8(in, t, 13);
+            __m512i sc = _mm512_and_si512(
+                _mm512_and_si512(_mm512_shuffle_epi8(b1h, _mm512_and_si512(_mm512_srli_epi16(p1, 4), nib)),
+                                 _mm512_shuffle_epi8(b1l, _mm512_and_si512(p1, nib))),
+                _mm512_shuffle_epi8(b2h, _mm512_and_si512(_mm512_srli_epi16(in, 4), nib)));
+            __m512i m23 = _mm512_or_si512(_mm512_subs_epu8(p2, _mm512_set1_epi8((char)(0xE0 - 0x80))),
+                                          _mm512_subs_epu8(p3, _mm512_set1_epi8((char)(0xF0 - 0x80))));
+            err = _mm512_or_si512(err, _mm512_xor_si512(_mm512_and_si512(m23, _mm512_set1_epi8((char)0x80)), sc));
+            pending = _mm512_subs_epu8(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = _mm512_or_si512(err, pending);   /* the input ended inside a sequence */
+    return _mm512_test_epi8_mask(err, err) == 0;
+}
+#elif !defined(USFM_SIMD_NONE) && defined(__AVX2__) && !defined(__AVX512BW__)
 #  include <immintrin.h>
 #  define USFM__UTF8_SIMD 1
 /* Keiser-Lemire UTF-8 validation, 32 bytes per step (AVX2). Returns 1
