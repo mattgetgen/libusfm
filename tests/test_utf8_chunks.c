@@ -231,8 +231,52 @@ static void test_utf8_chunks_bom(void)
     }
 }
 
+/* White box: the chunk cuts of a valid input end at character boundaries
+ * and every chunk is valid. A cut inside a character would make a chunk
+ * invalid; the parser would then check runs one by one, which gives the
+ * same output (so the tests above cannot see it) but loses the speed. */
+static void test_utf8_chunk_cuts(void)
+{
+    static const char *const inputs[] = {
+        "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80" "b\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xE2\x82\xAC\xC3\xA9z",
+        "\xEF\xBB\xBF\\id GEN \xE4\xB8\xAD\xE6\x96\x87\xD8\xB9\xD8\xB1\xD8\xA8\xD9\x8A\n",
+        "\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xF0\x9F\x98\x80"
+    };
+    static const uint32_t chunks[] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 61u, 64u};
+    uint32_t i, c, from, cut, guard;
+    for (i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+        const uint8_t *u = (const uint8_t *)inputs[i];
+        uint32_t n = (uint32_t)strlen(inputs[i]);
+        CHECK(usfm__utf8_valid(inputs[i], n));
+        for (c = 0; c < sizeof chunks / sizeof chunks[0]; c++) {
+            from = 0;
+            for (guard = 0; guard <= n && from < n; guard++) {   /* bounded: n + 1 */
+                cut = usfm__utf8_cut(u, n, from, chunks[c]);
+                CHECK(cut > from && cut <= n);
+                CHECK(cut == n || !usfm__utf8_is_cont(u[cut]));
+                if (!usfm__utf8_valid_chunk(inputs[i] + from, cut - from)) {
+                    usfm_test_failures++;
+                    fprintf(stderr, "input %u, chunk %u: chunk [%u, %u) invalid\n", (unsigned)i,
+                            (unsigned)chunks[c], (unsigned)from, (unsigned)cut);
+                    break;
+                }
+                usfm_test_checks++;
+                if (cut <= from) break;
+                from = cut;
+            }
+            CHECK_EQ(from, n);
+        }
+    }
+    /* 4 or more continuation bytes in a row: no boundary within 3 bytes
+     * either way, so the cut stays (and still moves forward). */
+    CHECK_EQ(usfm__utf8_cut((const uint8_t *)"a\x80\x80\x80\x80\x80\x80\x80" "b", 9u, 0u, 4u), 4u);
+    CHECK_EQ(usfm__utf8_cut((const uint8_t *)"a\x80\x80\x80\x80\x80\x80\x80" "b", 9u, 0u, 1u), 1u);
+    CHECK_EQ(usfm__utf8_cut((const uint8_t *)"a\x80\x80\x80\x80\x80\x80\x80" "b", 9u, 1u, 2u), 3u);
+}
+
 static void run_utf8_chunks_tests(void)
 {
+    RUN(test_utf8_chunk_cuts);
     RUN(test_utf8_chunks_at_boundary);
     RUN(test_utf8_chunks_after_long_prefix);
     RUN(test_utf8_chunks_input_end);
