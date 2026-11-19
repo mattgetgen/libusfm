@@ -25,6 +25,7 @@
 #include "test_parse_alloc.c"
 #include "test_utf8.c"
 #include "test_simd.c"
+#include "test_fastpath.c"
 
 int main(void)
 {
@@ -54,6 +55,8 @@ int main(void)
     run_utf8_tests();
     fprintf(stderr, "simd\n");
     run_simd_tests();
+    fprintf(stderr, "fast path\n");
+    run_fastpath_tests();
     if (usfm_test_failures != 0) {
         fprintf(stderr, "FAILED: %d of %d checks\n", usfm_test_failures, usfm_test_checks);
         return 1;

@@ -222,4 +222,81 @@ static uint32_t check_utf8_coverage(const USFM_Ast *ast)
     return missing;
 }
 
+/* The character-span fast path must not change anything: compares two
+ * parses of the same input (fast path on and off) field by field.
+ * Returns 0 if identical; otherwise prints the first difference and
+ * returns 1. */
+static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_Ast *b,
+                            const USFM_Err *eb, const char *label)
+{
+    uint32_t na, nb, da, db, ca, cb, va, vb, i;
+    const USFM_Node *xa, *xb;
+    const USFM_Diagnostic *ga, *gb;
+    const USFM_ChapterEntry *ha, *hb;
+    const USFM_VerseEntry *wa, *wb;
+    if ((a == NULL) != (b == NULL) || ea->code != eb->code) {
+        fprintf(stderr, "%s: fast path: result %s/%u, reference %s/%u\n", label,
+                a ? "tree" : "NULL", (unsigned)ea->code, b ? "tree" : "NULL", (unsigned)eb->code);
+        return 1;
+    }
+    if (a == NULL) return 0;
+    xa = USFM_Ast_GetNodes(a, &na);
+    xb = USFM_Ast_GetNodes(b, &nb);
+    for (i = 0; i < na && i < nb; i++) {
+        if (memcmp(&xa[i], &xb[i], sizeof xa[i]) != 0) {
+            fprintf(stderr, "%s: fast path: node %u differs: kind %u/%u marker %u/%u span %u+%u/%u+%u"
+                    " parent %u/%u end %u/%u flags 0x%02x/0x%02x\n", label, i,
+                    xa[i].kind, xb[i].kind, xa[i].marker, xb[i].marker, xa[i].span.offset,
+                    xa[i].span.length, xb[i].span.offset, xb[i].span.length, xa[i].parent,
+                    xb[i].parent, xa[i].end, xb[i].end, xa[i].level_flags, xb[i].level_flags);
+            return 1;
+        }
+    }
+    if (na != nb) {
+        fprintf(stderr, "%s: fast path: %u nodes, reference %u\n", label, na, nb);
+        return 1;
+    }
+    ga = USFM_Ast_GetDiagnostics(a, &da);
+    gb = USFM_Ast_GetDiagnostics(b, &db);
+    for (i = 0; i < da && i < db; i++) {
+        if (memcmp(&ga[i], &gb[i], sizeof ga[i]) != 0) {
+            fprintf(stderr, "%s: fast path: diagnostic %u differs: code %u/%u at %u/%u\n", label, i,
+                    ga[i].code, gb[i].code, ga[i].span.offset, gb[i].span.offset);
+            return 1;
+        }
+    }
+    if (da != db || USFM_Ast_GetDroppedDiagnosticCount(a) != USFM_Ast_GetDroppedDiagnosticCount(b)) {
+        fprintf(stderr, "%s: fast path: %u diagnostics (%u dropped), reference %u (%u dropped)\n",
+                label, da, USFM_Ast_GetDroppedDiagnosticCount(a), db,
+                USFM_Ast_GetDroppedDiagnosticCount(b));
+        return 1;
+    }
+    ha = USFM_Ast_GetChapters(a, &ca);
+    hb = USFM_Ast_GetChapters(b, &cb);
+    wa = USFM_Ast_GetVerses(a, &va);
+    wb = USFM_Ast_GetVerses(b, &vb);
+    if (ca != cb || va != vb || (ca && memcmp(ha, hb, ca * sizeof *ha) != 0) ||
+        (va && memcmp(wa, wb, va * sizeof *wa) != 0) ||
+        USFM_Ast_GetVersion(a) != USFM_Ast_GetVersion(b) ||
+        strcmp(USFM_Ast_GetBookCode(a), USFM_Ast_GetBookCode(b)) != 0) {
+        fprintf(stderr, "%s: fast path: chapter/verse tables, version or book code differ\n", label);
+        return 1;
+    }
+    return 0;
+}
+
+/* Parses `input` with the fast path on and off (default allocator) and
+ * compares the results. Returns 0 if identical. */
+static int check_fast_path(const char *input, uint32_t length, const USFM_Config *config,
+                           uint32_t flags, const char *label)
+{
+    USFM_Err ea, eb;
+    USFM_Ast *a = usfm__parse_opts_impl(input, length, config, flags, NULL, &ea, 1);
+    USFM_Ast *b = usfm__parse_opts_impl(input, length, config, flags, NULL, &eb, 0);
+    int diff = check_same_parse(a, &ea, b, &eb, label);
+    USFM_Ast_Free(a);
+    USFM_Ast_Free(b);
+    return diff;
+}
+
 #endif
