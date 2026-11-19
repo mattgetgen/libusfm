@@ -19,6 +19,11 @@ usfmtc 0.4.8 (Python, the USFM committee's parser; 0.4.10 gives the
 same counts, checked on 2026-11-17), each run with its own
 harness from the parser benchmark repository. A fourth, usfm_tools 0.1.1
 (Rust), gave the same counts on 2026-11-16.
+usfm3 0.3.2 (Rust, 2026-11-18) gives the same counts too, once its
+marker table is mapped to ParatextData's categories. It files `\h`, `\ide`
+and `\toc1`-`\toc3` under "identification", not paragraphs. It also
+counts `\cp`, `\ca`, `\va` and `\vp` as character styles. ParatextData
+treats these as paragraphs and as chapter or verse publishing markers.
 `paratextdata-web.csv` has ParatextData's per-book counts for
 WEB-STRONGS (compare with `build/corpus/libusfm-WEB-STRONGS.csv`). Every
 corpus also parses in libusfm with 0 diagnostics, 0 scanner differences
