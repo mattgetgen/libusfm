@@ -317,3 +317,38 @@ the total:
     loop;
   - look at the +2% on small AVX2 corpora (the per-open fast-path check,
     and code placement).
+
+### Follow-ups (2026-11-19)
+
+Two small changes, measured as above (3 rounds; 9 rounds where noted).
+
+- **`perf: always inline usfm__append` (`5103600`).** With asserts on,
+  the code is byte-identical: clang already inlined it. With `-DNDEBUG`,
+  WEB-STRONGS gets 6.5% faster (AVX2) and 2.4% faster (scalar), so NDEBUG
+  is now faster than asserts on (AVX2 −2.6%, was +4.1%).
+  `usfm__top_kind` was already inlined everywhere, so it is unchanged.
+- **`perf: inline closer compare instead of memcmp` (`303a8e0`).** An
+  inline byte loop replaces the `memcmp`. AVX2: −1.6% on WEB-STRONGS and
+  GRC-BYZ. It is also −1.6 to −1.8% on WEB, HBO-WLC and ARB-VD, where the
+  instruction count does not change, so that part is code placement.
+  Scalar: −1.1% to +0.3%. A new test (a same-length closer that differs
+  only in its last byte) kills the `open_length - 1` mutant, which used
+  to survive every test.
+
+After both, against `86dd228` (cycles; instructions):
+
+| Corpus | AVX2 | | Scalar | |
+| --- | ---: | ---: | ---: | ---: |
+| WEB | +0.5% (+0.8%, 9 rounds) | +1.1% | +0.5% (+0.6%, 9 rounds) | +0.3% |
+| WEB-STRONGS | **−22.7%** | −23.2% | **−14.1%** | −18.4% |
+| GRC-BYZ | **−21.6%** | −22.8% | **−15.1%** | −18.1% |
+| HBO-WLC | −0.1% (0.0%, 9 rounds) | +0.9% | +0.0% (0.0%, 9 rounds) | +0.3% |
+| ARB-VD | −0.1% (−0.1%, 9 rounds) | +1.1% | +0.7% (+0.9%, 9 rounds) | +0.4% |
+| CMN-CUV | −4.5% | −8.8% | −5.1% | −7.4% |
+
+- **"No other corpus more than 2% slower" now passes** on both builds.
+  AVX2 WEB is +0.5% (3 rounds) and +0.8% (9 rounds), down from +2.1% and
+  +2.3%. Most of that gain is code placement, so a later change can move
+  it again.
+- About 1% more instructions on the small AVX2 corpora (the per-open
+  fast-path check) remains. It no longer shows up in cycles.
