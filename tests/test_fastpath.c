@@ -49,6 +49,22 @@ static void test_fastpath_stops(void)
      * the opening bytes "\\+w". */
     CHECK_FAST("\\p \\fig A \\+w b\\w*|src=\"x.jpg\" size=\"col\"\\fig* c\n");
     CHECK_FAST("\\id GEN\n\\h Gen \\w b\\w* c\n\\c 1\n");
+    /* Openers after a closer (step B.1: the fast path opens them). */
+    CHECK_FAST("\\p \\w a\\w* \\w b\\w* \\w c\\w*\n");
+    CHECK_FAST("\\p \\w a|strong=\"H1\"\\w* \\w b|strong=\"H2\"\\w* c\n");
+    CHECK_FAST("\\p \\wj x \\+w a\\+w* \\+w b\\w* y\\wj*\n");
+    CHECK_FAST("\\p \\w a\\w* \\w b \\w c\\w* d\n");             /* \w inside an open \w */
+    CHECK_FAST("\\p \\w a\\w* \\w b \\w c d\n");                 /* no closer ahead */
+    CHECK_FAST("\\p \\w a\\w* \\xt Gen 1:1\\xt* b\n");          /* \xt outside a note */
+    CHECK_FAST("\\id GEN\n\\c 1\n\\p \\v 1 \\w a\\w* \\v 2 \\w b\\w*\n");
+    CHECK_FAST("\\p \\w a\\w* \\f + \\fr 1:1 \\ft x\\f* b\n");
+    CHECK_FAST("\\p \\w a\\w*\n\\p \\w b\\w*\n");
+    CHECK_FAST("\\p \\w a\\w* \\qt-s |who=\"x\"\\* b\\qt-e\\*\n");
+    CHECK_FAST("\\p \\w a\\w* \\zfoo b\\zfoo* c\n");
+    CHECK_FAST("\\p \\w a \\nd b\\nd*\\w* c\n");                 /* opener after opener */
+    CHECK_FAST("\\p x\\f + \\ft \\w a\\w* \\w b\\w*\\f* y\n");  /* in a note */
+    CHECK_FAST("\\tr \\tc1 \\w a\\w* \\w b\\w* \\tc2 c\n");     /* in a cell */
+    CHECK_FAST("\\p \\w a\\w*\\w b\\w*\n");                      /* opener straight after a closer */
 }
 
 /* A span opened at the depth limit fails to open and becomes text; the
@@ -65,6 +81,19 @@ static void test_fastpath_depth_limit(void)
     }
     memcpy(in + n, "\\+w*\\+w*\n", 10);
     n += 10;
+    in[n] = '\0';
+    CHECK_FAST(in);
+
+    /* The same, with the deep spans opened after a closer. */
+    n = 0;
+    memcpy(in + n, "\\p \\w a\\w* ", 11);
+    n += 11;
+    for (i = 0; i < 70; i++) {
+        memcpy(in + n, "\\+w x ", 6);
+        n += 6;
+    }
+    memcpy(in + n, "\\+w*\\+w*\n", 9);
+    n += 9;
     in[n] = '\0';
     CHECK_FAST(in);
 }
