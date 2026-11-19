@@ -2294,16 +2294,17 @@ typedef struct USFM_Parser {
     uint8_t          version_auto;      /* config said AUTO */
     uint8_t          chapter_open;      /* a \c is open: set by \c, cleared
                                            by \id and \periph */
-    uint8_t          check_utf8;        /* validate TEXT, ARGUMENT and
-                                           ATTRIBUTES runs; cleared once the
-                                           whole input is known valid */
+    uint8_t          check_utf8;        /* validation is on and the input
+                                           not yet covered (cleared once
+                                           utf8_valid_to reaches the end) */
     uint8_t          fast;              /* use the character-span fast path
                                            (0 only in tests, as the reference) */
     uint8_t          utf8_invalid_seen; /* a validation chunk was invalid:
                                            runs past utf8_valid_to are
                                            checked one by one */
     uint32_t         utf8_valid_to;     /* input[0, utf8_valid_to) is known
-                                           valid UTF-8 */
+                                           valid UTF-8; 0xFFFFFFFF with
+                                           validation off */
 #if defined(USFM_TEST_SCAN_REFERENCE)
     uint8_t          utf8_reference;    /* test-only hooks: see */
     uint32_t         utf8_chunk;        /* USFM__ParseHooks */
@@ -2905,8 +2906,9 @@ static uint32_t usfm__utf8_cut(const uint8_t *u, uint32_t n, uint32_t from, uint
 
 /* Validates chunks ahead until input[0, end) is covered or a chunk is
  * invalid. Returns 1 if input[0, end) is now known valid. Once the
- * whole input is covered, clears check_utf8: the rest of the parse runs
- * as for an input validated up front. */
+ * whole input is covered (utf8_valid_to == n), no token passes
+ * USFM__UTF8_GATE again: the rest of the parse runs as for an input
+ * validated up front. */
 static int usfm__utf8_cover(USFM_Parser *p, uint32_t end)
 {
     const uint8_t *u = (const uint8_t *)p->ast->input;
@@ -2934,12 +2936,22 @@ static int usfm__utf8_cover(USFM_Parser *p, uint32_t end)
     return end <= p->utf8_valid_to;
 }
 
-/* Does a token just scanned need usfm__check_utf8? Only if validation is
- * on and the token ends past the prefix known valid: one compare in the
- * token loop. In reference mode (tests) utf8_valid_to stays 0, so every
- * non-empty token goes to usfm__check_utf8. */
+/* Branch hint for a rare condition. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define USFM__UNLIKELY(x) __builtin_expect((x), 0)
+#else
+#  define USFM__UNLIKELY(x) (x)
+#endif
+
+/* Does a token just scanned need usfm__check_utf8? Only if it ends past
+ * the prefix known valid: one compare in the token loop, and never true
+ * with validation off (utf8_valid_to is 0xFFFFFFFF) or once the whole
+ * input is covered. In reference mode (tests) utf8_valid_to stays 0, so
+ * every non-empty token goes to usfm__check_utf8. The hint matters: it
+ * keeps the call off the fall-through path (measured: WEB-STRONGS 0.8%
+ * fewer cycles). */
 #define USFM__UTF8_GATE(p, t) \
-    ((p)->check_utf8 && (t)->tok.span.offset + (t)->tok.span.length > (p)->utf8_valid_to)
+    USFM__UNLIKELY((t)->tok.span.offset + (t)->tok.span.length > (p)->utf8_valid_to)
 
 /* Validates a TEXT, ARGUMENT or ATTRIBUTES token just scanned whose end
  * is past utf8_valid_to (see USFM__UTF8_GATE): first validates chunks
@@ -4174,7 +4186,7 @@ static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
      * sequence contains an ASCII byte. After an invalid chunk, runs are
      * checked one by one, so diagnostics match on every build. */
     p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
-    p.utf8_valid_to = 0;
+    p.utf8_valid_to = p.check_utf8 ? 0u : 0xFFFFFFFFu;
     p.utf8_invalid_seen = 0;
 #if defined(USFM_TEST_SCAN_REFERENCE)
     if (hooks != NULL) {
@@ -4182,6 +4194,11 @@ static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
         p.utf8_chunk = hooks->utf8_chunk;
     }
 #endif
+    /* The first chunk now, as the whole-input pass did: an input of one
+     * chunk (most books) then parses with validation already done. */
+    if (p.utf8_valid_to == 0 && input_length > 0 && !USFM__UTF8_REFERENCE(&p)) {
+        (void)usfm__utf8_cover(&p, 1u);
+    }
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
     p.text_node = USFM_NIL;
     usfm__scan_init(&p.scan, text, input_length);
