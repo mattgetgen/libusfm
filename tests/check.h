@@ -222,8 +222,8 @@ static uint32_t check_utf8_coverage(const USFM_Ast *ast)
     return missing;
 }
 
-/* The character-span fast path must not change anything: compares two
- * parses of the same input (fast path on and off) field by field.
+/* Compares two parses of the same input field by field: `a` under test,
+ * `b` the reference (e.g. the fast path off, or per-run UTF-8 checks).
  * Returns 0 if identical; otherwise prints the first difference and
  * returns 1. */
 static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_Ast *b,
@@ -235,14 +235,14 @@ static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_As
     const USFM_ChapterEntry *ha, *hb;
     const USFM_VerseEntry *wa, *wb;
     if ((a == NULL) != (b == NULL) || ea->code != eb->code) {
-        fprintf(stderr, "%s: fast path: result %s/%u, reference %s/%u\n", label,
+        fprintf(stderr, "%s: result %s/%u, reference %s/%u\n", label,
                 a ? "tree" : "NULL", (unsigned)ea->code, b ? "tree" : "NULL", (unsigned)eb->code);
         return 1;
     }
     if (a == NULL) return 0;
     /* With a tree, err.pos is the first dropped offset (when NOMEM). */
     if (ea->pos != eb->pos) {
-        fprintf(stderr, "%s: fast path: error position %u, reference %u\n", label,
+        fprintf(stderr, "%s: error position %u, reference %u\n", label,
                 (unsigned)ea->pos, (unsigned)eb->pos);
         return 1;
     }
@@ -250,7 +250,7 @@ static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_As
     xb = USFM_Ast_GetNodes(b, &nb);
     for (i = 0; i < na && i < nb; i++) {
         if (memcmp(&xa[i], &xb[i], sizeof xa[i]) != 0) {
-            fprintf(stderr, "%s: fast path: node %u differs: kind %u/%u marker %u/%u span %u+%u/%u+%u"
+            fprintf(stderr, "%s: node %u differs: kind %u/%u marker %u/%u span %u+%u/%u+%u"
                     " parent %u/%u end %u/%u flags 0x%02x/0x%02x\n", label, i,
                     xa[i].kind, xb[i].kind, xa[i].marker, xb[i].marker, xa[i].span.offset,
                     xa[i].span.length, xb[i].span.offset, xb[i].span.length, xa[i].parent,
@@ -259,20 +259,20 @@ static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_As
         }
     }
     if (na != nb) {
-        fprintf(stderr, "%s: fast path: %u nodes, reference %u\n", label, na, nb);
+        fprintf(stderr, "%s: %u nodes, reference %u\n", label, na, nb);
         return 1;
     }
     ga = USFM_Ast_GetDiagnostics(a, &da);
     gb = USFM_Ast_GetDiagnostics(b, &db);
     for (i = 0; i < da && i < db; i++) {
         if (memcmp(&ga[i], &gb[i], sizeof ga[i]) != 0) {
-            fprintf(stderr, "%s: fast path: diagnostic %u differs: code %u/%u at %u/%u\n", label, i,
+            fprintf(stderr, "%s: diagnostic %u differs: code %u/%u at %u/%u\n", label, i,
                     ga[i].code, gb[i].code, ga[i].span.offset, gb[i].span.offset);
             return 1;
         }
     }
     if (da != db || USFM_Ast_GetDroppedDiagnosticCount(a) != USFM_Ast_GetDroppedDiagnosticCount(b)) {
-        fprintf(stderr, "%s: fast path: %u diagnostics (%u dropped), reference %u (%u dropped)\n",
+        fprintf(stderr, "%s: %u diagnostics (%u dropped), reference %u (%u dropped)\n",
                 label, da, USFM_Ast_GetDroppedDiagnosticCount(a), db,
                 USFM_Ast_GetDroppedDiagnosticCount(b));
         return 1;
@@ -285,7 +285,7 @@ static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_As
         (va && memcmp(wa, wb, va * sizeof *wa) != 0) ||
         USFM_Ast_GetVersion(a) != USFM_Ast_GetVersion(b) ||
         strcmp(USFM_Ast_GetBookCode(a), USFM_Ast_GetBookCode(b)) != 0) {
-        fprintf(stderr, "%s: fast path: chapter/verse tables, version or book code differ\n", label);
+        fprintf(stderr, "%s: chapter/verse tables, version or book code differ\n", label);
         return 1;
     }
     return 0;
@@ -297,12 +297,49 @@ static int check_fast_path(const char *input, uint32_t length, const USFM_Config
                            uint32_t flags, const char *label)
 {
     USFM_Err ea, eb;
-    USFM_Ast *a = usfm__parse_opts_impl(input, length, config, flags, NULL, &ea, 1);
-    USFM_Ast *b = usfm__parse_opts_impl(input, length, config, flags, NULL, &eb, 0);
-    int diff = check_same_parse(a, &ea, b, &eb, label);
+    USFM__ParseHooks generic;
+    USFM_Ast *a, *b;
+    int diff;
+    char fast_label[300];
+    memset(&generic, 0, sizeof generic);
+    a = usfm__parse_opts_impl(input, length, config, flags, NULL, &ea, NULL);
+    b = usfm__parse_opts_impl(input, length, config, flags, NULL, &eb, &generic);
+    snprintf(fast_label, sizeof fast_label, "%s (fast path)", label);
+    diff = check_same_parse(a, &ea, b, &eb, fast_label);
     USFM_Ast_Free(a);
     USFM_Ast_Free(b);
     return diff;
+}
+
+/* UTF-8 validation must not change anything: parses `input` with the
+ * reference validation (every run checked on its own) and with each of
+ * the `count` chunk sizes in `sizes` (0 is the default size), and
+ * compares each with the reference. Returns the number of sizes that
+ * differ. */
+static int check_utf8_chunk_sizes(const char *input, uint32_t length, const USFM_Config *config,
+                                  uint32_t flags, const uint32_t *sizes, uint32_t count,
+                                  const char *label)
+{
+    USFM_Err er, ec;
+    USFM__ParseHooks hooks;
+    USFM_Ast *ref, *ast;
+    uint32_t i;
+    int diffs = 0;
+    char sized[300];
+    memset(&hooks, 0, sizeof hooks);
+    hooks.fast = 1;
+    hooks.utf8_reference = 1;
+    ref = usfm__parse_opts_impl(input, length, config, flags, NULL, &er, &hooks);
+    hooks.utf8_reference = 0;
+    for (i = 0; i < count; i++) {
+        hooks.utf8_chunk = sizes[i];
+        ast = usfm__parse_opts_impl(input, length, config, flags, NULL, &ec, &hooks);
+        snprintf(sized, sizeof sized, "%s (UTF-8 chunk %u)", label, (unsigned)sizes[i]);
+        diffs += check_same_parse(ast, &ec, ref, &er, sized);
+        USFM_Ast_Free(ast);
+    }
+    USFM_Ast_Free(ref);
+    return diffs;
 }
 
 #endif

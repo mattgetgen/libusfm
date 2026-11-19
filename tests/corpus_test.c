@@ -203,6 +203,10 @@ int main(int argc, char **argv)
     uint64_t checksum = 0xcbf29ce484222325ull;
     unsigned long long scan_diffs = 0;
     unsigned long long fast_diffs = 0;   /* fast path vs reference parser */
+    unsigned long long utf8_diffs = 0;   /* chunked vs per-run UTF-8 checks */
+    /* The default chunk size, and a small odd one that cuts inside
+     * multi-byte characters. */
+    static const uint32_t utf8_chunks[2] = {0u, 61u};
     unsigned long long block_diffs = 0;
     DIR *d = opendir(dir);
     FILE *csv;
@@ -267,6 +271,8 @@ int main(int argc, char **argv)
                                            scan_compare(data, length, 1u, scan_diffs == 0) +
                                            scan_compare(data, length, 7u + (uint32_t)i, scan_diffs == 0));
         fast_diffs += (unsigned long long)check_fast_path(data, length, NULL, 0, names[i]);
+        utf8_diffs += (unsigned long long)check_utf8_chunk_sizes(data, length, NULL, 0, utf8_chunks,
+                                                                 2u, names[i]);
         ast = USFM_Ast_Parse(data, length, NULL, &err);
         if (ast == NULL || err.code != USFM_OK) {
             fprintf(stderr, "%s: parse failed: %s\n", names[i], err.msg);
@@ -341,8 +347,9 @@ int main(int argc, char **argv)
     printf("Scanner differences: %llu\n", scan_diffs);
     printf("Classifier differences: %llu\n", block_diffs);
     printf("Fast-path differences: %llu\n", fast_diffs);
+    printf("UTF-8 chunk differences: %llu\n", utf8_diffs);
     printf("AST checksum: %016llx\n", (unsigned long long)checksum);
-    if (scan_diffs != 0 || block_diffs != 0 || fast_diffs != 0) failures++;
+    if (scan_diffs != 0 || block_diffs != 0 || fast_diffs != 0 || utf8_diffs != 0) failures++;
     if (expected_path == NULL) {
         printf("Expected:   (no expected file, counts not compared)\n");
     } else if (have_expected && memcmp(&total, &expected, sizeof total) != 0) {

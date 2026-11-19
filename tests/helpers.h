@@ -14,8 +14,20 @@ static USFM_Ast *parse_with_version(const char *usfm, uint8_t version)
     return USFM_Ast_Parse(usfm, (uint32_t)strlen(usfm), &config, &err);
 }
 
-/* Every tree and diagnostics check also parses with the fast path off
- * and requires an identical result. */
+/* check_utf8_chunk_sizes at the unit-test sizes: tiny chunks (every cut
+ * lands inside a multi-byte sequence somewhere), one block and the
+ * default. */
+static int check_utf8_chunks(const char *input, uint32_t length, const USFM_Config *config,
+                             uint32_t flags, const char *label)
+{
+    static const uint32_t sizes[] = {1u, 2u, 3u, 4u, 7u, 64u, 65536u};
+    return check_utf8_chunk_sizes(input, length, config, flags, sizes,
+                                  (uint32_t)(sizeof sizes / sizeof sizes[0]), label);
+}
+
+/* Every tree and diagnostics check also parses with the fast path off,
+ * and with per-run UTF-8 checks and each chunk size, and requires
+ * identical results. */
 static void check_fast_equal_at(const char *file, int line, const char *usfm, uint8_t version)
 {
     USFM_Config config;
@@ -27,6 +39,11 @@ static void check_fast_equal_at(const char *file, int line, const char *usfm, ui
     if (check_fast_path(usfm, (uint32_t)strlen(usfm), &config, 0, label) != 0) {
         usfm_test_failures++;
         fprintf(stderr, "%s: fast path differs for: %s\n", label, usfm);
+    }
+    usfm_test_checks++;
+    if (check_utf8_chunks(usfm, (uint32_t)strlen(usfm), &config, 0, label) != 0) {
+        usfm_test_failures++;
+        fprintf(stderr, "%s: chunked UTF-8 validation differs for: %s\n", label, usfm);
     }
 }
 

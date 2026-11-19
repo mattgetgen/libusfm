@@ -2297,6 +2297,10 @@ typedef struct USFM_Parser {
     uint8_t          fast;              /* use the character-span fast path
                                            (0 only in tests, as the reference) */
     uint8_t          reserved[1];
+#if defined(USFM_TEST_SCAN_REFERENCE)
+    uint8_t          utf8_reference;    /* test-only hooks: see */
+    uint32_t         utf8_chunk;        /* USFM__ParseHooks */
+#endif
     uint32_t         depth;
     uint32_t         last_end;          /* end of the last token placed */
     uint32_t         text_node;         /* last TEXT node made from a TEXT
@@ -2306,6 +2310,14 @@ typedef struct USFM_Parser {
     USFM_CloserTable closers[2];        /* [in_note]: see usfm__closer_ahead */
     USFM_Frame       stack[USFM_STACK_DEPTH];
 } USFM_Parser;
+
+/* Nonzero when a test asked for the reference UTF-8 validation (every
+ * run checked on its own); always 0 outside the tests. */
+#if defined(USFM_TEST_SCAN_REFERENCE)
+#define USFM__UTF8_REFERENCE(p) ((p)->utf8_reference != 0)
+#else
+#define USFM__UTF8_REFERENCE(p) 0
+#endif
 
 static uint8_t usfm__top_kind(const USFM_Parser *p)
 {
@@ -3965,11 +3977,25 @@ static void usfm__finish(USFM_Parser *p)
 /* Cap on the initial node-array estimate (1 << 20 nodes = 20 MiB). */
 #define USFM__NODE_ESTIMATE_MAX (1u << 20)
 
-/* USFM_Ast_ParseOpts with the character-span fast path on or off. Off
- * is the reference the tests compare the fast path with. */
+/* Internal parse options: the seams the tests drive. USFM_Ast_ParseOpts
+ * passes NULL, meaning all defaults. */
+typedef struct USFM__ParseHooks {
+    uint8_t  fast;              /* character-span fast path; 0 is the
+                                   reference the tests compare it with */
+#if defined(USFM_TEST_SCAN_REFERENCE)
+    uint8_t  utf8_reference;    /* check every TEXT, ARGUMENT and ATTRIBUTES
+                                   run on its own, with no whole-input or
+                                   chunk validation: the reference UTF-8
+                                   validation is compared with */
+    uint32_t utf8_chunk;        /* UTF-8 validation chunk size in bytes;
+                                   0 means the default */
+#endif
+} USFM__ParseHooks;
+
 static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
                                        const USFM_Config *config, uint32_t flags,
-                                       const USFM_Alc *alc_in, USFM_Err *err, int fast)
+                                       const USFM_Alc *alc_in, USFM_Err *err,
+                                       const USFM__ParseHooks *hooks)
 {
     const USFM_Alc *alc = usfm__alc_or_default(alc_in);
     USFM_Ast *ast;
@@ -4040,19 +4066,29 @@ static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
     memset(&p, 0, sizeof p);
     p.ast = ast;
     p.version_auto = version == USFM_VERSION_AUTO;
-    p.fast = (uint8_t)(fast != 0);
+    p.fast = (uint8_t)(hooks == NULL || hooks->fast != 0);
     p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
+#if defined(USFM_TEST_SCAN_REFERENCE)
+    if (hooks != NULL) {
+        p.utf8_reference = hooks->utf8_reference;
+        p.utf8_chunk = hooks->utf8_chunk;
+    }
+#endif
 #if USFM__UTF8_SIMD
     /* Valid as a whole means every run is valid: bytes outside runs are
      * ASCII (or the UTF-8 BOM) and no sequence contains an ASCII byte. So
      * one SIMD pass replaces the per-run checks; on invalid input every
      * run is still checked, and diagnostics match the scalar build. */
-    if (p.check_utf8 && usfm__utf8_valid_simd(text, input_length)) p.check_utf8 = 0;
+    if (p.check_utf8 && !USFM__UTF8_REFERENCE(&p) && usfm__utf8_valid_simd(text, input_length)) {
+        p.check_utf8 = 0;
+    }
 #else
     /* The same whole-input pass with the scalar validator: one long loop
      * instead of one short loop per run, whose trip counts (run length,
      * 8-byte words, tail bytes) mispredict. */
-    if (p.check_utf8 && usfm__utf8_valid_input(text, input_length)) p.check_utf8 = 0;
+    if (p.check_utf8 && !USFM__UTF8_REFERENCE(&p) && usfm__utf8_valid_input(text, input_length)) {
+        p.check_utf8 = 0;
+    }
 #endif
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
     p.text_node = USFM_NIL;
@@ -4080,7 +4116,7 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
                                       const USFM_Config *config, uint32_t flags,
                                       const USFM_Alc *alc_in, USFM_Err *err)
 {
-    return usfm__parse_opts_impl(input, input_length, config, flags, alc_in, err, 1);
+    return usfm__parse_opts_impl(input, input_length, config, flags, alc_in, err, NULL);
 }
 
 USFM_API USFM_Ast *USFM_Ast_Parse(const char *input, uint32_t input_length,

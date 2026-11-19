@@ -1,6 +1,7 @@
 /* libFuzzer harness. Input layout: byte 0 picks the USFM version
- * (% 5), byte 1 picks flags: bit 0 = COPY_INPUT, bit 7 = fail the
- * allocator after (byte1 & 0x3F) calls. The rest is the USFM text.
+ * (% 5) and the UTF-8 validation chunk size (/ 5, 0 = default), byte 1
+ * picks flags: bit 0 = COPY_INPUT, bit 7 = fail the allocator after
+ * (byte1 & 0x3F) calls. The rest is the USFM text.
  *
  * Every parse must either return NULL with USFM_ERR_NOMEM (and have
  * freed everything), or return a tree whose invariants hold. Any
@@ -120,14 +121,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         USFM_Alc ref_alc = alc;
         USFM_Err ref_err;
         USFM_Ast *ref;
+        USFM__ParseHooks generic;
         ref_state.live_bytes = 0;
         ref_state.calls_left = (data[1] & 0x80) ? (uint32_t)(data[1] & 0x3F) : UINT32_MAX;
         ref_alc.ctx = &ref_state;
+        memset(&generic, 0, sizeof generic);
         ref = usfm__parse_opts_impl((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
-                                    &ref_alc, &ref_err, 0);
-        if (check_same_parse(ast, &err, ref, &ref_err, "fuzz") != 0) abort();
+                                    &ref_alc, &ref_err, &generic);
+        if (check_same_parse(ast, &err, ref, &ref_err, "fuzz (fast path)") != 0) abort();
         USFM_Ast_Free(ref);
         if (ref_state.live_bytes != 0) abort();
+    }
+    {
+        /* Chunked UTF-8 validation must match the always-per-run
+         * reference; byte 0 / 5 picks the chunk size (0 is the default). */
+        uint32_t chunk = (uint32_t)(data[0] / 5u);
+        if (check_utf8_chunk_sizes((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
+                                   &chunk, 1u, "fuzz") != 0) abort();
     }
     if (ast == NULL) {
         if (state.live_bytes != 0) abort();
