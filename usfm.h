@@ -2715,7 +2715,7 @@ static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marke
 
 /* Appends a node as a child of the top frame. Returns its index, or
  * USFM_NIL (and sets p->failed) if the node array can't grow. */
-static uint32_t usfm__append(USFM_Parser *p, uint8_t kind, USFM_Span span,
+USFM__INLINE uint32_t usfm__append(USFM_Parser *p, uint8_t kind, USFM_Span span,
                              USFM_Marker marker, uint8_t level_flags)
 {
     USFM_Ast *ast = p->ast;
