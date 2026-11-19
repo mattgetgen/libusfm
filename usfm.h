@@ -3428,15 +3428,14 @@ USFM__INLINE int usfm__same_bytes(const char *a, const char *b, uint32_t n)
     return 1;
 }
 
-/* Opens a character span for marker token t, as the main loop does:
- * an implied paragraph if needed, then (for a plain marker) the
- * implicit close of outer spans whose end marker isn't ahead. Returns
- * the new node, or USFM_NIL if the stack is full (the marker becomes
- * text) or memory ran out.
- * A plain (non-\+) character marker inside open character spans closes
- * them, innermost first, until one whose end marker is still ahead
- * (usfm__closer_ahead); it nests inside that one. Note parts are never
- * closed here. Bounded by the stack depth. */
+/* Opens a character span for marker token t, as usfm__on_char does
+ * before its fast path. First an implied paragraph if inline content
+ * isn't allowed here. Then, for a plain (non-\+) marker, the open
+ * character spans are closed, innermost first, until one whose end
+ * marker is still ahead (usfm__closer_ahead), and the new span nests
+ * inside that one; note parts are never closed here. Returns the new
+ * node, or USFM_NIL if the stack is full (the marker becomes text) or
+ * memory ran out (p->failed). Bounded by the stack depth. */
 static uint32_t usfm__char_open(USFM_Parser *p, const USFM_ScanToken *t)
 {
     usfm__ensure_inline(p, t->tok.span.offset);
@@ -3455,21 +3454,31 @@ static uint32_t usfm__char_open(USFM_Parser *p, const USFM_ScanToken *t)
 }
 
 /* Character-span fast path (docs/superpowers/specs/
- * 2026-11-18-merged-parser-loop-design.md). Right after a character span
+ * 2026-11-18-merged-parser-loop-design.md and
+ * 2026-11-19-step-b1-char-open-design.md). Right after a character span
  * opens, reads its text, attributes and own closer, then any text after
  * the closer, without going round the main loop: no token struct is
  * handed over, no push-back check, no dispatch. Each token is scanned by
  * the scanner's own helpers and handled exactly as the generic handler
  * would handle it for the same top frame, so the tree, diagnostics and
- * parser state are identical. Anything else is left to the main loop; a
- * marker already scanned is handed over through the push-back slot.
- * Bounded: each pass consumes input or returns. */
+ * parser state are identical.
+ *
+ * At a marker: the span's own closer closes it (while it is still open);
+ * a character-role opener is opened with usfm__char_open, as
+ * usfm__on_char would, and its span becomes the one being read. Any
+ * other marker is handed to the main loop through the push-back slot,
+ * as the token the main loop's own scan would have produced. A `//` is
+ * left to the main loop unscanned. Bounded: each pass consumes input or
+ * returns. */
 static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t open_length)
 {
     USFM_Scanner *s = &p->scan;
     const char *in = s->input;
     uint32_t len = s->length;
     USFM_ScanToken t;
+    /* The span being read: its opening marker's bytes ("\\", an optional
+     * "+", the name), and whether it has been closed. */
+    uint32_t cur_offset = open_offset, cur_length = open_length;
     int closed = 0;
     for (;;) {
         uint32_t pos = s->position, node;
@@ -3478,14 +3487,16 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
         USFM_ASSERT(s->expect_arg == USFM_ARG_NONE && !p->has_peeked);
         USFM_ASSERT(closed || top == USFM_AST_CHAR);
         if (in[pos] == '\\' && !usfm__is_escape(in, len, pos)) {
-            if (closed) return;         /* the next marker: the main loop's */
             /* The usual closer repeats the opening marker byte for byte
              * ("\\+w" ... "\\+w*"); it then classifies exactly as the
              * opening marker did, so it matches the top frame. Any other
-             * spelling goes through the scanner and usfm__frame_matches. */
-            if (len - pos > open_length &&
-                usfm__same_bytes(in + pos, in + open_offset, open_length) && in[pos + open_length] == '*') {
-                uint32_t end = pos + open_length + 1u;
+             * spelling goes through the scanner and usfm__frame_matches.
+             * Only while the span is open is the top frame the span
+             * whose bytes are kept. */
+            if (!closed && len - pos > cur_length &&
+                usfm__same_bytes(in + pos, in + cur_offset, cur_length) &&
+                in[pos + cur_length] == '*') {
+                uint32_t end = pos + cur_length + 1u;
                 s->position = end;
                 closed = 1;
                 if (!usfm__fast_close(p, end)) return;
@@ -3493,14 +3504,30 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
                 continue;
             }
             usfm__scan_marker(s, &t);
-            if (t.tok.kind == USFM_TOK_MARKER_END && t.name_length != 0 &&
+            if (!closed && t.tok.kind == USFM_TOK_MARKER_END && t.name_length != 0 &&
                 usfm__frame_matches(p, &p->stack[p->depth - 1], &t)) {
                 closed = 1;
                 if (!usfm__fast_close(p, usfm__tok_end(&t))) return;
                 USFM_ASSERT(s->position > pos);
                 continue;
             }
-            usfm__push_back(p, &t);
+            if (t.tok.kind == USFM_TOK_MARKER && t.row != USFM_ROW_NONE &&
+                !(USFM_FLAGS(t.tok.level_flags) & (USFM_TF_MILESTONE_START | USFM_TF_MILESTONE_END)) &&
+                USFM_MarkerRows[t.row].role == USFM_ROLE_CHAR) {
+                /* A character opener: usfm__on_marker would call
+                 * usfm__on_char. Open it the same way and read the new
+                 * span here. No CHAR row takes an argument, and the open
+                 * never pushes a token back (usfm__closer_ahead scans a
+                 * copy of the scanner), so the loop's asserts still hold. */
+                USFM_ASSERT(s->expect_arg == USFM_ARG_NONE);
+                if (usfm__char_open(p, &t) == USFM_NIL) return;
+                cur_offset = t.tok.span.offset;
+                cur_length = t.name_offset + t.name_length - t.tok.span.offset;
+                closed = 0;
+                USFM_ASSERT(s->position > pos);
+                continue;
+            }
+            usfm__push_back(p, &t);     /* the main loop's next token */
             return;
         }
         /* The top frame is PARA, CELL, NOTE or CHAR here; this is the value
