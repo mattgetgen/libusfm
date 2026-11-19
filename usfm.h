@@ -3402,6 +3402,19 @@ static int usfm__closer_ahead(USFM_Parser *p, USFM_Marker marker, uint32_t name_
     return found && last >= pos;
 }
 
+/* Closes the top frame, a character span whose end marker ends at
+ * `end`, as usfm__on_close does. Returns 1 if the fast path may go on:
+ * the new top frame is PARA, CELL, NOTE or CHAR. */
+USFM__INLINE int usfm__fast_close(USFM_Parser *p, uint32_t end)
+{
+    uint8_t top;
+    if (end > p->last_end) p->last_end = end;
+    usfm__close_top(p);
+    top = usfm__top_kind(p);
+    return top == USFM_AST_PARA || top == USFM_AST_CELL || top == USFM_AST_NOTE ||
+           top == USFM_AST_CHAR;
+}
+
 /* Character-span fast path (docs/superpowers/specs/
  * 2026-11-18-merged-parser-loop-design.md). Right after a character span
  * opens, reads its text, attributes and own closer, then any text after
@@ -3424,6 +3437,7 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
         uint8_t top = usfm__top_kind(p);
         if (p->failed || pos >= len) return;
         USFM_ASSERT(s->expect_arg == USFM_ARG_NONE && !p->has_peeked);
+        USFM_ASSERT(closed || top == USFM_AST_CHAR);
         if (in[pos] == '\\' && !usfm__is_escape(in, len, pos)) {
             if (closed) return;         /* the next marker: the main loop's */
             /* The usual closer repeats the opening marker byte for byte
@@ -3434,24 +3448,17 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
                 memcmp(in + pos, in + open_offset, open_length) == 0 && in[pos + open_length] == '*') {
                 uint32_t end = pos + open_length + 1u;
                 s->position = end;
-                if (end > p->last_end) p->last_end = end;
-                usfm__close_top(p);
                 closed = 1;
-                top = usfm__top_kind(p);
-                if (top != USFM_AST_PARA && top != USFM_AST_CELL && top != USFM_AST_NOTE &&
-                    top != USFM_AST_CHAR) return;
+                if (!usfm__fast_close(p, end)) return;
+                USFM_ASSERT(s->position > pos);
                 continue;
             }
             usfm__scan_marker(s, &t);
             if (t.tok.kind == USFM_TOK_MARKER_END && t.name_length != 0 &&
                 usfm__frame_matches(p, &p->stack[p->depth - 1], &t)) {
-                uint32_t end = usfm__tok_end(&t);   /* as usfm__on_close */
-                if (end > p->last_end) p->last_end = end;
-                usfm__close_top(p);
                 closed = 1;
-                top = usfm__top_kind(p);
-                if (top != USFM_AST_PARA && top != USFM_AST_CELL && top != USFM_AST_NOTE &&
-                    top != USFM_AST_CHAR) return;
+                if (!usfm__fast_close(p, usfm__tok_end(&t))) return;
+                USFM_ASSERT(s->position > pos);
                 continue;
             }
             usfm__push_back(p, &t);
@@ -3465,6 +3472,7 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
             if (p->check_utf8) usfm__check_utf8(p, &t);
             usfm__append(p, USFM_AST_ATTRIBUTES, t.tok.span, USFM_M_NONE,
                          (uint8_t)(t.tok.level_flags & USFM_TF_INVALID_UTF8));
+            USFM_ASSERT(s->position > pos);
             continue;
         }
         if (in[pos] == '/' && pos + 1 < len && in[pos + 1] == '/') return;
@@ -3480,6 +3488,7 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
             p->text_offset = t.tok.span.offset;
             p->text_first_loose = t.first_loose;
         }
+        USFM_ASSERT(s->position > pos);
     }
 }
 
