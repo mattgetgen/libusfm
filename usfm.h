@@ -2136,7 +2136,9 @@ typedef struct USFM_Parser {
                                            by \id and \periph */
     uint8_t          check_utf8;        /* validate TEXT, ARGUMENT and
                                            ATTRIBUTES runs */
-    uint8_t          reserved[2];
+    uint8_t          fast;              /* use the character-span fast path
+                                           (0 only in tests, as the reference) */
+    uint8_t          reserved[1];
     uint32_t         depth;
     uint32_t         last_end;          /* end of the last token placed */
     uint32_t         text_node;         /* last TEXT node made from a TEXT
@@ -3672,9 +3674,11 @@ static void usfm__finish(USFM_Parser *p)
 /* Cap on the initial node-array estimate (1 << 20 nodes = 20 MiB). */
 #define USFM__NODE_ESTIMATE_MAX (1u << 20)
 
-USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
-                                      const USFM_Config *config, uint32_t flags,
-                                      const USFM_Alc *alc_in, USFM_Err *err)
+/* USFM_Ast_ParseOpts with the character-span fast path on or off. Off
+ * is the reference the tests compare the fast path with. */
+static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
+                                       const USFM_Config *config, uint32_t flags,
+                                       const USFM_Alc *alc_in, USFM_Err *err, int fast)
 {
     const USFM_Alc *alc = usfm__alc_or_default(alc_in);
     USFM_Ast *ast;
@@ -3745,6 +3749,7 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     memset(&p, 0, sizeof p);
     p.ast = ast;
     p.version_auto = version == USFM_VERSION_AUTO;
+    p.fast = (uint8_t)(fast != 0);
     p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
 #if USFM__UTF8_SIMD
     /* Valid as a whole means every run is valid: bytes outside runs are
@@ -3773,6 +3778,13 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
         usfm__set_err(err, USFM_ERR_NOMEM, ast->first_dropped_offset);
     }
     return ast;
+}
+
+USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
+                                      const USFM_Config *config, uint32_t flags,
+                                      const USFM_Alc *alc_in, USFM_Err *err)
+{
+    return usfm__parse_opts_impl(input, input_length, config, flags, alc_in, err, 1);
 }
 
 USFM_API USFM_Ast *USFM_Ast_Parse(const char *input, uint32_t input_length,
