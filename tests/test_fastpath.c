@@ -44,6 +44,9 @@ static void test_fastpath_stops(void)
     /* After the closer the top frame can be a figure or a header: in a
      * figure '|' starts attributes, so the fast path must hand back. */
     CHECK_FAST("\\p \\fig A \\w b\\w*|src=\"x.jpg\" size=\"col\"\\fig* c\n");
+    /* The same through the scanned-closer branch: "\\w*" does not repeat
+     * the opening bytes "\\+w". */
+    CHECK_FAST("\\p \\fig A \\+w b\\w*|src=\"x.jpg\" size=\"col\"\\fig* c\n");
     CHECK_FAST("\\id GEN\n\\h Gen \\w b\\w* c\n\\c 1\n");
 }
 

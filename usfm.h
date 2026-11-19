@@ -3402,6 +3402,87 @@ static int usfm__closer_ahead(USFM_Parser *p, USFM_Marker marker, uint32_t name_
     return found && last >= pos;
 }
 
+/* Character-span fast path (docs/superpowers/specs/
+ * 2026-11-18-merged-parser-loop-design.md). Right after a character span
+ * opens, reads its text, attributes and own closer, then any text after
+ * the closer, without going round the main loop: no token struct is
+ * handed over, no push-back check, no dispatch. Each token is scanned by
+ * the scanner's own helpers and handled exactly as the generic handler
+ * would handle it for the same top frame, so the tree, diagnostics and
+ * parser state are identical. Anything else is left to the main loop; a
+ * marker already scanned is handed over through the push-back slot.
+ * Bounded: each pass consumes input or returns. */
+static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t open_length)
+{
+    USFM_Scanner *s = &p->scan;
+    const char *in = s->input;
+    uint32_t len = s->length;
+    USFM_ScanToken t;
+    int closed = 0;
+    for (;;) {
+        uint32_t pos = s->position, node;
+        uint8_t top = usfm__top_kind(p);
+        if (p->failed || pos >= len) return;
+        USFM_ASSERT(s->expect_arg == USFM_ARG_NONE && !p->has_peeked);
+        if (in[pos] == '\\' && !usfm__is_escape(in, len, pos)) {
+            if (closed) return;         /* the next marker: the main loop's */
+            /* The usual closer repeats the opening marker byte for byte
+             * ("\\+w" ... "\\+w*"); it then classifies exactly as the
+             * opening marker did, so it matches the top frame. Any other
+             * spelling goes through the scanner and usfm__frame_matches. */
+            if (len - pos > open_length &&
+                memcmp(in + pos, in + open_offset, open_length) == 0 && in[pos + open_length] == '*') {
+                uint32_t end = pos + open_length + 1u;
+                s->position = end;
+                if (end > p->last_end) p->last_end = end;
+                usfm__close_top(p);
+                closed = 1;
+                top = usfm__top_kind(p);
+                if (top != USFM_AST_PARA && top != USFM_AST_CELL && top != USFM_AST_NOTE &&
+                    top != USFM_AST_CHAR) return;
+                continue;
+            }
+            usfm__scan_marker(s, &t);
+            if (t.tok.kind == USFM_TOK_MARKER_END && t.name_length != 0 &&
+                usfm__frame_matches(p, &p->stack[p->depth - 1], &t)) {
+                uint32_t end = usfm__tok_end(&t);   /* as usfm__on_close */
+                if (end > p->last_end) p->last_end = end;
+                usfm__close_top(p);
+                closed = 1;
+                top = usfm__top_kind(p);
+                if (top != USFM_AST_PARA && top != USFM_AST_CELL && top != USFM_AST_NOTE &&
+                    top != USFM_AST_CHAR) return;
+                continue;
+            }
+            usfm__push_back(p, &t);
+            return;
+        }
+        /* The top frame is PARA, CELL, NOTE or CHAR here; this is the value
+         * usfm__next computes for those. */
+        s->pipe_is_attr = (uint8_t)(top == USFM_AST_CHAR);
+        if (in[pos] == '|' && s->pipe_is_attr) {
+            usfm__scan_attributes(s, &t, USFM__USE_BLOCKS);
+            if (p->check_utf8) usfm__check_utf8(p, &t);
+            usfm__append(p, USFM_AST_ATTRIBUTES, t.tok.span, USFM_M_NONE,
+                         (uint8_t)(t.tok.level_flags & USFM_TF_INVALID_UTF8));
+            continue;
+        }
+        if (in[pos] == '/' && pos + 1 < len && in[pos + 1] == '/') return;
+        usfm__scan_text(s, &t, USFM__USE_BLOCKS);
+        if (p->check_utf8) usfm__check_utf8(p, &t);
+        /* usfm__on_text for a PARA, CELL, NOTE or CHAR top frame: no blank
+         * skip, and no implied paragraph. */
+        node = usfm__append(p, USFM_AST_TEXT, t.tok.span, USFM_M_NONE,
+                            (uint8_t)(t.tok.level_flags &
+                                      (USFM_TEXT_FLAGS_COOK | USFM_TF_INVALID_UTF8)));
+        if (node != USFM_NIL) {
+            p->text_node = node;
+            p->text_offset = t.tok.span.offset;
+            p->text_first_loose = t.first_loose;
+        }
+    }
+}
+
 /* A plain (non-\+) character marker inside open character spans closes
  * them, innermost first, until one whose end marker is still ahead
  * (usfm__closer_ahead); it nests inside that one. Note parts are never
@@ -3420,7 +3501,12 @@ static void usfm__on_char(USFM_Parser *p, const USFM_ScanToken *t)
             usfm__close_implicit(p);
         }
     }
-    usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0);
+    if (usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0) != USFM_NIL && p->fast &&
+        !p->has_peeked) {
+        /* The opening marker's bytes: "\\", an optional "+", the name. */
+        usfm__char_body_fast(p, t->tok.span.offset,
+                             t->name_offset + t->name_length - t->tok.span.offset);
+    }
 }
 
 static void usfm__on_attributes(USFM_Parser *p, const USFM_ScanToken *t)
