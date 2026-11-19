@@ -3428,6 +3428,32 @@ USFM__INLINE int usfm__same_bytes(const char *a, const char *b, uint32_t n)
     return 1;
 }
 
+/* Opens a character span for marker token t, as the main loop does:
+ * an implied paragraph if needed, then (for a plain marker) the
+ * implicit close of outer spans whose end marker isn't ahead. Returns
+ * the new node, or USFM_NIL if the stack is full (the marker becomes
+ * text) or memory ran out.
+ * A plain (non-\+) character marker inside open character spans closes
+ * them, innermost first, until one whose end marker is still ahead
+ * (usfm__closer_ahead); it nests inside that one. Note parts are never
+ * closed here. Bounded by the stack depth. */
+static uint32_t usfm__char_open(USFM_Parser *p, const USFM_ScanToken *t)
+{
+    usfm__ensure_inline(p, t->tok.span.offset);
+    if (!(t->tok.level_flags & USFM_TF_NESTED)) {
+        while (p->depth > 1) {
+            const USFM_Frame *top = &p->stack[p->depth - 1];
+            const USFM_Node *outer = &p->ast->nodes[top->node];
+            uint32_t offset = 0, length = 0;
+            if (top->kind != USFM_AST_CHAR || (top->flags & USFM_FRAME_NOTE_PART)) break;
+            if (outer->marker == USFM_M_UNKNOWN) usfm__node_name(p, top->node, &offset, &length);
+            if (usfm__closer_ahead(p, outer->marker, offset, length)) break;
+            usfm__close_implicit(p);
+        }
+    }
+    return usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0);
+}
+
 /* Character-span fast path (docs/superpowers/specs/
  * 2026-11-18-merged-parser-loop-design.md). Right after a character span
  * opens, reads its text, attributes and own closer, then any text after
@@ -3505,26 +3531,9 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
     }
 }
 
-/* A plain (non-\+) character marker inside open character spans closes
- * them, innermost first, until one whose end marker is still ahead
- * (usfm__closer_ahead); it nests inside that one. Note parts are never
- * closed here. Bounded by the stack depth. */
 static void usfm__on_char(USFM_Parser *p, const USFM_ScanToken *t)
 {
-    usfm__ensure_inline(p, t->tok.span.offset);
-    if (!(t->tok.level_flags & USFM_TF_NESTED)) {
-        while (p->depth > 1) {
-            const USFM_Frame *top = &p->stack[p->depth - 1];
-            const USFM_Node *outer = &p->ast->nodes[top->node];
-            uint32_t offset = 0, length = 0;
-            if (top->kind != USFM_AST_CHAR || (top->flags & USFM_FRAME_NOTE_PART)) break;
-            if (outer->marker == USFM_M_UNKNOWN) usfm__node_name(p, top->node, &offset, &length);
-            if (usfm__closer_ahead(p, outer->marker, offset, length)) break;
-            usfm__close_implicit(p);
-        }
-    }
-    if (usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0) != USFM_NIL && p->fast &&
-        !p->has_peeked) {
+    if (usfm__char_open(p, t) != USFM_NIL && p->fast && !p->has_peeked) {
         /* The opening marker's bytes: "\\", an optional "+", the name. */
         usfm__char_body_fast(p, t->tok.span.offset,
                              t->name_offset + t->name_length - t->tok.span.offset);
