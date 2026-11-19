@@ -1,6 +1,6 @@
 # libusfm roadmap
 
-Updated 2026-11-18. Each phase depends on the ones before it. Version
+Updated 2026-11-19. Each phase depends on the ones before it. Version
 numbers follow the project's rule: a release that adds or changes API is
 a minor version, and one that only changes speed or internals is a patch.
 
@@ -68,14 +68,21 @@ usfm-grammar, tree-sitter-usfm3 and the `usfm` crate:
   paused. Every writer below relies on it.
 
 ### Phase 1: fastest out of the box (0.1.x, no API change)
-1. **A merged parser loop.**
-   - **What changes:** the parser reads the input directly, with no token
-     struct, no push-back, and one dispatch on the marker's role. A fast
-     path handles character span, text, attributes and closer.
-   - **Safety:** the current scanner stays as the reference, and a
-     differential test checks that the tree is byte-identical.
-   - **Expected gain:** 20-40% on word-tagged text. It starts as a
-     prototype measured before the full change.
+1. **A merged parser loop: done as a fast path (2026-11-19).**
+   - **What was built (step A):** a character-span fast path. Right after a
+     span opens, it reads the span's text, attributes and closer, and the
+     text after it, without going back through the main loop.
+   - **Gain:** −23% cycles with AVX2 and −14% to −19% with scalar on
+     word-tagged text (WEB-STRONGS, GRC-BYZ). Every corpus is within 1%
+     of its old speed or faster.
+   - **Safety:** the generic loop stays as the reference. A differential
+     test checks every unit test, corpus file and fuzz input for a
+     byte-identical result.
+   - **The full merge isn't worth doing.** That means no token struct, no
+     push-back, and one dispatch everywhere. Step B.1 was measured and
+     reverted. The remaining round trip is about 5.5% of instructions.
+   - **Details:** `docs/superpowers/specs/2026-11-18-merged-parser-loop-design.md`
+     and `2026-11-19-step-b1-char-open-design.md`.
 2. **Choosing the SIMD path at runtime.**
    - **What changes:** one build contains several instruction-set versions
      and detects the CPU, as usfm3 gets through `memchr`. A default
@@ -132,6 +139,9 @@ usfm-grammar, tree-sitter-usfm3 and the `usfm` crate:
   with one method: same pinning, passes and warm-ups, power profile on
   "performance".
 - **Performance work outside the plan above:**
-  - the SIMD structural index (simdjson stage 1), which would follow the
-    merged loop;
+  - the cost of each marker. After step A, WEB-STRONGS spends about 159
+    instructions finding and recognising each marker (15.7% of the
+    total). Opening a span costs about 144 more. Start by finding the 35
+    instructions per marker scan that have no source-line information;
+  - the SIMD structural index (simdjson stage 1);
   - arena allocators.

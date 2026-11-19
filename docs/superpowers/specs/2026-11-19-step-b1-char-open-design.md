@@ -3,6 +3,11 @@
 Date: 2026-11-19. Branch: `feat/simd` (0.1.1). No API change.
 Follows `2026-11-18-merged-parser-loop-design.md` (step A and its results).
 
+**Status: measured, then reverted (8dd25ae).** B.1 failed its keep
+criteria; see "Outcome" at the end. The parser is back to step A plus
+its follow-ups. The B.1 test cases stay, because they also exercise step
+A's fast path.
+
 ## Why
 
 Step A's results (10–25% band) say B starts by moving the marker open onto
@@ -299,7 +304,9 @@ they come from in the source.
   Corpus marker counts: `\w` 640k, `\+w` 38k, `\v` 38k, `\q#` 23k,
   `\p` 9k, `\wj` 2.3k, notes 1.9k. All have matching closers.
 
-### Recommendation
+### Recommendation at the time of measuring
+
+Superseded by "Outcome" below.
 
 **Keep B.1 anyway, with the miss recorded. Don't try to tune it to the
 bar.**
@@ -330,3 +337,32 @@ open, not `\v` or paragraph markers.**
   round trip and that of the `\w` after it. At ~36–110 instructions
   each, that is about 38k × 2 tokens, roughly 0.5–1%.
 - **Paragraph markers** are smaller still (35k tokens).
+
+## Outcome (2026-11-19)
+
+**Reverted.** `8dd25ae` reverts `fbb419d` (the change) and `f5eeb0d` (the
+`usfm__on_char` split). `usfm.h` is identical to `303a8e0`.
+
+**Why:**
+- **It missed both keep criteria.** AVX2 gained 1.5–1.6% on the target
+  corpora against a 3% bar. Scalar CMN-CUV was 1.6–1.8% slower, against a
+  1% limit.
+- **It added a second way to open a span,** with an invariant the tests
+  can't guard. Dropping `closed = 0` changes no output, only speed.
+- **The "structure for later B steps" argument doesn't hold.** No later B
+  step is worth doing: the whole remaining main-loop round trip is about
+  5.5% of WEB-STRONGS's instructions, the most a full merge could remove.
+
+**Kept:** the test cases from `c5e7d88`. They are valid step A cases (runs
+of spans, a marker right after a closer, implicit closes, the depth
+limit), and they pass on step A.
+
+**What this means for the merged loop:** step A delivered the merged
+loop's value: −23% (AVX2) and −14% to −19% (scalar) on word-tagged text.
+The hand-off between scanner and parser was expensive inside character
+spans, which step A covers. Elsewhere it is small. Step B is closed.
+
+**Where the remaining cost is** (the profile above): finding and
+recognising a marker, 159 instructions per marker, and opening a span,
+about 144. A fully merged loop would pay both. They are per-marker costs,
+not loop structure, so they belong to separate work. See the roadmap.

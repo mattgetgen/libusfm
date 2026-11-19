@@ -352,3 +352,11 @@ After both, against `86dd228` (cycles; instructions):
   it again.
 - About 1% more instructions on the small AVX2 corpora (the per-open
   fast-path check) remains. It no longer shows up in cycles.
+
+### Step B outcome (2026-11-19)
+
+- **B.1 was measured and reverted.** B.1 opened character markers inside
+  the fast path. See `2026-11-19-step-b1-char-open-design.md`.
+- **The main loop has little left to remove.** After step A, the whole
+  main-loop round trip is about 5.5% of WEB-STRONGS's instructions.
+- **Step B is closed.** Step A is the merged loop's result.
