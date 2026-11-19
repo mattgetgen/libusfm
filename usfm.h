@@ -2637,6 +2637,31 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 #else
 #  define USFM__UTF8_SIMD 0
 #  define USFM__UTF8_SIMD_PATH "none"
+/* usfm__utf8_valid for a whole input (the scalar build's one pass):
+ * the ASCII skip tests 32 bytes at a time. In CJK or Arabic text the
+ * short ASCII markup between runs then rarely fills a whole step, so the
+ * test stays predictable; mostly-ASCII text still skips. */
+static int usfm__utf8_valid_input(const char *s, uint32_t n)
+{
+    const uint8_t *u = (const uint8_t *)s;
+    uint32_t i = 0, k;
+    uint64_t st = 0;
+    while (n - i >= 32u) {              /* bounded: i grows by 32 */
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, u + i, 8);
+        memcpy(&w1, u + i + 8u, 8);
+        memcpy(&w2, u + i + 16u, 8);
+        memcpy(&w3, u + i + 24u, 8);
+        if (st == 0 && ((w0 | w1 | w2 | w3) & 0x8080808080808080ull) == 0) {
+            i += 32u;
+            continue;
+        }
+        for (k = 0; k < 32u; k++) st = (USFM_Utf8Dfa[u[i + k]] >> st) & 63u;   /* bounded: 32 */
+        i += 32u;
+    }
+    while (i < n) st = (USFM_Utf8Dfa[u[i++]] >> st) & 63u;   /* bounded: i grows */
+    return st == 0;
+}
 #endif
 
 static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marker marker);
@@ -3865,6 +3890,11 @@ static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
      * one SIMD pass replaces the per-run checks; on invalid input every
      * run is still checked, and diagnostics match the scalar build. */
     if (p.check_utf8 && usfm__utf8_valid_simd(text, input_length)) p.check_utf8 = 0;
+#else
+    /* The same whole-input pass with the scalar validator: one long loop
+     * instead of one short loop per run, whose trip counts (run length,
+     * 8-byte words, tail bytes) mispredict. */
+    if (p.check_utf8 && usfm__utf8_valid_input(text, input_length)) p.check_utf8 = 0;
 #endif
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
     p.text_node = USFM_NIL;

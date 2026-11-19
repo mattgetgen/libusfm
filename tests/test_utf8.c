@@ -133,7 +133,11 @@ static void test_utf8_validator_encoded(void)
     }
 }
 
-#if USFM__UTF8_SIMD
+#if !USFM__UTF8_SIMD
+/* Without SIMD the whole-input pass is the 32-byte-step scalar validator:
+ * the same tests hold for it. */
+#  define usfm__utf8_valid_simd usfm__utf8_valid_input
+#endif
 /* usfm__utf8_valid_simd against the scalar DFA; reports bytes, capped. */
 static void check_simd_matches(const unsigned char *s, uint32_t n)
 {
@@ -250,7 +254,6 @@ static void test_utf8_simd_validator(void)
         if (usfm_test_failures - before > 20) return;
     }
 }
-#endif
 
 static void test_utf8_validator_table(void)
 {
@@ -630,9 +633,7 @@ static void run_utf8_tests(void)
     test_utf8_validator_edges();
     test_utf8_validator_random();
     test_utf8_validator_encoded();
-#if USFM__UTF8_SIMD
     test_utf8_simd_validator();
-#endif
     test_utf8_diagnostics();
     test_utf8_opt_out();
     test_utf8_legacy_book();
