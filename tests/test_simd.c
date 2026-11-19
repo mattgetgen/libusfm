@@ -47,6 +47,31 @@ static void test_classifier_matches_scalar(void)
     CHECK_EQ(mismatches, 0);
 }
 
+#if USFM__WINDOW_SCAN
+/* The window scanner's text masks against the scalar block reference. */
+static void test_text_classifier_matches_scalar(void)
+{
+    static const char special[] = "\\|/~\r\n\t";
+    char block[64];
+    USFM_BlockMasks b;
+    uint32_t mismatches = 0, n, k, pipe;
+    for (n = 0; n < 20256; n++) {     /* every byte value, whole block; then random */
+        for (k = 0; k < 64; k++) {
+            uint32_t r = simd_rand();
+            block[k] = n < 256 ? (char)n : (r & 3u) == 0 ? special[(r >> 2) % 7u] : (char)(r >> 4);
+        }
+        usfm__classify_block_scalar(block, &b);
+        for (pipe = 0; pipe < 2u; pipe++) {
+            uint64_t stops, nbsp, loose;
+            usfm__classify_text(block, (int)pipe, &stops, &nbsp, &loose);
+            if (stops != (b.backslash | b.slash | (pipe ? b.pipe : 0u)) || nbsp != b.nbsp ||
+                loose != b.loose_ws) mismatches++;
+        }
+    }
+    CHECK_EQ(mismatches, 0);
+}
+#endif
+
 static void test_bit_helpers(void)
 {
     CHECK_EQ(usfm__ctz64(1u), 0);
@@ -54,10 +79,12 @@ static void test_bit_helpers(void)
     CHECK_EQ(usfm__ctz64(0x50u), 4);
     CHECK_EQ(usfm__ctz64(~(uint64_t)0), 0);
     CHECK_EQ(usfm__ctz64((uint64_t)0x8000000000000000ull | 0x100u), 8);
+#if !USFM__WINDOW_SCAN
     CHECK_EQ(usfm__bit_range(0, 64), ~(uint64_t)0);
     CHECK_EQ(usfm__bit_range(3, 5), 0x18u);
     CHECK_EQ(usfm__bit_range(64, 64), 0);
     CHECK_EQ(usfm__bit_range(0, 0), 0);
+#endif
 }
 
 static void test_classifier_long_buffer(void)
@@ -116,6 +143,37 @@ static void test_scanner_every_length(void)
     CHECK_EQ(bad, 0);
 }
 
+/* Attribute runs of every length up to 200, ending at every offset of a
+ * 64-byte window and past it: with no stop at all in the first window
+ * (the run must be continued), and with '/' (a window stop that does not
+ * end attributes) every 11 bytes. */
+static void test_scanner_long_attributes(void)
+{
+    static const char *const ends[] = { "\\w*", "  \\w*", "\\\\\\w*", "\\=x\\w*", "\t\\*" };
+    static const char filler[] = "lemma=\"H1 x\" strong";
+    char buf[300];
+    uint32_t bad = 0, len, e, slash;
+    for (slash = 0; slash < 2u; slash++) {
+        for (e = 0; e < sizeof ends / sizeof ends[0]; e++) {
+            for (len = 0; len <= 200u; len++) {
+                uint32_t n = 0, k, el = (uint32_t)strlen(ends[e]);
+                memcpy(buf, "\\w x|", 5);
+                n = 5;
+                for (k = 0; k < len; k++) {
+                    buf[n++] = slash && k % 11u == 10u ? '/' : filler[k % (sizeof filler - 1u)];
+                }
+                memcpy(buf + n, ends[e], el);
+                n += el;
+                memcpy(buf + n, " y", 2);
+                n += 2;
+                bad += (uint32_t)scan_compare(buf, n, 1u, bad == 0);
+                bad += (uint32_t)scan_compare(buf, n - 2u - el, 1u, bad == 0);  /* run to the end */
+            }
+        }
+    }
+    CHECK_EQ(bad, 0);
+}
+
 static void test_scanner_random(void)
 {
     static const char alphabet[] = "\\\\\\|/~\r\n\t \"=*+-abcwvpq1";
@@ -135,9 +193,13 @@ static void run_simd_tests(void)
     RUN(test_scanner_block_boundaries);
     RUN(test_scanner_every_length);
     RUN(test_scanner_random);
+    RUN(test_scanner_long_attributes);
 #if USFM__USE_BLOCKS
     RUN(test_bit_helpers);
     RUN(test_classifier_matches_scalar);
+#if USFM__WINDOW_SCAN
+    RUN(test_text_classifier_matches_scalar);
+#endif
     RUN(test_classifier_long_buffer);
 #endif
 }

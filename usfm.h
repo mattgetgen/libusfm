@@ -1482,6 +1482,20 @@ static void usfm__classify(const char *name, uint32_t length, USFM_ScanToken *t)
 #  define USFM__USE_BLOCKS 0
 #endif
 
+/* How the block scanner finds the end of a text or attributes run.
+ * USFM__WINDOW_SCAN 1 (AVX2, AVX-512BW): each probe classifies the 64
+ * bytes starting at the run, so a run shorter than 64 bytes ends in its
+ * first window and nothing is cached. 0 (SSE2/SSSE3, NEON, wasm): probes
+ * classify aligned 64-byte blocks and cache the last one. With 128-bit
+ * vectors classifying a window on every probe measured slower than the
+ * cache on tag-dense text (SSSE3: WEB-STRONGS +4.5%, GRC-BYZ +2.1%
+ * cycles); with AVX2 it was faster on every corpus (-2.6..-10%). */
+#if defined(USFM__SIMD_AVX512) || defined(USFM__SIMD_AVX2)
+#  define USFM__WINDOW_SCAN 1
+#else
+#  define USFM__WINDOW_SCAN 0
+#endif
+
 /* Bit i of each mask describes byte i of a 64-byte block. */
 typedef struct USFM_BlockMasks {
     uint64_t backslash;                 /* '\\' */
@@ -1527,6 +1541,7 @@ static uint32_t usfm__ctz64(uint64_t x)
 }
 #endif
 
+#if !USFM__WINDOW_SCAN
 /* Bits [from, to) of a block, 0 <= from <= to <= 64. */
 static uint64_t usfm__bit_range(uint32_t from, uint32_t to)
 {
@@ -1534,6 +1549,7 @@ static uint64_t usfm__bit_range(uint32_t from, uint32_t to)
     uint64_t lo = from >= 64u ? ~(uint64_t)0 : (((uint64_t)1 << from) - 1u);
     return hi & ~lo;
 }
+#endif
 
 #if defined(USFM__SIMD_AVX512)
 static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
@@ -1548,6 +1564,9 @@ static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
                              _mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\t')));
 }
 #elif defined(USFM__SIMD_AVX2)
+#if defined(USFM_TEST_SCAN_REFERENCE)
+/* The scanner uses usfm__classify_text on this path; the full block
+ * classifier is kept for the tests. */
 static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
 {
     const __m256i bs = _mm256_set1_epi8('\\'), pi = _mm256_set1_epi8('|');
@@ -1569,6 +1588,7 @@ static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
         m->loose_ws |= (uint64_t)(uint32_t)_mm256_movemask_epi8(ws) << shift;
     }
 }
+#endif
 #elif defined(USFM__SIMD_SSE2)
 static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
 {
@@ -1648,7 +1668,7 @@ typedef struct USFM_Scanner {
     uint8_t     expect_arg;             /* set after a marker that takes one */
     uint8_t     pipe_is_attr;           /* set by the parser before each call */
     uint16_t    reserved;
-#if USFM__USE_BLOCKS
+#if USFM__USE_BLOCKS && !USFM__WINDOW_SCAN
     uint32_t    block_base;             /* offset of the cached block, or
                                            USFM__NO_BLOCK */
     USFM_BlockMasks block;              /* masks of the cached block */
@@ -1665,14 +1685,16 @@ static int usfm__wide_bom(const char *input, uint32_t length)
     return length >= 4 && u[0] == 0 && u[1] == 0 && u[2] == 0xFEu && u[3] == 0xFFu;
 }
 
+#if USFM__USE_BLOCKS && !USFM__WINDOW_SCAN
 #define USFM__NO_BLOCK 0xFFFFFFFFu
+#endif
 
 static void usfm__scan_init(USFM_Scanner *s, const char *input, uint32_t length)
 {
     memset(s, 0, sizeof *s);
     s->input = input;
     s->length = length;
-#if USFM__USE_BLOCKS
+#if USFM__USE_BLOCKS && !USFM__WINDOW_SCAN
     s->block_base = USFM__NO_BLOCK;
 #endif
     if (length >= 3 && (uint8_t)input[0] == 0xEF && (uint8_t)input[1] == 0xBB &&
@@ -1843,7 +1865,143 @@ static uint32_t usfm__attr_end_scalar(const USFM_Scanner *s, uint32_t i)
     return i > len ? len : i;
 }
 
-#if USFM__USE_BLOCKS
+#if USFM__USE_BLOCKS && USFM__WINDOW_SCAN
+/* Text-run masks of the 64 bytes at p: stops ('\\', '/', and '|' if
+ * pipe is set), '~', and CR/LF/TAB. Fewer masks than a full block
+ * classification: which stop it is gets read from the input. */
+#if defined(USFM__SIMD_AVX2)
+static void usfm__classify_text(const char *p, int pipe, uint64_t *stops, uint64_t *nbsp,
+                                uint64_t *loose)
+{
+    const __m256i bs = _mm256_set1_epi8('\\'), sl = _mm256_set1_epi8('/');
+    const __m256i pi = pipe ? _mm256_set1_epi8('|') : _mm256_set1_epi8('\\');
+    const __m256i tl = _mm256_set1_epi8('~'), cr = _mm256_set1_epi8('\r');
+    const __m256i lf = _mm256_set1_epi8('\n'), tab = _mm256_set1_epi8('\t');
+    __m256i x0 = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    __m256i x1 = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+#define USFM__TEXT_STOPS(x) _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(x, bs), _mm256_cmpeq_epi8(x, sl)), \
+                                            _mm256_cmpeq_epi8(x, pi))
+#define USFM__TEXT_LOOSE(x) _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(x, cr), _mm256_cmpeq_epi8(x, lf)), \
+                                            _mm256_cmpeq_epi8(x, tab))
+    *stops = (uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_STOPS(x0)) |
+             ((uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_STOPS(x1)) << 32);
+    *nbsp = (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, tl)) |
+            ((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, tl)) << 32);
+    *loose = (uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_LOOSE(x0)) |
+             ((uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_LOOSE(x1)) << 32);
+#undef USFM__TEXT_STOPS
+#undef USFM__TEXT_LOOSE
+}
+#else   /* AVX-512BW: one 512-bit classification already gives each mask */
+static void usfm__classify_text(const char *p, int pipe, uint64_t *stops, uint64_t *nbsp,
+                                uint64_t *loose)
+{
+    USFM_BlockMasks m;
+    usfm__classify_block(p, &m);
+    *stops = m.backslash | m.slash | (pipe ? m.pipe : 0u);
+    *nbsp = m.nbsp;
+    *loose = m.loose_ws;
+}
+#endif
+
+/* usfm__classify_text on the 64 bytes at `at` (at < length). Within 64
+ * bytes of the end they are classified from a zero-padded copy, so
+ * nothing past the input is ever read; zero bytes are not special, so
+ * the padding sets no bits. */
+static void usfm__text_window(const USFM_Scanner *s, uint32_t at, int pipe, uint64_t *stops,
+                              uint64_t *nbsp, uint64_t *loose)
+{
+    if (s->length - at >= 64u) {
+        usfm__classify_text(s->input + at, pipe, stops, nbsp, loose);
+    } else {
+        char tail[64];
+        memset(tail, 0, sizeof tail);
+        memcpy(tail, s->input + at, s->length - at);
+        usfm__classify_text(tail, pipe, stops, nbsp, loose);
+    }
+}
+
+/* End of a text run starting at `start`, from masks of the 64 bytes at
+ * each probe. Gives the same end and flags as usfm__text_end_scalar:
+ * escaped bytes are skipped (so an escaped '~' sets no NBSP flag), and
+ * only the stop candidates ('\', '/', and '|' where attributes are
+ * allowed) are inspected one by one. The window starts at the run, not
+ * at a 64-byte boundary: a run shorter than 64 bytes then always ends in
+ * the first window, where with aligned cached blocks whether it crossed
+ * a boundary was a data-dependent branch (with whether the cached block
+ * was still current). Bounded: each pass ends the run or advances i. */
+static uint32_t usfm__text_end_blocks(USFM_Scanner *s, uint32_t start, uint8_t *flags,
+                                      uint32_t *first_loose)
+{
+    const char *in = s->input;
+    uint32_t len = s->length, i = start;
+    uint64_t nbsp = 0, loose = 0;
+    uint8_t f = 0;
+    while (i < len) {
+        uint64_t stops, wn, wl, below, lw;
+        uint32_t j;
+        usfm__text_window(s, i, s->pipe_is_attr, &stops, &wn, &wl);
+        /* Bits below the first stop (all 64 if none; padding sets none). */
+        below = (stops - 1u) & ~stops;
+        lw = wl & below;
+        nbsp |= wn & below;
+        if (lw != 0 && loose == 0) *first_loose = i + usfm__ctz64(lw);
+        loose |= lw;
+        if (stops == 0) {                   /* no stop in these 64 bytes */
+            i += 64u;
+            continue;
+        }
+        j = i + usfm__ctz64(stops);
+        if (in[j] == '\\') {
+            if (!usfm__is_escape(in, len, j)) {
+                i = j;
+                break;
+            }
+            f |= USFM_TF_HAS_ESCAPE;
+            i = j + 2u;                     /* skip the escaped byte too */
+        } else if (in[j] == '|') {
+            i = j;
+            break;
+        } else {                            /* '/' */
+            if (j + 1u < len && in[j + 1u] == '/') {
+                i = j;
+                break;
+            }
+            i = j + 1u;
+        }
+    }
+    if (nbsp != 0) f |= USFM_TF_HAS_NBSP;
+    if (loose != 0) f |= USFM_TF_HAS_LOOSE_WS;
+    *flags = f;
+    return i > len ? len : i;
+}
+
+/* End of an attributes run from window masks: the next backslash that
+ * starts neither an escape nor "\=". Bounded like the text run. */
+static uint32_t usfm__attr_end_blocks(USFM_Scanner *s, uint32_t i)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    while (i < len) {
+        uint64_t stops, wn, wl;
+        uint32_t j;
+        usfm__text_window(s, i, 0, &stops, &wn, &wl);  /* stops: '\\' and '/' */
+        if (stops == 0) {
+            i += 64u;
+            continue;
+        }
+        j = i + usfm__ctz64(stops);
+        if (in[j] == '/') {
+            i = j + 1u;
+            continue;
+        }
+        if (!usfm__is_escape(in, len, j) && !(j + 1u < len && in[j + 1u] == '=')) return j;
+        i = j + 2u;
+    }
+    return len;
+}
+
+#elif USFM__USE_BLOCKS   /* !USFM__WINDOW_SCAN: aligned blocks, the last one cached */
 /* Makes the 64-byte block at `base` (a multiple of 64, below the input
  * length) the cached block. A last, partial block is classified from a
  * zero-padded copy, so nothing past the input is ever read; zero bytes
@@ -1946,7 +2104,7 @@ static uint32_t usfm__attr_end_blocks(USFM_Scanner *s, uint32_t i)
     }
     return len;
 }
-#endif /* USFM__USE_BLOCKS */
+#endif /* USFM__USE_BLOCKS, USFM__WINDOW_SCAN */
 
 /* Forces inlining of the small scanner helpers the main scan loop and
  * the parser's fast path share: without it the scalar build stops
@@ -2003,7 +2161,7 @@ USFM__INLINE void usfm__scan_text(USFM_Scanner *s, USFM_ScanToken *t, int use_bl
 
 /* Returns 1 and fills *t, or 0 at end of input. Every call that
  * returns 1 consumes at least one byte, so a caller's loop is bounded
- * by the input length. use_blocks selects the cached-block loops (when
+ * by the input length. use_blocks selects the block loops (when
  * compiled in) or the byte loops; results are identical either way. */
 static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_blocks)
 {
