@@ -240,6 +240,12 @@ static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_As
         return 1;
     }
     if (a == NULL) return 0;
+    /* With a tree, err.pos is the first dropped offset (when NOMEM). */
+    if (ea->pos != eb->pos) {
+        fprintf(stderr, "%s: fast path: error position %u, reference %u\n", label,
+                (unsigned)ea->pos, (unsigned)eb->pos);
+        return 1;
+    }
     xa = USFM_Ast_GetNodes(a, &na);
     xb = USFM_Ast_GetNodes(b, &nb);
     for (i = 0; i < na && i < nb; i++) {
