@@ -1948,6 +1948,59 @@ static uint32_t usfm__attr_end_blocks(USFM_Scanner *s, uint32_t i)
 }
 #endif /* USFM__USE_BLOCKS */
 
+/* Forces inlining of the small scanner helpers the main scan loop and
+ * the parser's fast path share: without it the scalar build stops
+ * inlining them into usfm__scan_next_with (measured: 2-3% slower on
+ * plain text). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define USFM__INLINE static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#  define USFM__INLINE static __forceinline
+#else
+#  define USFM__INLINE static inline
+#endif
+
+/* An attributes token at s->position, which holds '|' (attributes are
+ * allowed there): the run up to the next backslash that starts neither
+ * an escape nor "\=", without trailing blanks. Shared by the scanner and
+ * the parser's character-span fast path. */
+USFM__INLINE void usfm__scan_attributes(USFM_Scanner *s, USFM_ScanToken *t, int use_blocks)
+{
+    const char *in = s->input;
+    uint32_t start = s->position, i, end;
+#if USFM__USE_BLOCKS
+    i = use_blocks ? usfm__attr_end_blocks(s, start + 1u) : usfm__attr_end_scalar(s, start + 1u);
+#else
+    (void)use_blocks;
+    i = usfm__attr_end_scalar(s, start + 1u);
+#endif
+    end = i;
+    while (end > start + 1 &&      /* bounded by the run */
+           (USFM_ByteClass[(uint8_t)in[end - 1]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) end--;
+    usfm__tok(t, USFM_TOK_ATTRIBUTES, start, end);
+    s->position = i;
+}
+
+/* A text token at s->position, which starts neither a marker, nor
+ * attributes, nor "//". Shared like usfm__scan_attributes. */
+USFM__INLINE void usfm__scan_text(USFM_Scanner *s, USFM_ScanToken *t, int use_blocks)
+{
+    uint32_t start = s->position, i, first_loose = USFM_NIL;
+    uint8_t flags = 0;
+#if USFM__USE_BLOCKS
+    i = use_blocks ? usfm__text_end_blocks(s, start, &flags, &first_loose)
+                   : usfm__text_end_scalar(s, start, &flags, &first_loose);
+#else
+    (void)use_blocks;
+    i = usfm__text_end_scalar(s, start, &flags, &first_loose);
+#endif
+    USFM_ASSERT(i > start);
+    usfm__tok(t, USFM_TOK_TEXT, start, i);
+    t->first_loose = first_loose;
+    t->tok.level_flags = flags;
+    s->position = i;
+}
+
 /* Returns 1 and fills *t, or 0 at end of input. Every call that
  * returns 1 consumes at least one byte, so a caller's loop is bounded
  * by the input length. use_blocks selects the cached-block loops (when
@@ -1956,11 +2009,7 @@ static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_bloc
 {
     const char *in = s->input;
     uint32_t len = s->length;
-    uint32_t start, i, first_loose = USFM_NIL;
-    uint8_t flags = 0;
-#if !USFM__USE_BLOCKS
-    (void)use_blocks;
-#endif
+    uint32_t start;
     if (s->expect_arg != USFM_ARG_NONE) {
         uint8_t mode = s->expect_arg;
         s->expect_arg = USFM_ARG_NONE;
@@ -1970,17 +2019,7 @@ static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_bloc
     if (start >= len) return 0;
     if (in[start] == '\\' && !usfm__is_escape(in, len, start)) return usfm__scan_marker(s, t);
     if (in[start] == '|' && s->pipe_is_attr) {
-        uint32_t end;
-#if USFM__USE_BLOCKS
-        i = use_blocks ? usfm__attr_end_blocks(s, start + 1u) : usfm__attr_end_scalar(s, start + 1u);
-#else
-        i = usfm__attr_end_scalar(s, start + 1u);
-#endif
-        end = i;
-        while (end > start + 1 &&
-               (USFM_ByteClass[(uint8_t)in[end - 1]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) end--;
-        usfm__tok(t, USFM_TOK_ATTRIBUTES, start, end);
-        s->position = i;
+        usfm__scan_attributes(s, t, use_blocks);
         return 1;
     }
     if (in[start] == '/' && start + 1 < len && in[start + 1] == '/') {
@@ -1988,17 +2027,7 @@ static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_bloc
         s->position = start + 2;
         return 1;
     }
-#if USFM__USE_BLOCKS
-    i = use_blocks ? usfm__text_end_blocks(s, start, &flags, &first_loose)
-                   : usfm__text_end_scalar(s, start, &flags, &first_loose);
-#else
-    i = usfm__text_end_scalar(s, start, &flags, &first_loose);
-#endif
-    USFM_ASSERT(i > start);
-    usfm__tok(t, USFM_TOK_TEXT, start, i);
-    t->first_loose = first_loose;
-    t->tok.level_flags = flags;
-    s->position = i;
+    usfm__scan_text(s, t, use_blocks);
     return 1;
 }
 
