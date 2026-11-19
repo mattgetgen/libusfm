@@ -3415,6 +3415,19 @@ USFM__INLINE int usfm__fast_close(USFM_Parser *p, uint32_t end)
            top == USFM_AST_CHAR;
 }
 
+/* Byte compare for the fast path's closer check. The opening marker is
+ * short ("\\" + optional "+" + name, typically 2-6 bytes), and a memcmp
+ * call costs more than the compare (1.6% of instructions on
+ * WEB-STRONGS). Bounded: n iterations at most. */
+USFM__INLINE int usfm__same_bytes(const char *a, const char *b, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
 /* Character-span fast path (docs/superpowers/specs/
  * 2026-11-18-merged-parser-loop-design.md). Right after a character span
  * opens, reads its text, attributes and own closer, then any text after
@@ -3445,7 +3458,7 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
              * opening marker did, so it matches the top frame. Any other
              * spelling goes through the scanner and usfm__frame_matches. */
             if (len - pos > open_length &&
-                memcmp(in + pos, in + open_offset, open_length) == 0 && in[pos + open_length] == '*') {
+                usfm__same_bytes(in + pos, in + open_offset, open_length) && in[pos + open_length] == '*') {
                 uint32_t end = pos + open_length + 1u;
                 s->position = end;
                 closed = 1;

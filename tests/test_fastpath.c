@@ -20,6 +20,7 @@ static void test_fastpath_stops(void)
 {
     CHECK_FAST("\\p \\w word|strong=\"H1\"\\w* and \\w more\\w* text.\n");
     CHECK_FAST("\\p \\w word\\nd*\n");                      /* a different closer */
+    CHECK_FAST("\\p \\bd word\\bk* tail\\bd*\n");           /* same length, last byte differs */
     CHECK_FAST("\\p \\w word\\* tail\n");                    /* bare \\* */
     CHECK_FAST("\\p \\wj said \\+w light|strong=\"H216\"\\+w*, then\\wj*\n");
     CHECK_FAST("\\p \\wj said \\+w light\\w*, then\\wj*\n"); /* closer without + */
