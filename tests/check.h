@@ -311,35 +311,27 @@ static int check_fast_path(const char *input, uint32_t length, const USFM_Config
     return diff;
 }
 
-/* UTF-8 validation must not change anything: parses `input` with the
- * reference validation (every run checked on its own) and with each of
- * the `count` chunk sizes in `sizes` (0 is the default size), and
- * compares each with the reference. Returns the number of sizes that
- * differ. */
-static int check_utf8_chunk_sizes(const char *input, uint32_t length, const USFM_Config *config,
-                                  uint32_t flags, const uint32_t *sizes, uint32_t count,
-                                  const char *label)
+/* UTF-8 validation must not change anything: parses `input` normally
+ * and with the reference validation (every run checked on its own), and
+ * compares the two. Returns 0 if identical, 1 otherwise. */
+static int check_utf8_reference(const char *input, uint32_t length, const USFM_Config *config,
+                                uint32_t flags, const char *label)
 {
-    USFM_Err er, ec;
+    USFM_Err er, en;
     USFM__ParseHooks hooks;
     USFM_Ast *ref, *ast;
-    uint32_t i;
-    int diffs = 0;
-    char sized[300];
+    int diff;
+    char ref_label[300];
     memset(&hooks, 0, sizeof hooks);
     hooks.fast = 1;
     hooks.utf8_reference = 1;
     ref = usfm__parse_opts_impl(input, length, config, flags, NULL, &er, &hooks);
-    hooks.utf8_reference = 0;
-    for (i = 0; i < count; i++) {
-        hooks.utf8_chunk = sizes[i];
-        ast = usfm__parse_opts_impl(input, length, config, flags, NULL, &ec, &hooks);
-        snprintf(sized, sizeof sized, "%s (UTF-8 chunk %u)", label, (unsigned)sizes[i]);
-        diffs += check_same_parse(ast, &ec, ref, &er, sized);
-        USFM_Ast_Free(ast);
-    }
+    ast = usfm__parse_opts_impl(input, length, config, flags, NULL, &en, NULL);
+    snprintf(ref_label, sizeof ref_label, "%s (UTF-8 reference)", label);
+    diff = check_same_parse(ast, &en, ref, &er, ref_label);
+    USFM_Ast_Free(ast);
     USFM_Ast_Free(ref);
-    return diffs;
+    return diff;
 }
 
 #endif

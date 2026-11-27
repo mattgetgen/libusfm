@@ -24,7 +24,7 @@
 #include "test_iter.c"
 #include "test_parse_alloc.c"
 #include "test_utf8.c"
-#include "test_utf8_chunks.c"
+#include "test_utf8_reference.c"
 #include "test_simd.c"
 #include "test_fastpath.c"
 
@@ -54,8 +54,8 @@ int main(void)
     run_parse_alloc_tests();
     fprintf(stderr, "utf8\n");
     run_utf8_tests();
-    fprintf(stderr, "utf8 chunks\n");
-    run_utf8_chunks_tests();
+    fprintf(stderr, "utf8 reference\n");
+    run_utf8_reference_tests();
     fprintf(stderr, "simd\n");
     run_simd_tests();
     fprintf(stderr, "fast path\n");

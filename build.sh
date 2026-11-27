@@ -65,7 +65,7 @@ run_corpus() {
         exit 1
     fi
     checksum=$(grep '^AST checksum' "$log" | cut -d' ' -f3)
-    echo "$path $corpus: $(grep '^Scanner differences' "$log"), $(grep '^Classifier differences' "$log"), $(grep '^Fast-path differences' "$log"), $(grep '^UTF-8 chunk differences' "$log"), $(grep '^Diagnostics' "$log"), checksum $checksum, $(tail -n 1 "$log")"
+    echo "$path $corpus: $(grep '^Scanner differences' "$log"), $(grep '^Classifier differences' "$log"), $(grep '^Fast-path differences' "$log"), $(grep '^UTF-8 reference differences' "$log"), $(grep '^Diagnostics' "$log"), checksum $checksum, $(tail -n 1 "$log")"
     echo "$path $corpus $checksum" >> build/checksums.txt
 }
 

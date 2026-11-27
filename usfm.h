@@ -2298,8 +2298,8 @@ typedef struct USFM_Parser {
                                            (0 only in tests, as the reference) */
     uint8_t          reserved[1];
 #if defined(USFM_TEST_SCAN_REFERENCE)
-    uint8_t          utf8_reference;    /* test-only hooks: see */
-    uint32_t         utf8_chunk;        /* USFM__ParseHooks */
+    uint8_t          utf8_reference;    /* test-only hook: see
+                                           USFM__ParseHooks */
 #endif
     uint32_t         depth;
     uint32_t         last_end;          /* end of the last token placed */
@@ -3984,11 +3984,9 @@ typedef struct USFM__ParseHooks {
                                    reference the tests compare it with */
 #if defined(USFM_TEST_SCAN_REFERENCE)
     uint8_t  utf8_reference;    /* check every TEXT, ARGUMENT and ATTRIBUTES
-                                   run on its own, with no whole-input or
-                                   chunk validation: the reference UTF-8
+                                   run on its own, with no whole-input
+                                   validation: the reference UTF-8
                                    validation is compared with */
-    uint32_t utf8_chunk;        /* UTF-8 validation chunk size in bytes;
-                                   0 means the default */
 #endif
 } USFM__ParseHooks;
 
@@ -4071,7 +4069,6 @@ static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
 #if defined(USFM_TEST_SCAN_REFERENCE)
     if (hooks != NULL) {
         p.utf8_reference = hooks->utf8_reference;
-        p.utf8_chunk = hooks->utf8_chunk;
     }
 #endif
 #if USFM__UTF8_SIMD

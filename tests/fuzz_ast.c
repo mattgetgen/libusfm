@@ -1,7 +1,6 @@
 /* libFuzzer harness. Input layout: byte 0 picks the USFM version
- * (% 5) and the UTF-8 validation chunk size (/ 5, 0 = default), byte 1
- * picks flags: bit 0 = COPY_INPUT, bit 7 = fail the allocator after
- * (byte1 & 0x3F) calls. The rest is the USFM text.
+ * (% 5), byte 1 picks flags: bit 0 = COPY_INPUT, bit 7 = fail the
+ * allocator after (byte1 & 0x3F) calls. The rest is the USFM text.
  *
  * Every parse must either return NULL with USFM_ERR_NOMEM (and have
  * freed everything), or return a tree whose invariants hold. Any
@@ -132,13 +131,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         USFM_Ast_Free(ref);
         if (ref_state.live_bytes != 0) abort();
     }
-    {
-        /* Chunked UTF-8 validation must match the always-per-run
-         * reference; byte 0 / 5 picks the chunk size (0 is the default). */
-        uint32_t chunk = (uint32_t)(data[0] / 5u);
-        if (check_utf8_chunk_sizes((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
-                                   &chunk, 1u, "fuzz") != 0) abort();
-    }
+    /* The UTF-8 validation must match the always-per-run reference. */
+    if (check_utf8_reference((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
+                             "fuzz") != 0) abort();
     if (ast == NULL) {
         if (state.live_bytes != 0) abort();
         if (err.code == USFM_ERR_UNSUPPORTED_ENCODING) {
