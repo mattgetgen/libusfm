@@ -222,4 +222,116 @@ static uint32_t check_utf8_coverage(const USFM_Ast *ast)
     return missing;
 }
 
+/* Compares two parses of the same input field by field: `a` under test,
+ * `b` the reference (e.g. the fast path off, or per-run UTF-8 checks).
+ * Returns 0 if identical; otherwise prints the first difference and
+ * returns 1. */
+static int check_same_parse(const USFM_Ast *a, const USFM_Err *ea, const USFM_Ast *b,
+                            const USFM_Err *eb, const char *label)
+{
+    uint32_t na, nb, da, db, ca, cb, va, vb, i;
+    const USFM_Node *xa, *xb;
+    const USFM_Diagnostic *ga, *gb;
+    const USFM_ChapterEntry *ha, *hb;
+    const USFM_VerseEntry *wa, *wb;
+    if ((a == NULL) != (b == NULL) || ea->code != eb->code) {
+        fprintf(stderr, "%s: result %s/%u, reference %s/%u\n", label,
+                a ? "tree" : "NULL", (unsigned)ea->code, b ? "tree" : "NULL", (unsigned)eb->code);
+        return 1;
+    }
+    if (a == NULL) return 0;
+    /* With a tree, err.pos is the first dropped offset (when NOMEM). */
+    if (ea->pos != eb->pos) {
+        fprintf(stderr, "%s: error position %u, reference %u\n", label,
+                (unsigned)ea->pos, (unsigned)eb->pos);
+        return 1;
+    }
+    xa = USFM_Ast_GetNodes(a, &na);
+    xb = USFM_Ast_GetNodes(b, &nb);
+    for (i = 0; i < na && i < nb; i++) {
+        if (memcmp(&xa[i], &xb[i], sizeof xa[i]) != 0) {
+            fprintf(stderr, "%s: node %u differs: kind %u/%u marker %u/%u span %u+%u/%u+%u"
+                    " parent %u/%u end %u/%u flags 0x%02x/0x%02x\n", label, i,
+                    xa[i].kind, xb[i].kind, xa[i].marker, xb[i].marker, xa[i].span.offset,
+                    xa[i].span.length, xb[i].span.offset, xb[i].span.length, xa[i].parent,
+                    xb[i].parent, xa[i].end, xb[i].end, xa[i].level_flags, xb[i].level_flags);
+            return 1;
+        }
+    }
+    if (na != nb) {
+        fprintf(stderr, "%s: %u nodes, reference %u\n", label, na, nb);
+        return 1;
+    }
+    ga = USFM_Ast_GetDiagnostics(a, &da);
+    gb = USFM_Ast_GetDiagnostics(b, &db);
+    for (i = 0; i < da && i < db; i++) {
+        if (memcmp(&ga[i], &gb[i], sizeof ga[i]) != 0) {
+            fprintf(stderr, "%s: diagnostic %u differs: code %u/%u at %u/%u\n", label, i,
+                    ga[i].code, gb[i].code, ga[i].span.offset, gb[i].span.offset);
+            return 1;
+        }
+    }
+    if (da != db || USFM_Ast_GetDroppedDiagnosticCount(a) != USFM_Ast_GetDroppedDiagnosticCount(b)) {
+        fprintf(stderr, "%s: %u diagnostics (%u dropped), reference %u (%u dropped)\n",
+                label, da, USFM_Ast_GetDroppedDiagnosticCount(a), db,
+                USFM_Ast_GetDroppedDiagnosticCount(b));
+        return 1;
+    }
+    ha = USFM_Ast_GetChapters(a, &ca);
+    hb = USFM_Ast_GetChapters(b, &cb);
+    wa = USFM_Ast_GetVerses(a, &va);
+    wb = USFM_Ast_GetVerses(b, &vb);
+    if (ca != cb || va != vb || (ca && memcmp(ha, hb, ca * sizeof *ha) != 0) ||
+        (va && memcmp(wa, wb, va * sizeof *wa) != 0) ||
+        USFM_Ast_GetVersion(a) != USFM_Ast_GetVersion(b) ||
+        strcmp(USFM_Ast_GetBookCode(a), USFM_Ast_GetBookCode(b)) != 0) {
+        fprintf(stderr, "%s: chapter/verse tables, version or book code differ\n", label);
+        return 1;
+    }
+    return 0;
+}
+
+/* Parses `input` with the fast path on and off (default allocator) and
+ * compares the results. Returns 0 if identical. */
+static int check_fast_path(const char *input, uint32_t length, const USFM_Config *config,
+                           uint32_t flags, const char *label)
+{
+    USFM_Err ea, eb;
+    USFM__ParseHooks generic;
+    USFM_Ast *a, *b;
+    int diff;
+    char fast_label[300];
+    memset(&generic, 0, sizeof generic);
+    a = usfm__parse_opts_impl(input, length, config, flags, NULL, &ea, NULL);
+    b = usfm__parse_opts_impl(input, length, config, flags, NULL, &eb, &generic);
+    snprintf(fast_label, sizeof fast_label, "%s (fast path)", label);
+    diff = check_same_parse(a, &ea, b, &eb, fast_label);
+    USFM_Ast_Free(a);
+    USFM_Ast_Free(b);
+    return diff;
+}
+
+/* UTF-8 validation must not change anything: parses `input` normally
+ * and with the reference validation (every run checked on its own), and
+ * compares the two. Returns 0 if identical, 1 otherwise. */
+static int check_utf8_reference(const char *input, uint32_t length, const USFM_Config *config,
+                                uint32_t flags, const char *label)
+{
+    USFM_Err er, en;
+    USFM__ParseHooks hooks;
+    USFM_Ast *ref, *ast;
+    int diff;
+    char ref_label[300];
+    memset(&hooks, 0, sizeof hooks);
+    hooks.fast = 1;
+    hooks.utf8_reference = 1;
+    ref = usfm__parse_opts_impl(input, length, config, flags, NULL, &er, &hooks);
+    ast = usfm__parse_opts_impl(input, length, config, flags, NULL, &en, NULL);
+    snprintf(ref_label, sizeof ref_label, "%s (UTF-8 reference)", label);
+    diff = check_same_parse(ast, &en, ref, &er, ref_label);
+    USFM_Ast_Free(ast);
+    USFM_Ast_Free(ref);
+    return diff;
+}
+
 #endif

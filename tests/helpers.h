@@ -14,9 +14,31 @@ static USFM_Ast *parse_with_version(const char *usfm, uint8_t version)
     return USFM_Ast_Parse(usfm, (uint32_t)strlen(usfm), &config, &err);
 }
 
+/* Every tree and diagnostics check also parses with the fast path off,
+ * and with per-run UTF-8 checks, and requires identical results. */
+static void check_fast_equal_at(const char *file, int line, const char *usfm, uint8_t version)
+{
+    USFM_Config config;
+    char label[256];
+    memset(&config, 0, sizeof config);
+    config.version = version;
+    snprintf(label, sizeof label, "%s:%d", file, line);
+    usfm_test_checks++;
+    if (check_fast_path(usfm, (uint32_t)strlen(usfm), &config, 0, label) != 0) {
+        usfm_test_failures++;
+        fprintf(stderr, "%s: fast path differs for: %s\n", label, usfm);
+    }
+    usfm_test_checks++;
+    if (check_utf8_reference(usfm, (uint32_t)strlen(usfm), &config, 0, label) != 0) {
+        usfm_test_failures++;
+        fprintf(stderr, "%s: UTF-8 validation differs from the reference for: %s\n", label, usfm);
+    }
+}
+
 static void check_tree_at(const char *file, int line, const char *usfm, const char *expected)
 {
     USFM_Ast *ast = parse_with_version(usfm, USFM_VERSION_AUTO);
+    check_fast_equal_at(file, line, usfm, USFM_VERSION_AUTO);
     usfm_test_checks++;
     if (ast == NULL) {
         usfm_test_failures++;
@@ -40,6 +62,7 @@ static void check_diags_at(const char *file, int line, const char *usfm, uint8_t
                            const char *expected)
 {
     USFM_Ast *ast = parse_with_version(usfm, version);
+    check_fast_equal_at(file, line, usfm, version);
     usfm_test_checks++;
     if (ast == NULL) {
         usfm_test_failures++;

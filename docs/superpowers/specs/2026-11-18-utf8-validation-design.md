@@ -189,45 +189,89 @@ bring the cost close to zero.
 
 ## 0.1.1: SIMD
 
-`usfm__utf8_check` (the scalar decoder) stays the reference and the authority. SIMD is a filter that proves
-most of the input valid, so `usfm__utf8_check` runs only where it might
-find something.
+`usfm__utf8_check` (the scalar decoder) stays the authority for every
+diagnostic's offset and length. SIMD only proves input valid.
 
-- **The classifier gets one more mask:** `USFM_BlockMasks` gains
-  `uint64_t utf8_error`, the input positions where the Keiser–Lemire
-  validator ("Validating UTF-8 in less than one instruction per byte",
-  2021; as in simdutf) reports an error. It uses three 16-entry nibble
-  lookups plus checks for 3- and 4-byte sequences, with the last three
-  bytes before the block as context.
-- **Each SIMD path gets its own version:**
+### Why not a mask in the block classifier
 
-  | Path | Version |
-  | --- | --- |
-  | SSSE3 (detected at compile time with `__SSSE3__`, e.g. `-mssse3`, `-march=x86-64-v2` or `-march=native`) | `pshufb`; the 16-byte classifier uses it for this mask only |
-  | SSE2 without SSSE3 (a plain x86-64 build) | no `pshufb`: the mask is `usfm__utf8_check` run over the block |
-  | AVX2, AVX-512BW | `vpshufb` |
-  | NEON | `vqtbl1q_u8` |
-  | wasm simd128 | `i8x16.swizzle` |
+An earlier version of this section put a UTF-8 error mask in
+`USFM_BlockMasks`. That doesn't work:
+- **Only one block is cached.** By the time a long text run has been
+  scanned, the masks of its earlier blocks are gone.
+- **Some bytes never go through the classifier.** Arguments are scanned
+  byte by byte, without loading blocks.
 
-  A pure-ASCII block (no high bits, one `movemask`) sets no bits and
-  skips the lookups.
-- **The context bytes:** the scanner loads blocks in increasing order but
-  can skip some (long arguments are scanned byte by byte). So the three
-  bytes before a block are always read from the input (`base - 3 .. base
-  - 1`, or zeros at the start), never carried over from the previous
-  block.
-- **How a run is checked:** if no `utf8_error` bit falls in the run's
-  blocks, from the run's first block through the block after its last
-  byte (a truncated sequence is reported at the next byte), the run is
-  valid. Otherwise `usfm__utf8_check` runs on the run, and its answer
-  (offset and length) is the one used. Diagnostics and flags are byte-identical on every
-  path by construction.
-- **Tests:**
-  - The existing classifier comparison extends to the new mask. Each SIMD
-    mask must equal a scalar reference mask computed by running
-    `usfm__utf8_check` (the scalar decoder) over the block.
-  - Every corpus and fuzz input must give identical diagnostics and flags
-    on every path.
+### Design: validate the whole input once
+
+- **One pass.** On a SIMD build, with validation on, `USFM_Ast_ParseOpts`
+  validates the whole input before parsing, with
+  `usfm__utf8_valid_simd(text, input_length)`. If it is valid, the parser
+  skips the per-run check entirely: no per-token cost. If it is not, the
+  parser checks every run as in 0.1.0, so diagnostics and flags are the
+  same on every path.
+- **Equivalent to checking every run.**
+  - Every byte outside the validated runs is ASCII, apart from a leading
+    UTF-8 byte-order mark, which is itself valid.
+  - A multi-byte sequence can't contain an ASCII byte.
+
+  So the whole input is valid exactly when every run is valid.
+- **Scalar builds keep checking per run.** This covers `USFM_SIMD_NONE`,
+  targets without SIMD, and SSE2 without SSSE3. Measured on the scalar
+  build, a separate whole-input DFA pass was slower on Hebrew and Arabic
+  (+2.2 and +3.2 ms) than checking each run while parsing, where the DFA
+  overlaps with parser work.
+- **The validator is Keiser–Lemire** ("Validating UTF-8 in less than one
+  instruction per byte", 2021; as in simdjson and simdutf).
+  - Three 16-entry nibble lookups classify each byte against the one
+    before it.
+  - A saturating-subtract check catches missing 3rd and 4th bytes.
+  - The bytes before the input are taken to be zero, which is ASCII.
+  - The final, partial chunk is zero-padded. Lead bytes pending in the
+    last chunk (a lead byte in its last 3 positions) are folded into the
+    error at the end, so a sequence cut short at the end of the input is
+    an error.
+  - A chunk with no high bits always skips the lookups, and folds in any
+    pending lead bytes from the previous chunk.
+- **Each path gets its own version:**
+
+  | Path | Chunk | Lookups / shifts |
+  | --- | ---: | --- |
+  | AVX-512BW | 64 | `vpshufb` (per 128-bit lane), previous bytes via `valignr`/permute |
+  | AVX2 | 32 | `vpshufb`, previous bytes via `vperm2i128` + `vpalignr` |
+  | SSSE3 (`__SSSE3__`: `-mssse3`, `-march=x86-64-v2`, `-march=native`) | 16 | `pshufb`, `palignr` |
+  | SSE2 without SSSE3 (plain x86-64) | — | none: checks per run (scalar) |
+  | NEON (aarch64) | 16 | `vqtbl1q_u8`, `vextq_u8` |
+  | wasm simd128 | 16 | `i8x16.swizzle`, `i8x16.shuffle` |
+
+- **Measured** with the 16-byte SSSE3 prototype in an AVX2 build (CPU 2,
+  fastest of 27 passes): validating the whole input added 0.3–0.7 ms per
+  corpus (2.4 ms on the 19 MiB WEB-STRONGS). Checking per run on the same
+  build added 1.5–14.6 ms.
+
+### Tests
+
+- **SIMD against the scalar DFA.** Each SIMD validator is compared with
+  `usfm__utf8_valid`:
+  - every 1- to 4-byte sequence of edge bytes inside an ASCII buffer, at
+    the chunk-boundary offsets 0–3, 12–17, 28–33, 44–49 and 60–65, so it
+    crosses the 16-, 32- and 64-byte chunk boundaries; 4-byte sequences
+    only start at chunk positions 0 and 13–15;
+  - each of those at several tails: the end of the input, 5 `x` after it,
+    and 128 `x` (whole ASCII chunks) followed by é;
+  - fixed cases for each width, with a lead byte at the last position of
+    a 16-, 32- or 64-byte chunk, a whole ASCII chunk, then more text
+    (the 16-wide case is 15 `x`, C3, 24 `x`, C3 A9);
+  - random strings, mostly ASCII and up to 200 bytes long;
+  - encoded random scalar values and their mutations;
+  - every file of every corpus.
+- **Identical diagnostics on every path.** Every corpus and fuzz input
+  must give the same diagnostics and flags on every path. The fuzzer
+  compares a validated parse with a `USFM_PARSE_NO_UTF8_CHECK` parse
+  (validation adds diagnostics and the flag bit, nothing else) and
+  separately checks the SIMD validator against the scalar DFA on every
+  input; the corpus test compares with the scalar path.
+- **Every path is run:** scalar, SSE2 and AVX2 natively, SSSE3 by
+  building with `-mssse3`, NEON (qemu), wasm (Node) and AVX-512BW (SDE).
 
 ## Tests (0.1.0)
 
@@ -263,7 +307,8 @@ find something.
   default, and with it off. The release notes report both.
 - **The comparison table:** uses validation on, with a note that the
   other parsers' decoding is not timed.
-- **After 0.1.1:** the same again.
+- **After 0.1.1:** the same again, per SIMD path, with one method for
+  every parser so the times are comparable.
 
 ## Not in scope
 

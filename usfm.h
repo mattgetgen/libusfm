@@ -44,8 +44,8 @@
 
 #define USFM_VERSION_MAJOR 0
 #define USFM_VERSION_MINOR 1
-#define USFM_VERSION_PATCH 0
-#define USFM_VERSION "0.1.0-dev"
+#define USFM_VERSION_PATCH 1
+#define USFM_VERSION "0.1.1-dev"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -91,7 +91,9 @@ extern "C" {
  *   validation off. Input starting with a UTF-16 or UTF-32 byte-order
  *   mark returns NULL with USFM_ERR_UNSUPPORTED_ENCODING, even with
  *   validation off. UTF-16 or UTF-32 without a byte-order mark is not
- *   detected.
+ *   detected. SIMD builds (see SIMD) validate the whole input in one
+ *   pass and re-check runs only if it is invalid; the results are the
+ *   same on every build.
  *
  * Failure semantics
  *   NULL                          -> failed, nothing to free; err.code
@@ -149,6 +151,25 @@ extern "C" {
  * implementation still calls memcpy, memcmp and memset (<string.h>),
  * and assert() unless USFM_ASSERT is defined. A freestanding build must
  * provide those three functions and define USFM_ASSERT. */
+/* SIMD: the scanner finds text and attribute boundaries 64 bytes at a
+ * time. The instruction set is chosen at compile time from the
+ * compiler's target macros: AVX-512BW (-mavx512bw), AVX2 (-mavx2), SSE2
+ * (always on x86-64), NEON (ARM64), wasm simd128 (-msimd128); anything
+ * else uses byte loops. There is no runtime CPU detection, so build with
+ * the flags for the machines you target (e.g. -march=native). Define
+ * USFM_SIMD_NONE to force the byte loops. Every path produces identical
+ * results, and none reads past the end of the input.
+ *
+ * UTF-8 validation uses a Keiser-Lemire validator on the same targets:
+ * AVX-512BW (64 bytes per step), AVX2 (32), SSSE3 (16), NEON and wasm
+ * simd128 (16). USFM_Ast_ParseOpts validates the whole input once; only if
+ * it is invalid are the runs checked one by one, so diagnostics and
+ * flags are identical everywhere. SSE2 without SSSE3 and scalar builds
+ * (USFM_SIMD_NONE, targets with no SIMD) validate per run. A plain
+ * x86-64 build gets SSE2 for the scanner but no SIMD UTF-8 validation;
+ * enable SSSE3 (-mssse3, -march=x86-64-v2, -march=native) for it. MSVC
+ * has no SSSE3-only switch: MSVC x64 builds validate per run unless built
+ * with /arch:AVX2 (AVX2 validator) or /arch:AVX512 (AVX-512BW validator). */
 
 #define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
 
@@ -1365,6 +1386,10 @@ typedef struct USFM_ScanToken {
     uint16_t   reserved;
     uint32_t   name_offset;             /* marker name in the input */
     uint32_t   name_length;             /* 0 for "\*" and a lone "\" */
+    uint32_t   first_loose;             /* TEXT: offset of the first CR, LF
+                                           or TAB, or USFM_NIL; lets the
+                                           parser keep USFM_TF_HAS_LOOSE_WS
+                                           exact after trimming in O(1) */
 } USFM_ScanToken;
 
 /* Sets t->row, t->tok.marker and the level / milestone bits of
@@ -1419,6 +1444,219 @@ static void usfm__classify(const char *name, uint32_t length, USFM_ScanToken *t)
     t->tok.level_flags |= (uint8_t)(level | flags);
 }
 
+/* ===== SIMD block classifier ===== */
+
+/* The path is chosen at compile time from the compiler's target macros;
+ * there is no runtime CPU detection. USFM__USE_BLOCKS is 1 when a SIMD
+ * classifier exists; otherwise the scanner keeps its byte loops. */
+#if defined(USFM_SIMD_NONE)
+#  define USFM__SIMD_PATH "scalar (USFM_SIMD_NONE)"
+#  define USFM__USE_BLOCKS 0
+#elif defined(__AVX512BW__)
+#  include <immintrin.h>
+#  define USFM__SIMD_PATH "avx512bw"
+#  define USFM__SIMD_AVX512 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__AVX2__)
+#  include <immintrin.h>
+#  define USFM__SIMD_PATH "avx2"
+#  define USFM__SIMD_AVX2 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#  define USFM__SIMD_PATH "sse2"
+#  define USFM__SIMD_SSE2 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#  include <arm_neon.h>
+#  define USFM__SIMD_PATH "neon"
+#  define USFM__SIMD_NEON 1
+#  define USFM__USE_BLOCKS 1
+#elif defined(__wasm_simd128__)
+#  include <wasm_simd128.h>
+#  define USFM__SIMD_PATH "wasm-simd128"
+#  define USFM__SIMD_WASM 1
+#  define USFM__USE_BLOCKS 1
+#else
+#  define USFM__SIMD_PATH "scalar (no SIMD for this target)"
+#  define USFM__USE_BLOCKS 0
+#endif
+
+/* How the block scanner finds the end of a text or attributes run.
+ * USFM__WINDOW_SCAN 1 (AVX2, AVX-512BW): each probe classifies the 64
+ * bytes starting at the run, so a run shorter than 64 bytes ends in its
+ * first window and nothing is cached. 0 (SSE2/SSSE3, NEON, wasm): probes
+ * classify aligned 64-byte blocks and cache the last one. With 128-bit
+ * vectors classifying a window on every probe measured slower than the
+ * cache on tag-dense text (SSSE3: WEB-STRONGS +4.5%, GRC-BYZ +2.1%
+ * cycles); with AVX2 it was faster on every corpus (-2.6..-10%). */
+#if defined(USFM__SIMD_AVX512) || defined(USFM__SIMD_AVX2)
+#  define USFM__WINDOW_SCAN 1
+#else
+#  define USFM__WINDOW_SCAN 0
+#endif
+
+/* Bit i of each mask describes byte i of a 64-byte block. */
+typedef struct USFM_BlockMasks {
+    uint64_t backslash;                 /* '\\' */
+    uint64_t pipe;                      /* '|' */
+    uint64_t slash;                     /* '/' */
+    uint64_t nbsp;                      /* '~' (flag only) */
+    uint64_t loose_ws;                  /* CR, LF, TAB (flag only) */
+} USFM_BlockMasks;
+
+#if USFM__USE_BLOCKS && defined(USFM_TEST_SCAN_REFERENCE)
+/* Reference classifier: every SIMD classifier is tested against it. */
+static void usfm__classify_block_scalar(const char *p, USFM_BlockMasks *m)
+{
+    uint32_t i;
+    memset(m, 0, sizeof *m);
+    for (i = 0; i < 64u; i++) {
+        uint64_t bit = (uint64_t)1 << i;
+        switch (p[i]) {
+        case '\\': m->backslash |= bit; break;
+        case '|': m->pipe |= bit; break;
+        case '/': m->slash |= bit; break;
+        case '~': m->nbsp |= bit; break;
+        case '\r': case '\n': case '\t': m->loose_ws |= bit; break;
+        default: break;
+        }
+    }
+}
+#endif
+
+#if USFM__USE_BLOCKS
+/* Index of the lowest set bit; x must not be 0. */
+#if defined(__GNUC__) || defined(__clang__)
+static uint32_t usfm__ctz64(uint64_t x) { return (uint32_t)__builtin_ctzll(x); }
+#else
+static uint32_t usfm__ctz64(uint64_t x)
+{
+    /* Population count of the bits below the lowest set bit. */
+    x = (x & (0 - x)) - 1u;
+    x = x - ((x >> 1) & 0x5555555555555555ull);
+    x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+    return (uint32_t)((x * 0x0101010101010101ull) >> 56);
+}
+#endif
+
+#if !USFM__WINDOW_SCAN
+/* Bits [from, to) of a block, 0 <= from <= to <= 64. */
+static uint64_t usfm__bit_range(uint32_t from, uint32_t to)
+{
+    uint64_t hi = to >= 64u ? ~(uint64_t)0 : (((uint64_t)1 << to) - 1u);
+    uint64_t lo = from >= 64u ? ~(uint64_t)0 : (((uint64_t)1 << from) - 1u);
+    return hi & ~lo;
+}
+#endif
+
+#if defined(USFM__SIMD_AVX512)
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    __m512i x = _mm512_loadu_si512((const void *)p);
+    m->backslash = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\\'));
+    m->pipe = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('|'));
+    m->slash = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('/'));
+    m->nbsp = (uint64_t)_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('~'));
+    m->loose_ws = (uint64_t)(_mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\r')) |
+                             _mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\n')) |
+                             _mm512_cmpeq_epi8_mask(x, _mm512_set1_epi8('\t')));
+}
+#elif defined(USFM__SIMD_AVX2)
+#if defined(USFM_TEST_SCAN_REFERENCE)
+/* The scanner uses usfm__classify_text on this path; the full block
+ * classifier is kept for the tests. */
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    const __m256i bs = _mm256_set1_epi8('\\'), pi = _mm256_set1_epi8('|');
+    const __m256i sl = _mm256_set1_epi8('/'), tl = _mm256_set1_epi8('~');
+    const __m256i cr = _mm256_set1_epi8('\r'), lf = _mm256_set1_epi8('\n');
+    const __m256i tab = _mm256_set1_epi8('\t');
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 2u; k++) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32u * k));
+        uint32_t shift = 32u * k;
+        __m256i ws = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(x, cr),
+                                                     _mm256_cmpeq_epi8(x, lf)),
+                                     _mm256_cmpeq_epi8(x, tab));
+        m->backslash |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, bs)) << shift;
+        m->pipe |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, pi)) << shift;
+        m->slash |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, sl)) << shift;
+        m->nbsp |= (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, tl)) << shift;
+        m->loose_ws |= (uint64_t)(uint32_t)_mm256_movemask_epi8(ws) << shift;
+    }
+}
+#endif
+#elif defined(USFM__SIMD_SSE2)
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    const __m128i bs = _mm_set1_epi8('\\'), pi = _mm_set1_epi8('|');
+    const __m128i sl = _mm_set1_epi8('/'), tl = _mm_set1_epi8('~');
+    const __m128i cr = _mm_set1_epi8('\r'), lf = _mm_set1_epi8('\n');
+    const __m128i tab = _mm_set1_epi8('\t');
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 4u; k++) {
+        __m128i x = _mm_loadu_si128((const __m128i *)(const void *)(p + 16u * k));
+        uint32_t shift = 16u * k;
+        __m128i ws = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, cr), _mm_cmpeq_epi8(x, lf)),
+                                  _mm_cmpeq_epi8(x, tab));
+        m->backslash |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, bs)) << shift;
+        m->pipe |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, pi)) << shift;
+        m->slash |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, sl)) << shift;
+        m->nbsp |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(x, tl)) << shift;
+        m->loose_ws |= (uint64_t)(uint32_t)_mm_movemask_epi8(ws) << shift;
+    }
+}
+#elif defined(USFM__SIMD_NEON)
+/* NEON has no movemask: weight each lane by its bit and add the halves. */
+static uint64_t usfm__neon_bits(uint8x16_t eq)
+{
+    static const uint8_t weights[16] = { 1, 2, 4, 8, 16, 32, 64, 128,
+                                         1, 2, 4, 8, 16, 32, 64, 128 };
+    uint8x16_t b = vandq_u8(eq, vld1q_u8(weights));
+    return (uint64_t)vaddv_u8(vget_low_u8(b)) | ((uint64_t)vaddv_u8(vget_high_u8(b)) << 8);
+}
+
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 4u; k++) {
+        uint8x16_t x = vld1q_u8((const uint8_t *)p + 16u * k);
+        uint32_t shift = 16u * k;
+        uint8x16_t ws = vorrq_u8(vorrq_u8(vceqq_u8(x, vdupq_n_u8('\r')), vceqq_u8(x, vdupq_n_u8('\n'))),
+                                 vceqq_u8(x, vdupq_n_u8('\t')));
+        m->backslash |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('\\'))) << shift;
+        m->pipe |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('|'))) << shift;
+        m->slash |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('/'))) << shift;
+        m->nbsp |= usfm__neon_bits(vceqq_u8(x, vdupq_n_u8('~'))) << shift;
+        m->loose_ws |= usfm__neon_bits(ws) << shift;
+    }
+}
+#elif defined(USFM__SIMD_WASM)
+static void usfm__classify_block(const char *p, USFM_BlockMasks *m)
+{
+    uint32_t k;
+    memset(m, 0, sizeof *m);
+    for (k = 0; k < 4u; k++) {
+        v128_t x = wasm_v128_load(p + 16u * k);
+        uint32_t shift = 16u * k;
+        v128_t ws = wasm_v128_or(wasm_v128_or(wasm_i8x16_eq(x, wasm_i8x16_splat('\r')),
+                                              wasm_i8x16_eq(x, wasm_i8x16_splat('\n'))),
+                                 wasm_i8x16_eq(x, wasm_i8x16_splat('\t')));
+        m->backslash |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('\\'))) << shift;
+        m->pipe |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('|'))) << shift;
+        m->slash |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('/'))) << shift;
+        m->nbsp |= (uint64_t)wasm_i8x16_bitmask(wasm_i8x16_eq(x, wasm_i8x16_splat('~'))) << shift;
+        m->loose_ws |= (uint64_t)wasm_i8x16_bitmask(ws) << shift;
+    }
+}
+#endif
+#endif /* USFM__USE_BLOCKS */
+
 /* ===== Scanner ===== */
 
 enum { USFM_ARG_NONE = 0, USFM_ARG_WORD, USFM_ARG_LINE };
@@ -1430,6 +1668,11 @@ typedef struct USFM_Scanner {
     uint8_t     expect_arg;             /* set after a marker that takes one */
     uint8_t     pipe_is_attr;           /* set by the parser before each call */
     uint16_t    reserved;
+#if USFM__USE_BLOCKS && !USFM__WINDOW_SCAN
+    uint32_t    block_base;             /* offset of the cached block, or
+                                           USFM__NO_BLOCK */
+    USFM_BlockMasks block;              /* masks of the cached block */
+#endif
 } USFM_Scanner;
 
 /* Does the input start with a UTF-16 (FF FE, FE FF) or UTF-32
@@ -1442,11 +1685,18 @@ static int usfm__wide_bom(const char *input, uint32_t length)
     return length >= 4 && u[0] == 0 && u[1] == 0 && u[2] == 0xFEu && u[3] == 0xFFu;
 }
 
+#if USFM__USE_BLOCKS && !USFM__WINDOW_SCAN
+#define USFM__NO_BLOCK 0xFFFFFFFFu
+#endif
+
 static void usfm__scan_init(USFM_Scanner *s, const char *input, uint32_t length)
 {
     memset(s, 0, sizeof *s);
     s->input = input;
     s->length = length;
+#if USFM__USE_BLOCKS && !USFM__WINDOW_SCAN
+    s->block_base = USFM__NO_BLOCK;
+#endif
     if (length >= 3 && (uint8_t)input[0] == 0xEF && (uint8_t)input[1] == 0xBB &&
         (uint8_t)input[2] == 0xBF) {
         s->position = 3;                /* UTF-8 BOM */
@@ -1467,6 +1717,7 @@ static void usfm__tok(USFM_ScanToken *t, uint8_t kind, uint32_t start, uint32_t 
     t->tok.span = usfm__span(start, end - start);
     t->tok.kind = kind;
     t->row = USFM_ROW_NONE;
+    t->first_loose = USFM_NIL;
 }
 
 /* Consumes the one whitespace character that ends an opening marker or
@@ -1553,52 +1804,13 @@ static int usfm__scan_argument(USFM_Scanner *s, USFM_ScanToken *t, uint8_t mode)
     return 1;
 }
 
-/* Returns 1 and fills *t, or 0 at end of input. Every call that
- * returns 1 consumes at least one byte, so a caller's loop is bounded
- * by the input length. */
-static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
+/* End of a text run starting at `start` (byte loop); sets *flags. */
+static uint32_t usfm__text_end_scalar(const USFM_Scanner *s, uint32_t start, uint8_t *flags,
+                                      uint32_t *first_loose)
 {
     const char *in = s->input;
-    uint32_t len = s->length;
-    uint32_t start, i;
-    uint8_t flags = 0;
-    if (s->expect_arg != USFM_ARG_NONE) {
-        uint8_t mode = s->expect_arg;
-        s->expect_arg = USFM_ARG_NONE;
-        if (usfm__scan_argument(s, t, mode)) return 1;
-    }
-    start = s->position;
-    if (start >= len) return 0;
-    if (in[start] == '\\' && !usfm__is_escape(in, len, start)) return usfm__scan_marker(s, t);
-    if (in[start] == '|' && s->pipe_is_attr) {
-        uint32_t end;
-        i = start + 1;
-        /* Attributes run to the next marker; escapes don't end them. */
-        while (i < len) {
-            if (in[i] == '\\') {
-                /* \= is an escape here only (field guide section 1). */
-                if (!usfm__is_escape(in, len, i) &&
-                    !(i + 1 < len && in[i + 1] == '=')) break;
-                i += 2;
-                continue;
-            }
-            i++;
-        }
-        if (i > len) i = len;
-        end = i;
-        while (end > start + 1 &&
-               (USFM_ByteClass[(uint8_t)in[end - 1]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) end--;
-        usfm__tok(t, USFM_TOK_ATTRIBUTES, start, end);
-        s->position = i;
-        return 1;
-    }
-    if (in[start] == '/' && start + 1 < len && in[start + 1] == '/') {
-        usfm__tok(t, USFM_TOK_OPTBREAK, start, start + 2);
-        s->position = start + 2;
-        return 1;
-    }
-    /* Text: skip quickly over bytes that are not STOP bytes. */
-    i = start;
+    uint32_t len = s->length, i = start;
+    uint8_t f = 0;
     while (i < len) {
         uint8_t b = (uint8_t)in[i];
         if (!(USFM_ByteClass[b] & USFM_BC_STOP)) {
@@ -1609,7 +1821,7 @@ static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
             /* \" is accepted as an escape in text too, as in attributes:
              * deliberate and harmless, since \" can't start a marker. */
             if (!usfm__is_escape(in, len, i)) break;
-            flags |= USFM_TF_HAS_ESCAPE;
+            f |= USFM_TF_HAS_ESCAPE;
             i += 2;
             continue;
         }
@@ -1623,17 +1835,373 @@ static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
             i++;
             continue;
         }
-        if (b == '~') flags |= USFM_TF_HAS_NBSP;
-        else flags |= USFM_TF_HAS_LOOSE_WS;      /* CR, LF, TAB */
+        if (b == '~') {
+            f |= USFM_TF_HAS_NBSP;
+        } else {                                 /* CR, LF, TAB */
+            if (!(f & USFM_TF_HAS_LOOSE_WS)) *first_loose = i;
+            f |= USFM_TF_HAS_LOOSE_WS;
+        }
         i++;
     }
-    if (i > len) i = len;
+    *flags = f;
+    return i > len ? len : i;
+}
+
+/* End of an attributes run whose first byte after the '|' is at `i`
+ * (byte loop): the next backslash that does not start an escape. */
+static uint32_t usfm__attr_end_scalar(const USFM_Scanner *s, uint32_t i)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    while (i < len) {
+        if (in[i] == '\\') {
+            /* \= is an escape here only (field guide section 1). */
+            if (!usfm__is_escape(in, len, i) && !(i + 1 < len && in[i + 1] == '=')) break;
+            i += 2;
+            continue;
+        }
+        i++;
+    }
+    return i > len ? len : i;
+}
+
+#if USFM__USE_BLOCKS && USFM__WINDOW_SCAN
+/* Text-run masks of the 64 bytes at p: stops ('\\', '/', and '|' if
+ * pipe is set), '~', and CR/LF/TAB. Fewer masks than a full block
+ * classification: which stop it is gets read from the input. */
+#if defined(USFM__SIMD_AVX2)
+static void usfm__classify_text(const char *p, int pipe, uint64_t *stops, uint64_t *nbsp,
+                                uint64_t *loose)
+{
+    const __m256i bs = _mm256_set1_epi8('\\'), sl = _mm256_set1_epi8('/');
+    const __m256i pi = pipe ? _mm256_set1_epi8('|') : _mm256_set1_epi8('\\');
+    const __m256i tl = _mm256_set1_epi8('~'), cr = _mm256_set1_epi8('\r');
+    const __m256i lf = _mm256_set1_epi8('\n'), tab = _mm256_set1_epi8('\t');
+    __m256i x0 = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    __m256i x1 = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+#define USFM__TEXT_STOPS(x) _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(x, bs), _mm256_cmpeq_epi8(x, sl)), \
+                                            _mm256_cmpeq_epi8(x, pi))
+#define USFM__TEXT_LOOSE(x) _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(x, cr), _mm256_cmpeq_epi8(x, lf)), \
+                                            _mm256_cmpeq_epi8(x, tab))
+    *stops = (uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_STOPS(x0)) |
+             ((uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_STOPS(x1)) << 32);
+    *nbsp = (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, tl)) |
+            ((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, tl)) << 32);
+    *loose = (uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_LOOSE(x0)) |
+             ((uint64_t)(uint32_t)_mm256_movemask_epi8(USFM__TEXT_LOOSE(x1)) << 32);
+#undef USFM__TEXT_STOPS
+#undef USFM__TEXT_LOOSE
+}
+#else   /* AVX-512BW: one 512-bit classification already gives each mask */
+static void usfm__classify_text(const char *p, int pipe, uint64_t *stops, uint64_t *nbsp,
+                                uint64_t *loose)
+{
+    USFM_BlockMasks m;
+    usfm__classify_block(p, &m);
+    *stops = m.backslash | m.slash | (pipe ? m.pipe : 0u);
+    *nbsp = m.nbsp;
+    *loose = m.loose_ws;
+}
+#endif
+
+/* usfm__classify_text on the 64 bytes at `at` (at < length). Within 64
+ * bytes of the end they are classified from a zero-padded copy, so
+ * nothing past the input is ever read; zero bytes are not special, so
+ * the padding sets no bits. */
+static void usfm__text_window(const USFM_Scanner *s, uint32_t at, int pipe, uint64_t *stops,
+                              uint64_t *nbsp, uint64_t *loose)
+{
+    if (s->length - at >= 64u) {
+        usfm__classify_text(s->input + at, pipe, stops, nbsp, loose);
+    } else {
+        char tail[64];
+        memset(tail, 0, sizeof tail);
+        memcpy(tail, s->input + at, s->length - at);
+        usfm__classify_text(tail, pipe, stops, nbsp, loose);
+    }
+}
+
+/* End of a text run starting at `start`, from masks of the 64 bytes at
+ * each probe. Gives the same end and flags as usfm__text_end_scalar:
+ * escaped bytes are skipped (so an escaped '~' sets no NBSP flag), and
+ * only the stop candidates ('\', '/', and '|' where attributes are
+ * allowed) are inspected one by one. The window starts at the run, not
+ * at a 64-byte boundary: a run shorter than 64 bytes then always ends in
+ * the first window, where with aligned cached blocks whether it crossed
+ * a boundary was a data-dependent branch (with whether the cached block
+ * was still current). Bounded: each pass ends the run or advances i. */
+static uint32_t usfm__text_end_blocks(USFM_Scanner *s, uint32_t start, uint8_t *flags,
+                                      uint32_t *first_loose)
+{
+    const char *in = s->input;
+    uint32_t len = s->length, i = start;
+    uint64_t nbsp = 0, loose = 0;
+    uint8_t f = 0;
+    while (i < len) {
+        uint64_t stops, wn, wl, below, lw;
+        uint32_t j;
+        usfm__text_window(s, i, s->pipe_is_attr, &stops, &wn, &wl);
+        /* Bits below the first stop (all 64 if none; padding sets none). */
+        below = (stops - 1u) & ~stops;
+        lw = wl & below;
+        nbsp |= wn & below;
+        if (lw != 0 && loose == 0) *first_loose = i + usfm__ctz64(lw);
+        loose |= lw;
+        if (stops == 0) {                   /* no stop in these 64 bytes */
+            i += 64u;
+            continue;
+        }
+        j = i + usfm__ctz64(stops);
+        if (in[j] == '\\') {
+            if (!usfm__is_escape(in, len, j)) {
+                i = j;
+                break;
+            }
+            f |= USFM_TF_HAS_ESCAPE;
+            i = j + 2u;                     /* skip the escaped byte too */
+        } else if (in[j] == '|') {
+            i = j;
+            break;
+        } else {                            /* '/' */
+            if (j + 1u < len && in[j + 1u] == '/') {
+                i = j;
+                break;
+            }
+            i = j + 1u;
+        }
+    }
+    if (nbsp != 0) f |= USFM_TF_HAS_NBSP;
+    if (loose != 0) f |= USFM_TF_HAS_LOOSE_WS;
+    *flags = f;
+    return i > len ? len : i;
+}
+
+/* End of an attributes run from window masks: the next backslash that
+ * starts neither an escape nor "\=". Bounded like the text run. */
+static uint32_t usfm__attr_end_blocks(USFM_Scanner *s, uint32_t i)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    while (i < len) {
+        uint64_t stops, wn, wl;
+        uint32_t j;
+        usfm__text_window(s, i, 0, &stops, &wn, &wl);  /* stops: '\\' and '/' */
+        if (stops == 0) {
+            i += 64u;
+            continue;
+        }
+        j = i + usfm__ctz64(stops);
+        if (in[j] == '/') {
+            i = j + 1u;
+            continue;
+        }
+        if (!usfm__is_escape(in, len, j) && !(j + 1u < len && in[j + 1u] == '=')) return j;
+        i = j + 2u;
+    }
+    return len;
+}
+
+#elif USFM__USE_BLOCKS   /* !USFM__WINDOW_SCAN: aligned blocks, the last one cached */
+/* Makes the 64-byte block at `base` (a multiple of 64, below the input
+ * length) the cached block. A last, partial block is classified from a
+ * zero-padded copy, so nothing past the input is ever read; zero bytes
+ * are not special, so the padding sets no bits. */
+static void usfm__load_block(USFM_Scanner *s, uint32_t base)
+{
+    if (s->block_base == base) return;
+    if (s->length - base >= 64u) {
+        usfm__classify_block(s->input + base, &s->block);
+    } else {
+        char tail[64];
+        memset(tail, 0, sizeof tail);
+        memcpy(tail, s->input + base, s->length - base);
+        usfm__classify_block(tail, &s->block);
+    }
+    s->block_base = base;
+}
+
+/* Adds the flag-only bits of the cached block in [from, to) (input
+ * offsets inside the cached block) to the running results. */
+static void usfm__flag_span(const USFM_Scanner *s, uint32_t from, uint32_t to,
+                            uint64_t *nbsp, uint64_t *loose, uint32_t *first_loose)
+{
+    uint64_t r, lw;
+    if (to <= from) return;
+    r = usfm__bit_range(from - s->block_base, to - s->block_base);
+    lw = s->block.loose_ws & r;
+    *nbsp |= s->block.nbsp & r;
+    if (lw != 0 && *loose == 0) *first_loose = s->block_base + usfm__ctz64(lw);
+    *loose |= lw;
+}
+
+/* End of a text run starting at `start`, from cached block masks. Gives
+ * the same end and flags as usfm__text_end_scalar: escaped bytes are
+ * skipped (so an escaped '~' sets no NBSP flag), and only the stop
+ * candidates ('\', '/', and '|' where attributes are allowed) are
+ * inspected one by one. Bounded: each pass ends the run or advances i. */
+static uint32_t usfm__text_end_blocks(USFM_Scanner *s, uint32_t start, uint8_t *flags,
+                                      uint32_t *first_loose)
+{
+    const char *in = s->input;
+    uint32_t len = s->length, i = start;
+    uint64_t nbsp = 0, loose = 0;
+    uint8_t f = 0;
+    while (i < len) {
+        uint32_t base = i & ~63u, block_end = base + 64u, j;
+        uint64_t stops;
+        usfm__load_block(s, base);
+        stops = s->block.backslash | s->block.slash | (s->pipe_is_attr ? s->block.pipe : 0u);
+        stops &= usfm__bit_range(i - base, 64u);
+        if (stops == 0) {                   /* no stop in the rest of this block */
+            usfm__flag_span(s, i, block_end < len ? block_end : len, &nbsp, &loose, first_loose);
+            i = block_end;
+            continue;
+        }
+        j = base + usfm__ctz64(stops);
+        usfm__flag_span(s, i, j, &nbsp, &loose, first_loose);
+        if (in[j] == '\\') {
+            if (!usfm__is_escape(in, len, j)) {
+                i = j;
+                break;
+            }
+            f |= USFM_TF_HAS_ESCAPE;
+            i = j + 2u;                     /* skip the escaped byte too */
+        } else if (in[j] == '|') {
+            i = j;
+            break;
+        } else {                            /* '/' */
+            if (j + 1u < len && in[j + 1u] == '/') {
+                i = j;
+                break;
+            }
+            i = j + 1u;
+        }
+    }
+    if (nbsp != 0) f |= USFM_TF_HAS_NBSP;
+    if (loose != 0) f |= USFM_TF_HAS_LOOSE_WS;
+    *flags = f;
+    return i > len ? len : i;
+}
+
+/* End of an attributes run from cached block masks: the next backslash
+ * that starts neither an escape nor "\=". Bounded like the text run. */
+static uint32_t usfm__attr_end_blocks(USFM_Scanner *s, uint32_t i)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    while (i < len) {
+        uint32_t base = i & ~63u, j;
+        uint64_t stops;
+        usfm__load_block(s, base);
+        stops = s->block.backslash & usfm__bit_range(i - base, 64u);
+        if (stops == 0) {
+            i = base + 64u;
+            continue;
+        }
+        j = base + usfm__ctz64(stops);
+        if (!usfm__is_escape(in, len, j) && !(j + 1u < len && in[j + 1u] == '=')) return j;
+        i = j + 2u;
+    }
+    return len;
+}
+#endif /* USFM__USE_BLOCKS, USFM__WINDOW_SCAN */
+
+/* Forces inlining of the small scanner helpers the main scan loop and
+ * the parser's fast path share: without it the scalar build stops
+ * inlining them into usfm__scan_next_with (measured: 2-3% slower on
+ * plain text). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define USFM__INLINE static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#  define USFM__INLINE static __forceinline
+#else
+#  define USFM__INLINE static inline
+#endif
+
+/* An attributes token at s->position, which holds '|' (attributes are
+ * allowed there): the run up to the next backslash that starts neither
+ * an escape nor "\=", without trailing blanks. Shared by the scanner and
+ * the parser's character-span fast path. */
+USFM__INLINE void usfm__scan_attributes(USFM_Scanner *s, USFM_ScanToken *t, int use_blocks)
+{
+    const char *in = s->input;
+    uint32_t start = s->position, i, end;
+#if USFM__USE_BLOCKS
+    i = use_blocks ? usfm__attr_end_blocks(s, start + 1u) : usfm__attr_end_scalar(s, start + 1u);
+#else
+    (void)use_blocks;
+    i = usfm__attr_end_scalar(s, start + 1u);
+#endif
+    end = i;
+    while (end > start + 1 &&      /* bounded by the run */
+           (USFM_ByteClass[(uint8_t)in[end - 1]] & (USFM_BC_SPACE | USFM_BC_NEWLINE))) end--;
+    usfm__tok(t, USFM_TOK_ATTRIBUTES, start, end);
+    s->position = i;
+}
+
+/* A text token at s->position, which starts neither a marker, nor
+ * attributes, nor "//". Shared like usfm__scan_attributes. */
+USFM__INLINE void usfm__scan_text(USFM_Scanner *s, USFM_ScanToken *t, int use_blocks)
+{
+    uint32_t start = s->position, i, first_loose = USFM_NIL;
+    uint8_t flags = 0;
+#if USFM__USE_BLOCKS
+    i = use_blocks ? usfm__text_end_blocks(s, start, &flags, &first_loose)
+                   : usfm__text_end_scalar(s, start, &flags, &first_loose);
+#else
+    (void)use_blocks;
+    i = usfm__text_end_scalar(s, start, &flags, &first_loose);
+#endif
     USFM_ASSERT(i > start);
     usfm__tok(t, USFM_TOK_TEXT, start, i);
+    t->first_loose = first_loose;
     t->tok.level_flags = flags;
     s->position = i;
+}
+
+/* Returns 1 and fills *t, or 0 at end of input. Every call that
+ * returns 1 consumes at least one byte, so a caller's loop is bounded
+ * by the input length. use_blocks selects the block loops (when
+ * compiled in) or the byte loops; results are identical either way. */
+static int usfm__scan_next_with(USFM_Scanner *s, USFM_ScanToken *t, int use_blocks)
+{
+    const char *in = s->input;
+    uint32_t len = s->length;
+    uint32_t start;
+    if (s->expect_arg != USFM_ARG_NONE) {
+        uint8_t mode = s->expect_arg;
+        s->expect_arg = USFM_ARG_NONE;
+        if (usfm__scan_argument(s, t, mode)) return 1;
+    }
+    start = s->position;
+    if (start >= len) return 0;
+    if (in[start] == '\\' && !usfm__is_escape(in, len, start)) return usfm__scan_marker(s, t);
+    if (in[start] == '|' && s->pipe_is_attr) {
+        usfm__scan_attributes(s, t, use_blocks);
+        return 1;
+    }
+    if (in[start] == '/' && start + 1 < len && in[start + 1] == '/') {
+        usfm__tok(t, USFM_TOK_OPTBREAK, start, start + 2);
+        s->position = start + 2;
+        return 1;
+    }
+    usfm__scan_text(s, t, use_blocks);
     return 1;
 }
+
+static int usfm__scan_next(USFM_Scanner *s, USFM_ScanToken *t)
+{
+    return usfm__scan_next_with(s, t, USFM__USE_BLOCKS);
+}
+
+#if defined(USFM_TEST_SCAN_REFERENCE)
+/* v0.1's byte-loop scanner: the reference the block scanner is tested
+ * against. Test builds only. */
+static int usfm__scan_next_scalar(USFM_Scanner *s, USFM_ScanToken *t)
+{
+    return usfm__scan_next_with(s, t, 0);
+}
+#endif
 
 /* ===== AST handle ===== */
 
@@ -1726,12 +2294,30 @@ typedef struct USFM_Parser {
                                            by \id and \periph */
     uint8_t          check_utf8;        /* validate TEXT, ARGUMENT and
                                            ATTRIBUTES runs */
-    uint8_t          reserved[2];
+    uint8_t          fast;              /* use the character-span fast path
+                                           (0 only in tests, as the reference) */
+    uint8_t          reserved[1];
+#if defined(USFM_TEST_SCAN_REFERENCE)
+    uint8_t          utf8_reference;    /* test-only hook: see
+                                           USFM__ParseHooks */
+#endif
     uint32_t         depth;
     uint32_t         last_end;          /* end of the last token placed */
+    uint32_t         text_node;         /* last TEXT node made from a TEXT
+                                           token, or USFM_NIL ... */
+    uint32_t         text_offset;       /* ... its span offset ... */
+    uint32_t         text_first_loose;  /* ... and its first CR/LF/TAB */
     USFM_CloserTable closers[2];        /* [in_note]: see usfm__closer_ahead */
     USFM_Frame       stack[USFM_STACK_DEPTH];
 } USFM_Parser;
+
+/* Nonzero when a test asked for the reference UTF-8 validation (every
+ * run checked on its own); always 0 outside the tests. */
+#if defined(USFM_TEST_SCAN_REFERENCE)
+#define USFM__UTF8_REFERENCE(p) ((p)->utf8_reference != 0)
+#else
+#define USFM__UTF8_REFERENCE(p) 0
+#endif
 
 static uint8_t usfm__top_kind(const USFM_Parser *p)
 {
@@ -1858,6 +2444,396 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
     return n;
 }
 
+/* ---- SIMD UTF-8 validation ---- */
+
+/* Keiser-Lemire error classes ("Validating UTF-8 in less than one
+ * instruction per byte", 2021). TOO_LARGE_1000 and OVERLONG_4 share a
+ * bit by design. */
+#define USFM__U8_TOO_SHORT      (1 << 0)
+#define USFM__U8_TOO_LONG       (1 << 1)
+#define USFM__U8_OVERLONG_3     (1 << 2)
+#define USFM__U8_TOO_LARGE      (1 << 3)
+#define USFM__U8_SURROGATE      (1 << 4)
+#define USFM__U8_OVERLONG_2     (1 << 5)
+#define USFM__U8_TOO_LARGE_1000 (1 << 6)
+#define USFM__U8_OVERLONG_4     (1 << 6)
+#define USFM__U8_TWO_CONTS      (1 << 7)
+/* Table entries are bytes; this keeps -Woverflow quiet for bit 7. */
+#define USFM__U8_C(x) ((char)(x))
+#define USFM__U8_CARRY (USFM__U8_TOO_SHORT | USFM__U8_TOO_LONG | USFM__U8_TWO_CONTS)
+
+/* The three 16-entry lookup tables, shared by every SIMD path. */
+#define USFM__U8_B1H \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TOO_LONG), \
+    USFM__U8_C(USFM__U8_TWO_CONTS), \
+    USFM__U8_C(USFM__U8_TWO_CONTS), \
+    USFM__U8_C(USFM__U8_TWO_CONTS), \
+    USFM__U8_C(USFM__U8_TWO_CONTS), \
+    USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_2), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_OVERLONG_3 | USFM__U8_SURROGATE), \
+    USFM__U8_C(USFM__U8_TOO_SHORT | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4)
+#define USFM__U8_B1L \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_OVERLONG_3 | USFM__U8_OVERLONG_2 | USFM__U8_OVERLONG_4), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_OVERLONG_2), \
+    USFM__U8_C(USFM__U8_CARRY), \
+    USFM__U8_C(USFM__U8_CARRY), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000 | USFM__U8_SURROGATE), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000), \
+    USFM__U8_C(USFM__U8_CARRY | USFM__U8_TOO_LARGE | USFM__U8_TOO_LARGE_1000)
+#define USFM__U8_B2H \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 | USFM__U8_TOO_LARGE_1000 | USFM__U8_OVERLONG_4), \
+    USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_OVERLONG_3 | USFM__U8_TOO_LARGE), \
+    USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE | USFM__U8_TOO_LARGE), \
+    USFM__U8_C(USFM__U8_TOO_LONG | USFM__U8_OVERLONG_2 | USFM__U8_TWO_CONTS | USFM__U8_SURROGATE | USFM__U8_TOO_LARGE), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT), \
+    USFM__U8_C(USFM__U8_TOO_SHORT)
+/* The last 3 bytes of the "incomplete" threshold: a lead byte there needs more bytes. */
+#define USFM__U8_INCOMPLETE_LAST3 (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1)
+/* Saturating-subtract threshold byte for positions that can never be incomplete. */
+#define USFM__U8_FF USFM__U8_C(0xFF)
+#define USFM__U8_FF13 USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, \
+    USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF
+#define USFM__U8_FF16 USFM__U8_FF13, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF
+
+/* Whole-input validation is SIMD-only: on scalar builds a separate DFA
+ * pass is slower than checking runs while parsing (see the spec). */
+#if !defined(USFM_SIMD_NONE) && defined(__AVX512BW__)
+#  include <immintrin.h>
+#  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "avx512bw"
+/* Keiser-Lemire UTF-8 validation, 64 bytes per step (AVX-512BW). Returns
+ * 1 if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    const __m512i b1h = _mm512_broadcast_i32x4(_mm_setr_epi8(USFM__U8_B1H));
+    const __m512i b1l = _mm512_broadcast_i32x4(_mm_setr_epi8(USFM__U8_B1L));
+    const __m512i b2h = _mm512_broadcast_i32x4(_mm_setr_epi8(USFM__U8_B2H));
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    static const char incomplete_bytes[64] = {
+        USFM__U8_FF16, USFM__U8_FF16, USFM__U8_FF16, USFM__U8_FF13,
+        USFM__U8_INCOMPLETE_LAST3};
+    const __m512i incomplete_max = _mm512_loadu_si512((const void *)incomplete_bytes);
+    const __m512i nib = _mm512_set1_epi8(0x0F);
+    __m512i prev = _mm512_setzero_si512(), err = _mm512_setzero_si512(), pending = _mm512_setzero_si512();
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 64, then the tail ends it */
+        __m512i in;
+        if (n - i >= 64u) {
+            in = _mm512_loadu_si512((const void *)(s + i));
+            i += 64u;
+        } else if (i < n) {
+            char tail[64];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = _mm512_loadu_si512((const void *)tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (_mm512_movepi8_mask(in) == 0) {
+            err = _mm512_or_si512(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            /* Lane k of t is the 16 bytes just before lane k of in. */
+            __m512i t = _mm512_alignr_epi64(in, prev, 6);
+            __m512i p1 = _mm512_alignr_epi8(in, t, 15);
+            __m512i p2 = _mm512_alignr_epi8(in, t, 14);
+            __m512i p3 = _mm512_alignr_epi8(in, t, 13);
+            __m512i sc = _mm512_and_si512(
+                _mm512_and_si512(_mm512_shuffle_epi8(b1h, _mm512_and_si512(_mm512_srli_epi16(p1, 4), nib)),
+                                 _mm512_shuffle_epi8(b1l, _mm512_and_si512(p1, nib))),
+                _mm512_shuffle_epi8(b2h, _mm512_and_si512(_mm512_srli_epi16(in, 4), nib)));
+            __m512i m23 = _mm512_or_si512(_mm512_subs_epu8(p2, _mm512_set1_epi8((char)(0xE0 - 0x80))),
+                                          _mm512_subs_epu8(p3, _mm512_set1_epi8((char)(0xF0 - 0x80))));
+            err = _mm512_or_si512(err, _mm512_xor_si512(_mm512_and_si512(m23, _mm512_set1_epi8((char)0x80)), sc));
+            pending = _mm512_subs_epu8(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = _mm512_or_si512(err, pending);   /* the input ended inside a sequence */
+    return _mm512_test_epi8_mask(err, err) == 0;
+}
+#elif !defined(USFM_SIMD_NONE) && defined(__AVX2__) && !defined(__AVX512BW__)
+#  include <immintrin.h>
+#  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "avx2"
+/* Keiser-Lemire UTF-8 validation, 32 bytes per step (AVX2). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    const __m128i b1h_ = _mm_setr_epi8(USFM__U8_B1H);
+    const __m128i b1l_ = _mm_setr_epi8(USFM__U8_B1L);
+    const __m128i b2h_ = _mm_setr_epi8(USFM__U8_B2H);
+    const __m256i b1h = _mm256_broadcastsi128_si256(b1h_);
+    const __m256i b1l = _mm256_broadcastsi128_si256(b1l_);
+    const __m256i b2h = _mm256_broadcastsi128_si256(b2h_);
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    const __m256i incomplete_max = _mm256_setr_epi8(
+        USFM__U8_FF16, USFM__U8_FF13,
+        USFM__U8_INCOMPLETE_LAST3);
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    __m256i prev = _mm256_setzero_si256(), err = _mm256_setzero_si256(), pending = _mm256_setzero_si256();
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 32, then the tail ends it */
+        __m256i in;
+        if (n - i >= 32u) {
+            in = _mm256_loadu_si256((const __m256i *)(const void *)(s + i));
+            i += 32u;
+        } else if (i < n) {
+            char tail[32];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = _mm256_loadu_si256((const __m256i *)(const void *)tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (_mm256_movemask_epi8(in) == 0) {
+            err = _mm256_or_si256(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            __m256i t = _mm256_permute2x128_si256(prev, in, 0x21);   /* prev.hi : in.lo */
+            __m256i p1 = _mm256_alignr_epi8(in, t, 15);
+            __m256i p2 = _mm256_alignr_epi8(in, t, 14);
+            __m256i p3 = _mm256_alignr_epi8(in, t, 13);
+            __m256i sc = _mm256_and_si256(
+                _mm256_and_si256(_mm256_shuffle_epi8(b1h, _mm256_and_si256(_mm256_srli_epi16(p1, 4), nib)),
+                                 _mm256_shuffle_epi8(b1l, _mm256_and_si256(p1, nib))),
+                _mm256_shuffle_epi8(b2h, _mm256_and_si256(_mm256_srli_epi16(in, 4), nib)));
+            __m256i m23 = _mm256_or_si256(_mm256_subs_epu8(p2, _mm256_set1_epi8((char)(0xE0 - 0x80))),
+                                          _mm256_subs_epu8(p3, _mm256_set1_epi8((char)(0xF0 - 0x80))));
+            err = _mm256_or_si256(err, _mm256_xor_si256(_mm256_and_si256(m23, _mm256_set1_epi8((char)0x80)), sc));
+            pending = _mm256_subs_epu8(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = _mm256_or_si256(err, pending);   /* the input ended inside a sequence */
+    return _mm256_testz_si256(err, err);
+}
+#elif !defined(USFM_SIMD_NONE) && defined(__SSSE3__) && !defined(__AVX512BW__)
+#  include <tmmintrin.h>
+#  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "ssse3"
+/* Keiser-Lemire UTF-8 validation, 16 bytes per step (SSSE3). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    const __m128i b1h = _mm_setr_epi8(USFM__U8_B1H);
+    const __m128i b1l = _mm_setr_epi8(USFM__U8_B1L);
+    const __m128i b2h = _mm_setr_epi8(USFM__U8_B2H);
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    const __m128i incomplete_max = _mm_setr_epi8(USFM__U8_FF13,
+                                                 USFM__U8_INCOMPLETE_LAST3);
+    const __m128i nib = _mm_set1_epi8(0x0F);
+    __m128i prev = _mm_setzero_si128(), err = _mm_setzero_si128(), pending = _mm_setzero_si128();
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 16, then the tail ends it */
+        __m128i in;
+        if (n - i >= 16u) {
+            in = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
+            i += 16u;
+        } else if (i < n) {
+            char tail[16];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = _mm_loadu_si128((const __m128i *)(const void *)tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (_mm_movemask_epi8(in) == 0) {
+            err = _mm_or_si128(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            __m128i p1 = _mm_alignr_epi8(in, prev, 15);
+            __m128i p2 = _mm_alignr_epi8(in, prev, 14);
+            __m128i p3 = _mm_alignr_epi8(in, prev, 13);
+            __m128i sc = _mm_and_si128(
+                _mm_and_si128(_mm_shuffle_epi8(b1h, _mm_and_si128(_mm_srli_epi16(p1, 4), nib)),
+                              _mm_shuffle_epi8(b1l, _mm_and_si128(p1, nib))),
+                _mm_shuffle_epi8(b2h, _mm_and_si128(_mm_srli_epi16(in, 4), nib)));
+            __m128i m23 = _mm_or_si128(_mm_subs_epu8(p2, _mm_set1_epi8((char)(0xE0 - 0x80))),
+                                       _mm_subs_epu8(p3, _mm_set1_epi8((char)(0xF0 - 0x80))));
+            err = _mm_or_si128(err, _mm_xor_si128(_mm_and_si128(m23, _mm_set1_epi8((char)0x80)), sc));
+            pending = _mm_subs_epu8(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = _mm_or_si128(err, pending);   /* the input ended inside a sequence */
+    return _mm_movemask_epi8(_mm_cmpeq_epi8(err, _mm_setzero_si128())) == 0xFFFF;
+}
+#elif !defined(USFM_SIMD_NONE) && defined(__aarch64__) && defined(__ARM_NEON)
+#  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "neon"
+/* Keiser-Lemire UTF-8 validation, 16 bytes per step (NEON). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    static const char b1h_t[16] = {USFM__U8_B1H};
+    static const char b1l_t[16] = {USFM__U8_B1L};
+    static const char b2h_t[16] = {USFM__U8_B2H};
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    static const char inc_t[16] = {USFM__U8_FF13,
+                                   USFM__U8_INCOMPLETE_LAST3};
+    const uint8x16_t b1h = vld1q_u8((const uint8_t *)b1h_t);
+    const uint8x16_t b1l = vld1q_u8((const uint8_t *)b1l_t);
+    const uint8x16_t b2h = vld1q_u8((const uint8_t *)b2h_t);
+    const uint8x16_t incomplete_max = vld1q_u8((const uint8_t *)inc_t);
+    const uint8x16_t nib = vdupq_n_u8(0x0F);
+    uint8x16_t prev = vdupq_n_u8(0), err = vdupq_n_u8(0), pending = vdupq_n_u8(0);
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 16, then the tail ends it */
+        uint8x16_t in;
+        if (n - i >= 16u) {
+            in = vld1q_u8((const uint8_t *)(const void *)(s + i));
+            i += 16u;
+        } else if (i < n) {
+            uint8_t tail[16];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = vld1q_u8(tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (vmaxvq_u8(in) < 0x80) {
+            err = vorrq_u8(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            uint8x16_t p1 = vextq_u8(prev, in, 15);
+            uint8x16_t p2 = vextq_u8(prev, in, 14);
+            uint8x16_t p3 = vextq_u8(prev, in, 13);
+            uint8x16_t sc = vandq_u8(
+                vandq_u8(vqtbl1q_u8(b1h, vshrq_n_u8(p1, 4)),
+                         vqtbl1q_u8(b1l, vandq_u8(p1, nib))),
+                vqtbl1q_u8(b2h, vshrq_n_u8(in, 4)));
+            uint8x16_t m23 = vorrq_u8(vqsubq_u8(p2, vdupq_n_u8(0xE0 - 0x80)),
+                                      vqsubq_u8(p3, vdupq_n_u8(0xF0 - 0x80)));
+            err = vorrq_u8(err, veorq_u8(vandq_u8(m23, vdupq_n_u8(0x80)), sc));
+            pending = vqsubq_u8(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = vorrq_u8(err, pending);   /* the input ended inside a sequence */
+    return vmaxvq_u8(err) == 0;
+}
+#elif !defined(USFM_SIMD_NONE) && defined(__wasm_simd128__)
+#  define USFM__UTF8_SIMD 1
+#  define USFM__UTF8_SIMD_PATH "wasm-simd128"
+/* Keiser-Lemire UTF-8 validation, 16 bytes per step (wasm simd128). Returns 1
+ * if s[0, n) is valid UTF-8. The bytes before s are taken to be ASCII;
+ * a zero-padded last chunk and the final pending check catch a sequence
+ * cut short by the end. Chunks with no high bit skip the lookups. */
+static int usfm__utf8_valid_simd(const char *s, uint32_t n)
+{
+    static const char b1h_t[16] = {USFM__U8_B1H};
+    static const char b1l_t[16] = {USFM__U8_B1L};
+    static const char b2h_t[16] = {USFM__U8_B2H};
+    /* A lead byte in the last 3 positions still needs continuation bytes. */
+    static const char inc_t[16] = {USFM__U8_FF13,
+                                   USFM__U8_INCOMPLETE_LAST3};
+    const v128_t b1h = wasm_v128_load(b1h_t);
+    const v128_t b1l = wasm_v128_load(b1l_t);
+    const v128_t b2h = wasm_v128_load(b2h_t);
+    const v128_t incomplete_max = wasm_v128_load(inc_t);
+    const v128_t nib = wasm_u8x16_splat(0x0F);
+    v128_t prev = wasm_i8x16_splat(0), err = wasm_i8x16_splat(0), pending = wasm_i8x16_splat(0);
+    uint32_t i = 0;
+    for (;;) {                          /* bounded: i grows by 16, then the tail ends it */
+        v128_t in;
+        if (n - i >= 16u) {
+            in = wasm_v128_load(s + i);
+            i += 16u;
+        } else if (i < n) {
+            char tail[16];
+            memset(tail, 0, sizeof tail);
+            memcpy(tail, s + i, n - i);
+            in = wasm_v128_load(tail);
+            i = n;
+        } else {
+            break;
+        }
+        if (wasm_i8x16_bitmask(in) == 0) {
+            err = wasm_v128_or(err, pending);   /* a sequence ended at an ASCII byte */
+        } else {
+            v128_t p1 = wasm_i8x16_shuffle(prev, in, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30);
+            v128_t p2 = wasm_i8x16_shuffle(prev, in, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29);
+            v128_t p3 = wasm_i8x16_shuffle(prev, in, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+            v128_t sc = wasm_v128_and(
+                wasm_v128_and(wasm_i8x16_swizzle(b1h, wasm_u8x16_shr(p1, 4)),
+                              wasm_i8x16_swizzle(b1l, wasm_v128_and(p1, nib))),
+                wasm_i8x16_swizzle(b2h, wasm_u8x16_shr(in, 4)));
+            v128_t m23 = wasm_v128_or(wasm_u8x16_sub_sat(p2, wasm_u8x16_splat(0xE0 - 0x80)),
+                                      wasm_u8x16_sub_sat(p3, wasm_u8x16_splat(0xF0 - 0x80)));
+            err = wasm_v128_or(err, wasm_v128_xor(wasm_v128_and(m23, wasm_u8x16_splat(0x80)), sc));
+            pending = wasm_u8x16_sub_sat(in, incomplete_max);
+        }
+        prev = in;
+    }
+    err = wasm_v128_or(err, pending);   /* the input ended inside a sequence */
+    return !wasm_v128_any_true(err);
+}
+#else
+#  define USFM__UTF8_SIMD 0
+#  define USFM__UTF8_SIMD_PATH "none"
+/* usfm__utf8_valid for a whole input (the scalar build's one pass):
+ * the ASCII skip tests 32 bytes at a time. In CJK or Arabic text the
+ * short ASCII markup between runs then rarely fills a whole step, so the
+ * test stays predictable; mostly-ASCII text still skips. */
+static int usfm__utf8_valid_input(const char *s, uint32_t n)
+{
+    const uint8_t *u = (const uint8_t *)s;
+    uint32_t i = 0, k;
+    uint64_t st = 0;
+    while (n - i >= 32u) {              /* bounded: i grows by 32 */
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, u + i, 8);
+        memcpy(&w1, u + i + 8u, 8);
+        memcpy(&w2, u + i + 16u, 8);
+        memcpy(&w3, u + i + 24u, 8);
+        if (st == 0 && ((w0 | w1 | w2 | w3) & 0x8080808080808080ull) == 0) {
+            i += 32u;
+            continue;
+        }
+        for (k = 0; k < 32u; k++) st = (USFM_Utf8Dfa[u[i + k]] >> st) & 63u;   /* bounded: 32 */
+        i += 32u;
+    }
+    while (i < n) st = (USFM_Utf8Dfa[u[i++]] >> st) & 63u;   /* bounded: i grows */
+    return st == 0;
+}
+#endif
+
 static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marker marker);
 
 /* Keeps a rarely-needed slow path out of the hot token loop. */
@@ -1934,7 +2910,7 @@ static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marke
 
 /* Appends a node as a child of the top frame. Returns its index, or
  * USFM_NIL (and sets p->failed) if the node array can't grow. */
-static uint32_t usfm__append(USFM_Parser *p, uint8_t kind, USFM_Span span,
+USFM__INLINE uint32_t usfm__append(USFM_Parser *p, uint8_t kind, USFM_Span span,
                              USFM_Marker marker, uint8_t level_flags)
 {
     USFM_Ast *ast = p->ast;
@@ -2071,9 +3047,18 @@ static void usfm__trim_last_text(USFM_Parser *p)
     if (n->span.length == 0) {
         ast->node_count--;
     } else if (n->level_flags & USFM_TF_HAS_LOOSE_WS) {
-        /* Only ASCII whitespace was removed, so validity is unchanged. */
-        n->level_flags = (uint8_t)(usfm__text_flags(ast->input, n->span) |
-                                   (n->level_flags & USFM_TF_INVALID_UTF8));
+        /* Only the CR/LF/TAB flag can change: trimmed bytes are ASCII
+         * blanks, so validity (USFM_TF_INVALID_UTF8) is unchanged too.
+         * For a node straight from a TEXT token the scanner recorded its
+         * first CR/LF/TAB, so this is O(1); otherwise rescan (rare). */
+        if (ast->node_count - 1 == p->text_node && n->span.offset == p->text_offset) {
+            if (p->text_first_loose >= n->span.offset + n->span.length) {
+                n->level_flags &= (uint8_t)~USFM_TF_HAS_LOOSE_WS;
+            }
+        } else {
+            n->level_flags = (uint8_t)(usfm__text_flags(ast->input, n->span) |
+                                       (n->level_flags & USFM_TF_INVALID_UTF8));
+        }
     }
 }
 
@@ -2279,6 +3264,7 @@ static void usfm__set_version(USFM_Parser *p, USFM_Span arg)
 static void usfm__on_text(USFM_Parser *p, const USFM_ScanToken *t)
 {
     uint8_t k = usfm__top_kind(p);
+    uint32_t node;
     if ((usfm__is_block(k) || k == USFM_AST_TABLE || k == USFM_AST_MILESTONE) &&
         usfm__is_blank(p->ast->input, t->tok.span)) {
         return;                         /* layout whitespace between blocks */
@@ -2286,11 +3272,16 @@ static void usfm__on_text(USFM_Parser *p, const USFM_ScanToken *t)
     usfm__ensure_inline(p, t->tok.span.offset);
     /* An unclaimed ARGUMENT or stray ATTRIBUTES token has no text flags
      * from the scanner; compute them (rare). */
-    usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
-                 (uint8_t)((t->tok.kind == USFM_TOK_TEXT
-                                ? (t->tok.level_flags & USFM_TEXT_FLAGS_COOK)
-                                : usfm__text_flags(p->ast->input, t->tok.span)) |
-                           (t->tok.level_flags & USFM_TF_INVALID_UTF8)));
+    node = usfm__append(p, USFM_AST_TEXT, t->tok.span, USFM_M_NONE,
+                        (uint8_t)((t->tok.kind == USFM_TOK_TEXT
+                                       ? (t->tok.level_flags & USFM_TEXT_FLAGS_COOK)
+                                       : usfm__text_flags(p->ast->input, t->tok.span)) |
+                                  (t->tok.level_flags & USFM_TF_INVALID_UTF8)));
+    if (t->tok.kind == USFM_TOK_TEXT && node != USFM_NIL) {
+        p->text_node = node;
+        p->text_offset = t->tok.span.offset;
+        p->text_first_loose = t->first_loose;
+    }
 }
 
 static void usfm__on_optbreak(USFM_Parser *p, const USFM_ScanToken *t)
@@ -2606,6 +3597,109 @@ static int usfm__closer_ahead(USFM_Parser *p, USFM_Marker marker, uint32_t name_
     return found && last >= pos;
 }
 
+/* Closes the top frame, a character span whose end marker ends at
+ * `end`, as usfm__on_close does. Returns 1 if the fast path may go on:
+ * the new top frame is PARA, CELL, NOTE or CHAR. */
+USFM__INLINE int usfm__fast_close(USFM_Parser *p, uint32_t end)
+{
+    uint8_t top;
+    if (end > p->last_end) p->last_end = end;
+    usfm__close_top(p);
+    top = usfm__top_kind(p);
+    return top == USFM_AST_PARA || top == USFM_AST_CELL || top == USFM_AST_NOTE ||
+           top == USFM_AST_CHAR;
+}
+
+/* Byte compare for the fast path's closer check. The opening marker is
+ * short ("\\" + optional "+" + name, typically 2-6 bytes), and a memcmp
+ * call costs more than the compare (1.6% of instructions on
+ * WEB-STRONGS). Bounded: n iterations at most. */
+USFM__INLINE int usfm__same_bytes(const char *a, const char *b, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+/* Character-span fast path (docs/superpowers/specs/
+ * 2026-11-18-merged-parser-loop-design.md). Right after a character span
+ * opens, reads its text, attributes and own closer, then any text after
+ * the closer, without going round the main loop: no token struct is
+ * handed over, no push-back check, no dispatch. Each token is scanned by
+ * the scanner's own helpers and handled exactly as the generic handler
+ * would handle it for the same top frame, so the tree, diagnostics and
+ * parser state are identical. Anything else is left to the main loop; a
+ * marker already scanned is handed over through the push-back slot.
+ * Bounded: each pass consumes input or returns. */
+static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t open_length)
+{
+    USFM_Scanner *s = &p->scan;
+    const char *in = s->input;
+    uint32_t len = s->length;
+    USFM_ScanToken t;
+    int closed = 0;
+    for (;;) {
+        uint32_t pos = s->position, node;
+        uint8_t top = usfm__top_kind(p);
+        if (p->failed || pos >= len) return;
+        USFM_ASSERT(s->expect_arg == USFM_ARG_NONE && !p->has_peeked);
+        USFM_ASSERT(closed || top == USFM_AST_CHAR);
+        if (in[pos] == '\\' && !usfm__is_escape(in, len, pos)) {
+            if (closed) return;         /* the next marker: the main loop's */
+            /* The usual closer repeats the opening marker byte for byte
+             * ("\\+w" ... "\\+w*"); it then classifies exactly as the
+             * opening marker did, so it matches the top frame. Any other
+             * spelling goes through the scanner and usfm__frame_matches. */
+            if (len - pos > open_length &&
+                usfm__same_bytes(in + pos, in + open_offset, open_length) && in[pos + open_length] == '*') {
+                uint32_t end = pos + open_length + 1u;
+                s->position = end;
+                closed = 1;
+                if (!usfm__fast_close(p, end)) return;
+                USFM_ASSERT(s->position > pos);
+                continue;
+            }
+            usfm__scan_marker(s, &t);
+            if (t.tok.kind == USFM_TOK_MARKER_END && t.name_length != 0 &&
+                usfm__frame_matches(p, &p->stack[p->depth - 1], &t)) {
+                closed = 1;
+                if (!usfm__fast_close(p, usfm__tok_end(&t))) return;
+                USFM_ASSERT(s->position > pos);
+                continue;
+            }
+            usfm__push_back(p, &t);
+            return;
+        }
+        /* The top frame is PARA, CELL, NOTE or CHAR here; this is the value
+         * usfm__next computes for those. */
+        s->pipe_is_attr = (uint8_t)(top == USFM_AST_CHAR);
+        if (in[pos] == '|' && s->pipe_is_attr) {
+            usfm__scan_attributes(s, &t, USFM__USE_BLOCKS);
+            if (p->check_utf8) usfm__check_utf8(p, &t);
+            usfm__append(p, USFM_AST_ATTRIBUTES, t.tok.span, USFM_M_NONE,
+                         (uint8_t)(t.tok.level_flags & USFM_TF_INVALID_UTF8));
+            USFM_ASSERT(s->position > pos);
+            continue;
+        }
+        if (in[pos] == '/' && pos + 1 < len && in[pos + 1] == '/') return;
+        usfm__scan_text(s, &t, USFM__USE_BLOCKS);
+        if (p->check_utf8) usfm__check_utf8(p, &t);
+        /* usfm__on_text for a PARA, CELL, NOTE or CHAR top frame: no blank
+         * skip, and no implied paragraph. */
+        node = usfm__append(p, USFM_AST_TEXT, t.tok.span, USFM_M_NONE,
+                            (uint8_t)(t.tok.level_flags &
+                                      (USFM_TEXT_FLAGS_COOK | USFM_TF_INVALID_UTF8)));
+        if (node != USFM_NIL) {
+            p->text_node = node;
+            p->text_offset = t.tok.span.offset;
+            p->text_first_loose = t.first_loose;
+        }
+        USFM_ASSERT(s->position > pos);
+    }
+}
+
 /* A plain (non-\+) character marker inside open character spans closes
  * them, innermost first, until one whose end marker is still ahead
  * (usfm__closer_ahead); it nests inside that one. Note parts are never
@@ -2624,7 +3718,12 @@ static void usfm__on_char(USFM_Parser *p, const USFM_ScanToken *t)
             usfm__close_implicit(p);
         }
     }
-    usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0);
+    if (usfm__open_tok(p, USFM_AST_CHAR, t, t->tok.level_flags, 0) != USFM_NIL && p->fast &&
+        !p->has_peeked) {
+        /* The opening marker's bytes: "\\", an optional "+", the name. */
+        usfm__char_body_fast(p, t->tok.span.offset,
+                             t->name_offset + t->name_length - t->tok.span.offset);
+    }
 }
 
 static void usfm__on_attributes(USFM_Parser *p, const USFM_ScanToken *t)
@@ -2878,9 +3977,23 @@ static void usfm__finish(USFM_Parser *p)
 /* Cap on the initial node-array estimate (1 << 20 nodes = 20 MiB). */
 #define USFM__NODE_ESTIMATE_MAX (1u << 20)
 
-USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
-                                      const USFM_Config *config, uint32_t flags,
-                                      const USFM_Alc *alc_in, USFM_Err *err)
+/* Internal parse options: the seams the tests drive. USFM_Ast_ParseOpts
+ * passes NULL, meaning all defaults. */
+typedef struct USFM__ParseHooks {
+    uint8_t  fast;              /* character-span fast path; 0 is the
+                                   reference the tests compare it with */
+#if defined(USFM_TEST_SCAN_REFERENCE)
+    uint8_t  utf8_reference;    /* check every TEXT, ARGUMENT and ATTRIBUTES
+                                   run on its own, with no whole-input
+                                   validation: the reference UTF-8
+                                   validation is compared with */
+#endif
+} USFM__ParseHooks;
+
+static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
+                                       const USFM_Config *config, uint32_t flags,
+                                       const USFM_Alc *alc_in, USFM_Err *err,
+                                       const USFM__ParseHooks *hooks)
 {
     const USFM_Alc *alc = usfm__alc_or_default(alc_in);
     USFM_Ast *ast;
@@ -2951,8 +4064,31 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
     memset(&p, 0, sizeof p);
     p.ast = ast;
     p.version_auto = version == USFM_VERSION_AUTO;
+    p.fast = (uint8_t)(hooks == NULL || hooks->fast != 0);
     p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
+#if defined(USFM_TEST_SCAN_REFERENCE)
+    if (hooks != NULL) {
+        p.utf8_reference = hooks->utf8_reference;
+    }
+#endif
+#if USFM__UTF8_SIMD
+    /* Valid as a whole means every run is valid: bytes outside runs are
+     * ASCII (or the UTF-8 BOM) and no sequence contains an ASCII byte. So
+     * one SIMD pass replaces the per-run checks; on invalid input every
+     * run is still checked, and diagnostics match the scalar build. */
+    if (p.check_utf8 && !USFM__UTF8_REFERENCE(&p) && usfm__utf8_valid_simd(text, input_length)) {
+        p.check_utf8 = 0;
+    }
+#else
+    /* The same whole-input pass with the scalar validator: one long loop
+     * instead of one short loop per run, whose trip counts (run length,
+     * 8-byte words, tail bytes) mispredict. */
+    if (p.check_utf8 && !USFM__UTF8_REFERENCE(&p) && usfm__utf8_valid_input(text, input_length)) {
+        p.check_utf8 = 0;
+    }
+#endif
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
+    p.text_node = USFM_NIL;
     usfm__scan_init(&p.scan, text, input_length);
     usfm__open(&p, USFM_AST_BOOK, usfm__span(0, input_length), USFM_M_NONE, 0, 0);
     /* The BOOK span covers the whole input, which would otherwise make
@@ -2971,6 +4107,13 @@ USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
         usfm__set_err(err, USFM_ERR_NOMEM, ast->first_dropped_offset);
     }
     return ast;
+}
+
+USFM_API USFM_Ast *USFM_Ast_ParseOpts(const char *input, uint32_t input_length,
+                                      const USFM_Config *config, uint32_t flags,
+                                      const USFM_Alc *alc_in, USFM_Err *err)
+{
+    return usfm__parse_opts_impl(input, input_length, config, flags, alc_in, err, NULL);
 }
 
 USFM_API USFM_Ast *USFM_Ast_Parse(const char *input, uint32_t input_length,

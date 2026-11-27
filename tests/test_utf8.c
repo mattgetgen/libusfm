@@ -71,42 +71,50 @@ static void test_utf8_validator_random(void)
     }
 }
 
+/* A random valid UTF-8 string of 1 to 40 code points (at most 160 bytes). */
+static uint32_t utf8_gen_valid(uint32_t *seedp, unsigned char *s)
+{
+    uint32_t seed = *seedp, count, n = 0, r, j;
+    seed = seed * 1664525u + 1013904223u;
+    count = 1u + (seed >> 16) % 40u;
+    for (j = 0; j < count; j++) {
+        uint32_t cp;
+        seed = seed * 1664525u + 1013904223u;
+        r = seed >> 8;
+        switch ((seed >> 4) & 3u) {
+        case 0: cp = r & 0x7Fu; break;
+        case 1: cp = 0x80u + r % 0x780u; break;
+        case 2: cp = 0x800u + r % 0xF800u; if (cp >= 0xD800u && cp <= 0xDFFFu) cp += 0x800u; break;
+        default: cp = 0x10000u + r % 0x100000u; break;
+        }
+        if (cp < 0x80u) s[n++] = (unsigned char)cp;
+        else if (cp < 0x800u) {
+            s[n++] = (unsigned char)(0xC0u | (cp >> 6));
+            s[n++] = (unsigned char)(0x80u | (cp & 0x3Fu));
+        } else if (cp < 0x10000u) {
+            s[n++] = (unsigned char)(0xE0u | (cp >> 12));
+            s[n++] = (unsigned char)(0x80u | ((cp >> 6) & 0x3Fu));
+            s[n++] = (unsigned char)(0x80u | (cp & 0x3Fu));
+        } else {
+            s[n++] = (unsigned char)(0xF0u | (cp >> 18));
+            s[n++] = (unsigned char)(0x80u | ((cp >> 12) & 0x3Fu));
+            s[n++] = (unsigned char)(0x80u | ((cp >> 6) & 0x3Fu));
+            s[n++] = (unsigned char)(0x80u | (cp & 0x3Fu));
+        }
+    }
+    *seedp = seed;
+    return n;
+}
+
 /* Valid multi-byte text longer than 8 bytes, with sequences straddling
  * 8-byte word boundaries, then one mutation of each string. */
 static void test_utf8_validator_encoded(void)
 {
-    uint32_t seed = 777u, i, j;
+    uint32_t seed = 777u, i;
     unsigned char s[176];
     int before = usfm_test_failures;
     for (i = 0; i < 20000u; i++) {
-        uint32_t count, n = 0, r;
-        seed = seed * 1664525u + 1013904223u;
-        count = 1u + (seed >> 16) % 40u;
-        for (j = 0; j < count; j++) {
-            uint32_t cp;
-            seed = seed * 1664525u + 1013904223u;
-            r = seed >> 8;
-            switch ((seed >> 4) & 3u) {
-            case 0: cp = r & 0x7Fu; break;
-            case 1: cp = 0x80u + r % 0x780u; break;
-            case 2: cp = 0x800u + r % 0xF800u; if (cp >= 0xD800u && cp <= 0xDFFFu) cp += 0x800u; break;
-            default: cp = 0x10000u + r % 0x100000u; break;
-            }
-            if (cp < 0x80u) s[n++] = (unsigned char)cp;
-            else if (cp < 0x800u) {
-                s[n++] = (unsigned char)(0xC0u | (cp >> 6));
-                s[n++] = (unsigned char)(0x80u | (cp & 0x3Fu));
-            } else if (cp < 0x10000u) {
-                s[n++] = (unsigned char)(0xE0u | (cp >> 12));
-                s[n++] = (unsigned char)(0x80u | ((cp >> 6) & 0x3Fu));
-                s[n++] = (unsigned char)(0x80u | (cp & 0x3Fu));
-            } else {
-                s[n++] = (unsigned char)(0xF0u | (cp >> 18));
-                s[n++] = (unsigned char)(0x80u | ((cp >> 12) & 0x3Fu));
-                s[n++] = (unsigned char)(0x80u | ((cp >> 6) & 0x3Fu));
-                s[n++] = (unsigned char)(0x80u | (cp & 0x3Fu));
-            }
-        }
+        uint32_t n = utf8_gen_valid(&seed, s);
         {
             uint32_t bad;
             CHECK_EQ(usfm__utf8_check((const char *)s, n, &bad), n);
@@ -121,6 +129,128 @@ static void test_utf8_validator_encoded(void)
             n = (seed >> 8) % (n + 1u);
         }
         check_validator_matches(s, n);
+        if (usfm_test_failures - before > 20) return;
+    }
+}
+
+#if !USFM__UTF8_SIMD
+/* Without SIMD the whole-input pass is the 32-byte-step scalar validator:
+ * the same tests hold for it. */
+#  define usfm__utf8_valid_simd usfm__utf8_valid_input
+#endif
+/* usfm__utf8_valid_simd against the scalar DFA; reports bytes, capped. */
+static void check_simd_matches(const unsigned char *s, uint32_t n)
+{
+    int a = usfm__utf8_valid_simd((const char *)s, n) != 0;
+    int b = usfm__utf8_valid((const char *)s, n) != 0;
+    usfm_test_checks++;
+    if (a != b) {
+        uint32_t i;
+        usfm_test_failures++;
+        if (usfm_test_failures < 20) {
+            fprintf(stderr, "utf8 simd mismatch: simd %d, scalar %d for", a, b);
+            for (i = 0; i < n && i < 80; i++) fprintf(stderr, " %02X", s[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
+static void test_utf8_simd_validator(void)
+{
+    static const unsigned char edge[] = {
+        0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF,
+        0xE0, 0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF3, 0xF4, 0xF5, 0xFF
+    };
+    const uint32_t e = (uint32_t)sizeof edge;
+    static const uint32_t offs[] = {
+        0, 1, 2, 3, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31, 32, 33,
+        44, 45, 46, 47, 48, 49, 60, 61, 62, 63, 64, 65
+    };
+    unsigned char buf[256], seq[4];
+
+    uint32_t len, a, b, c, d, k, off, tail, seed, i, j;
+    int before = usfm_test_failures;
+    /* The 42-byte case where a pending lead byte must still fail when a whole
+     * ASCII chunk follows: 15 x, C3, 24 x, C3 A9. */
+    memset(buf, 'x', 15);
+    buf[15] = 0xC3;
+    memset(buf + 16, 'x', 24);
+    buf[40] = 0xC3;
+    buf[41] = 0xA9;
+    CHECK_EQ(usfm__utf8_valid_simd((const char *)buf, 42), 0);
+    CHECK_EQ(usfm__utf8_valid((const char *)buf, 42), 0);
+    check_simd_matches(buf, 42);
+    /* 32-wide: lead at chunk position 31, a whole ASCII chunk, then more text. */
+    memset(buf, 'x', 31);
+    buf[31] = 0xC3;
+    memset(buf + 32, 'x', 40);
+    buf[72] = 0xC3;
+    buf[73] = 0xA9;
+    CHECK_EQ(usfm__utf8_valid_simd((const char *)buf, 74), 0);
+    CHECK_EQ(usfm__utf8_valid((const char *)buf, 74), 0);
+    check_simd_matches(buf, 74);
+    /* 64-wide: lead at chunk position 63, a whole ASCII chunk, then more text. */
+    memset(buf, 'x', 63);
+    buf[63] = 0xC3;
+    memset(buf + 64, 'x', 72);
+    buf[136] = 0xC3;
+    buf[137] = 0xA9;
+    CHECK_EQ(usfm__utf8_valid_simd((const char *)buf, 138), 0);
+    CHECK_EQ(usfm__utf8_valid((const char *)buf, 138), 0);
+    check_simd_matches(buf, 138);
+    /* Edge sequences at chunk-boundary offsets. */
+    for (len = 1; len <= 4; len++) {
+        uint32_t total = 1;
+        for (i = 0; i < len; i++) total *= e;
+        for (i = 0; i < total; i++) {
+            uint32_t v = i;
+            a = v % e; v /= e; b = v % e; v /= e; c = v % e; v /= e; d = v % e;
+            seq[0] = edge[a]; seq[1] = edge[b]; seq[2] = edge[c]; seq[3] = edge[d];
+            for (k = 0; k < (uint32_t)(sizeof offs / sizeof offs[0]); k++) {
+                off = offs[k];
+                if (len == 4 && (off & 15u) != 0u && (off & 15u) < 13u) continue;   /* keeps the run short */
+                for (tail = 0; tail < 3; tail++) {
+                    if (len == 4 && tail == 1) continue;   /* keeps the run short */
+                    /* End of buffer; 5 'x' after; 128 'x' (whole ASCII chunks at 32/64 wide) then U+00E9. */
+                    uint32_t n = off + len + (tail == 0 ? 0u : tail == 1 ? 5u : 130u);
+                    memset(buf, 'x', sizeof buf);
+                    memcpy(buf + off, seq, len);
+                    if (tail == 2) { buf[n - 2] = 0xC3; buf[n - 1] = 0xA9; }
+                    check_simd_matches(buf, n);
+                }
+            }
+            if (usfm_test_failures - before > 20) return;
+        }
+    }
+    /* Random strings of 0-200 bytes, 60% ASCII. */
+    seed = 424242u;
+    for (i = 0; i < 250000u; i++) {
+        unsigned char r[200];
+        uint32_t n;
+        seed = seed * 1664525u + 1013904223u;
+        n = (seed >> 16) % 201u;
+        for (j = 0; j < n; j++) {
+            seed = seed * 1664525u + 1013904223u;
+            r[j] = (unsigned char)((seed >> 24) < 154u ? (seed >> 8) & 0x7Fu : seed >> 16);
+        }
+        check_simd_matches(r, n);
+        if (usfm_test_failures - before > 20) return;
+    }
+    /* Valid encoded strings and one mutation of each. */
+    seed = 991u;
+    for (i = 0; i < 20000u; i++) {
+        unsigned char s[176];
+        uint32_t n = utf8_gen_valid(&seed, s);
+        check_simd_matches(s, n);
+        seed = seed * 1664525u + 1013904223u;
+        if ((seed >> 20) & 1u) {
+            seed = seed * 1664525u + 1013904223u;
+            s[(seed >> 8) % n] = (unsigned char)(seed >> 24);
+        } else {
+            seed = seed * 1664525u + 1013904223u;
+            n = (seed >> 8) % (n + 1u);
+        }
+        check_simd_matches(s, n);
         if (usfm_test_failures - before > 20) return;
     }
 }
@@ -503,6 +633,7 @@ static void run_utf8_tests(void)
     test_utf8_validator_edges();
     test_utf8_validator_random();
     test_utf8_validator_encoded();
+    test_utf8_simd_validator();
     test_utf8_diagnostics();
     test_utf8_opt_out();
     test_utf8_legacy_book();

@@ -13,9 +13,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define USFM_TEST_SCAN_REFERENCE
 #define USFM_IMPLEMENTATION
 #include "../usfm.h"
 #include "check.h"
+#include "scan_compare.h"
 
 typedef struct FuzzAlc {
     size_t   live_bytes;
@@ -85,6 +87,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     USFM_Ast *ast;
     uint32_t flags;
     if (size < 2 || size - 2 > USFM_INPUT_MAX) return 0;
+    {
+        const char *text = (const char *)data + 2;
+        uint32_t text_length = (uint32_t)(size - 2);
+        if (scan_compare(text, text_length, 0u, 1) || scan_compare(text, text_length, 1u, 1) ||
+            scan_compare(text, text_length, 2u + data[1], 1)) {
+            abort();
+        }
+#if USFM__USE_BLOCKS
+        if (classifier_mismatches(text, text_length) != 0) abort();
+#endif
+#if USFM__UTF8_SIMD
+        if (usfm__utf8_valid_simd(text, text_length) != usfm__utf8_valid(text, text_length)) abort();
+#endif
+    }
     memset(&config, 0, sizeof config);
     config.version = (uint8_t)(data[0] % 5);
     flags = (data[1] & 0x01) ? USFM_PARSE_COPY_INPUT : USFM_PARSE_DEFAULT;
@@ -97,6 +113,27 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     ast = USFM_Ast_ParseOpts((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
                              &alc, &err);
+    {
+        /* The fast path must not change anything, including under the
+         * same allocation-failure schedule. */
+        FuzzAlc ref_state;
+        USFM_Alc ref_alc = alc;
+        USFM_Err ref_err;
+        USFM_Ast *ref;
+        USFM__ParseHooks generic;
+        ref_state.live_bytes = 0;
+        ref_state.calls_left = (data[1] & 0x80) ? (uint32_t)(data[1] & 0x3F) : UINT32_MAX;
+        ref_alc.ctx = &ref_state;
+        memset(&generic, 0, sizeof generic);
+        ref = usfm__parse_opts_impl((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
+                                    &ref_alc, &ref_err, &generic);
+        if (check_same_parse(ast, &err, ref, &ref_err, "fuzz (fast path)") != 0) abort();
+        USFM_Ast_Free(ref);
+        if (ref_state.live_bytes != 0) abort();
+    }
+    /* The UTF-8 validation must match the always-per-run reference. */
+    if (check_utf8_reference((const char *)data + 2, (uint32_t)(size - 2), &config, flags,
+                             "fuzz") != 0) abort();
     if (ast == NULL) {
         if (state.live_bytes != 0) abort();
         if (err.code == USFM_ERR_UNSUPPORTED_ENCODING) {
@@ -118,6 +155,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         const USFM_Node *x, *y;
         const USFM_Diagnostic *dx, *dy;
         if (plain == NULL) abort();
+        /* And the fast path with validation off. */
+        if (check_fast_path((const char *)data + 2, (uint32_t)(size - 2), &config,
+                            flags | USFM_PARSE_NO_UTF8_CHECK, "fuzz, no UTF-8 check") != 0) abort();
         x = USFM_Ast_GetNodes(ast, &na);
         y = USFM_Ast_GetNodes(plain, &nb);
         if (na != nb) abort();

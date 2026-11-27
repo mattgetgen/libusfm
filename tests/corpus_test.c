@@ -1,16 +1,26 @@
-/* Parses every .usfm file in a directory and checks the totals that
- * ParatextData, usfmtc and usfm3 agree on for the WEB corpus. Also
- * writes per-book counts to build/corpus/libusfm-web.csv for diffing
- * against tests/corpus/paratextdata-web.csv. */
+/* Usage: corpus_test DIR [EXPECTED_FILE]
+ *
+ * Parses every .usfm file in DIR, checks the AST invariants, compares the
+ * block and byte-loop scanners, and prints an AST checksum. With
+ * EXPECTED_FILE (tests/corpus/expected.txt), the totals must match the
+ * line whose first field is DIR's basename:
+ *
+ *   NAME books chapters verses paragraphs chars notes milestones
+ *
+ * Also writes per-book counts to build/corpus/libusfm-NAME.csv; for
+ * WEB-STRONGS that file can be diffed against
+ * tests/corpus/paratextdata-web.csv. */
 #define _DEFAULT_SOURCE 1
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#define USFM_TEST_SCAN_REFERENCE
 #define USFM_IMPLEMENTATION
 #include "../usfm.h"
 #include "check.h"
+#include "scan_compare.h"
 
 /* TEXT nodes whose flag disagrees with their text, per flag. */
 typedef struct FlagMismatches {
@@ -62,6 +72,39 @@ static void count_ast(const USFM_Ast *ast, Counts *c)
     }
 }
 
+/* The last path component of dir, ignoring trailing slashes. */
+static void corpus_name(const char *dir, char *out, size_t size)
+{
+    size_t end = strlen(dir), start;
+    while (end > 1 && dir[end - 1] == '/') end--;
+    start = end;
+    while (start > 0 && dir[start - 1] != '/') start--;
+    if (end - start >= size) end = start + size - 1;
+    memcpy(out, dir + start, end - start);
+    out[end - start] = '\0';
+}
+
+/* Finds name's line in the expected file. Returns 1 if found, 0 if not,
+ * -1 if the file can't be read. */
+static int read_expected(const char *path, const char *name, Counts *c)
+{
+    char line[512], first[256];
+    int found = 0;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return -1;
+    while (!found && fgets(line, sizeof line, f) != NULL) {
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%255s %llu %llu %llu %llu %llu %llu %llu", first, &c->books,
+                   &c->chapters, &c->verses, &c->paragraphs, &c->chars, &c->notes,
+                   &c->milestones) == 8 &&
+            strcmp(first, name) == 0) {
+            found = 1;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 static char *read_file(const char *path, uint32_t *length)
 {
     FILE *f = fopen(path, "rb");
@@ -86,10 +129,70 @@ static int compare_names(const void *a, const void *b)
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
+/* FNV-1a over every field of the trees, tables and diagnostics (field
+ * by field, so struct padding never enters the hash). */
+static uint64_t fnv(uint64_t h, uint64_t v, uint32_t bytes)
+{
+    uint32_t k;
+    for (k = 0; k < bytes; k++) {
+        h ^= (v >> (8u * k)) & 0xFFu;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static uint64_t checksum_ast(uint64_t h, const USFM_Ast *ast)
+{
+    uint32_t count, i;
+    const USFM_Node *nodes = USFM_Ast_GetNodes(ast, &count);
+    const USFM_ChapterEntry *chapters;
+    const USFM_VerseEntry *verses;
+    const USFM_Diagnostic *diags;
+    for (i = 0; i < count; i++) {
+        h = fnv(h, nodes[i].parent, 4);
+        h = fnv(h, nodes[i].end, 4);
+        h = fnv(h, nodes[i].span.offset, 4);
+        h = fnv(h, nodes[i].span.length, 4);
+        h = fnv(h, nodes[i].marker, 2);
+        h = fnv(h, nodes[i].kind, 1);
+        h = fnv(h, nodes[i].level_flags, 1);
+    }
+    chapters = USFM_Ast_GetChapters(ast, &count);
+    for (i = 0; i < count; i++) {
+        h = fnv(h, chapters[i].number, 2);
+        h = fnv(h, chapters[i].node, 4);
+        h = fnv(h, chapters[i].end_node, 4);
+        h = fnv(h, chapters[i].first_verse, 4);
+        h = fnv(h, chapters[i].verse_count, 4);
+    }
+    verses = USFM_Ast_GetVerses(ast, &count);
+    for (i = 0; i < count; i++) {
+        h = fnv(h, verses[i].ref.chapter, 2);
+        h = fnv(h, verses[i].ref.verse_first, 2);
+        h = fnv(h, verses[i].ref.verse_last, 2);
+        h = fnv(h, verses[i].ref.segment_first, 1);
+        h = fnv(h, verses[i].ref.segment_last, 1);
+        h = fnv(h, verses[i].node, 4);
+        h = fnv(h, verses[i].end_node, 4);
+    }
+    diags = USFM_Ast_GetDiagnostics(ast, &count);
+    for (i = 0; i < count; i++) {
+        h = fnv(h, diags[i].span.offset, 4);
+        h = fnv(h, diags[i].span.length, 4);
+        h = fnv(h, diags[i].code, 2);
+        h = fnv(h, diags[i].marker, 2);
+    }
+    return h;
+}
+
+
 int main(int argc, char **argv)
 {
-    const char *dir = argc > 1 ? argv[1] : "build/corpus/WEB";
-    const Counts expected = { 83, 1402, 38058, 34753, 685197, 2218, 0 };
+    const char *dir = argc > 1 ? argv[1] : "build/corpus/WEB-STRONGS";
+    const char *expected_path = argc > 2 ? argv[2] : NULL;
+    char name[256], csv_path[512];
+    Counts expected;
+    int have_expected = 0;
     Counts total;
     FlagMismatches mismatches;
     unsigned long long diag_totals[USFM_DIAGNOSTIC_CODE_COUNT];
@@ -97,19 +200,42 @@ int main(int argc, char **argv)
     char *names[256];
     size_t name_count = 0, i;
     int failures = 0;
+    uint64_t checksum = 0xcbf29ce484222325ull;
+    unsigned long long scan_diffs = 0;
+    unsigned long long fast_diffs = 0;   /* fast path vs reference parser */
+    unsigned long long utf8_diffs = 0;   /* normal vs per-run UTF-8 checks */
+    unsigned long long block_diffs = 0;
     DIR *d = opendir(dir);
-    FILE *csv = fopen("build/corpus/libusfm-web.csv", "w");
+    FILE *csv;
     struct dirent *e;
+    corpus_name(dir, name, sizeof name);
+    snprintf(csv_path, sizeof csv_path, "build/corpus/libusfm-%s.csv", name);
+    csv = fopen(csv_path, "w");
+    memset(&expected, 0, sizeof expected);
+    if (expected_path != NULL) {
+        int r = read_expected(expected_path, name, &expected);
+        if (r < 0) {
+            fprintf(stderr, "cannot read %s\n", expected_path);
+            failures++;
+        } else if (r == 0) {
+            fprintf(stderr, "%s: no line for %s\n", expected_path, name);
+            failures++;
+        } else {
+            have_expected = 1;
+        }
+    }
     memset(&total, 0, sizeof total);
     memset(&mismatches, 0, sizeof mismatches);
     memset(diag_totals, 0, sizeof diag_totals);
     if (d == NULL) {
         fprintf(stderr, "cannot open %s\n", dir);
+        if (csv) fclose(csv);
         return 1;
     }
     while ((e = readdir(d)) != NULL && name_count < 256) {
         size_t len = strlen(e->d_name);
-        if (len > 5 && strcmp(e->d_name + len - 5, ".usfm") == 0) {
+        if ((len > 5 && strcmp(e->d_name + len - 5, ".usfm") == 0) ||
+            (len > 4 && strcmp(e->d_name + len - 4, ".SFM") == 0)) {
             names[name_count++] = strdup(e->d_name);
         }
     }
@@ -129,11 +255,26 @@ int main(int argc, char **argv)
             failures++;
             continue;
         }
+#if USFM__USE_BLOCKS
+        block_diffs += classifier_mismatches(data, length);
+#endif
+#if USFM__UTF8_SIMD
+        if (usfm__utf8_valid_simd(data, length) != usfm__utf8_valid(data, length)) {
+            fprintf(stderr, "%s: SIMD and scalar UTF-8 validators disagree\n", names[i]);
+            failures++;
+        }
+#endif
+        scan_diffs += (unsigned long long)(scan_compare(data, length, 0u, scan_diffs == 0) +
+                                           scan_compare(data, length, 1u, scan_diffs == 0) +
+                                           scan_compare(data, length, 7u + (uint32_t)i, scan_diffs == 0));
+        fast_diffs += (unsigned long long)check_fast_path(data, length, NULL, 0, names[i]);
+        utf8_diffs += (unsigned long long)check_utf8_reference(data, length, NULL, 0, names[i]);
         ast = USFM_Ast_Parse(data, length, NULL, &err);
         if (ast == NULL || err.code != USFM_OK) {
             fprintf(stderr, "%s: parse failed: %s\n", names[i], err.msg);
             failures++;
         } else {
+            checksum = checksum_ast(checksum, ast);
             count_flag_mismatches(ast, &mismatches);
             if (check_ast(ast) != 0) {
                 fprintf(stderr, "%s: invariants failed\n", names[i]);
@@ -180,7 +321,7 @@ int main(int argc, char **argv)
            total.books, total.chapters, total.verses, total.paragraphs,
            total.chars, total.notes, total.milestones);
     {
-        /* WEB is well-formed, so any diagnostic here deserves a look. */
+        /* The corpora are well-formed, so any diagnostic here deserves a look. */
         unsigned long long diag_sum = dropped_total;
         uint16_t k;
         for (k = 0; k < USFM_DIAGNOSTIC_CODE_COUNT; k++) diag_sum += diag_totals[k];
@@ -197,7 +338,17 @@ int main(int argc, char **argv)
     printf("Text flag mismatches: %llu loose-ws, %llu nbsp, %llu escape\n",
            mismatches.loose_ws, mismatches.nbsp, mismatches.escape);
     if (mismatches.loose_ws + mismatches.nbsp + mismatches.escape != 0) failures++;
-    if (memcmp(&total, &expected, sizeof total) != 0) {
+    printf("SIMD path: %s\n", USFM__SIMD_PATH);
+    printf("UTF-8 validator: %s\n", USFM__UTF8_SIMD_PATH);
+    printf("Scanner differences: %llu\n", scan_diffs);
+    printf("Classifier differences: %llu\n", block_diffs);
+    printf("Fast-path differences: %llu\n", fast_diffs);
+    printf("UTF-8 reference differences: %llu\n", utf8_diffs);
+    printf("AST checksum: %016llx\n", (unsigned long long)checksum);
+    if (scan_diffs != 0 || block_diffs != 0 || fast_diffs != 0 || utf8_diffs != 0) failures++;
+    if (expected_path == NULL) {
+        printf("Expected:   (no expected file, counts not compared)\n");
+    } else if (have_expected && memcmp(&total, &expected, sizeof total) != 0) {
         printf("Expected:   %llu books, %llu chapters, %llu verses, %llu paragraphs\n"
                "            %llu char styles, %llu notes, %llu milestones\n",
                expected.books, expected.chapters, expected.verses, expected.paragraphs,
