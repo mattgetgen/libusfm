@@ -2,6 +2,12 @@
 
 Date: 2026-11-19. Branch: `feat/simd` (0.1.1). No API change.
 
+**Status: measured, then reverted (2026-11-26).** Chunking alone, and
+chunking only from a size threshold, both missed the keep criteria; see
+[Threshold (2026-11-26)](#threshold-2026-11-26). `eba7f8b` reverts
+`d8bf02e` and `3b02f55`; `e597980` keeps the per-run reference harness
+and drops the chunk-size hook.
+
 ## Why
 
 Today `USFM_Ast_ParseOpts` validates the whole input in one pass before
@@ -312,3 +318,172 @@ Smaller chunks help ALB900a more, and cost the smaller books more
 - **AVX-512BW under Intel SDE** (`sde64 -spr`): `d8bf02e` passes, with
   0 differences and the same checksums; so does `3b02f55` (15,449,331
   checks; all 6 corpora with 0 differences and identical checksums).
+
+## Threshold (2026-11-26)
+
+The user's option B: inputs shorter than a threshold T keep the
+whole-input pass (valid: per-run checks off; invalid: every run checked),
+and only inputs of at least T are validated in chunks, with smaller chunks
+since only large inputs see them. A test-only hook forced chunking at any
+size so the boundary, corpus and fuzz comparisons still covered the
+chunked path. Criteria, against `8c1edef`: every normal corpus (WEB,
+WEB-STRONGS, GRC-BYZ, HBO-WLC, ARB-VD, CMN-CUV, 01DFM) within ±0.5% in
+cycles on both AVX2 and scalar; ALB900a at least 15% fewer AVX2 cycles;
+all tests pass.
+
+**Result: no variant met them; the chunking was reverted.**
+
+### Method
+
+As in [Measured](#measured): clang 14, `-std=c99 -O3 -march=native`,
+asserts on; AVX2 adds `-mno-avx512f`, scalar `-DUSFM_SIMD_NONE`;
+`tests/bench.c` (printing cycles to 3 decimals) against each variant's
+`usfm.h`; `taskset -c 2`, `-n 27` (ALB900a `-n 9`); 9 rounds, the order
+of the versions rotated each round; the median over rounds of each
+round's fastest pass. Before each block the package was at or below
+55 °C, before each round at or below 70 °C. Round starts were 47–64 °C
+in every block. **base2** is a byte-identical copy of the `8c1edef`
+binary, which shows the noise: up to ±0.5%.
+
+### Shapes tried
+
+All at the threshold check in `usfm__parse_opts_impl`; T only decides
+which inputs chunk (every normal-corpus book is under 1 MiB; the
+largest, in WEB-STRONGS, is 1015 KiB).
+
+- **A, one-compare gate:** `3b02f55`'s gate
+  (`end > utf8_valid_to`); below T, a valid input sets `utf8_valid_to`
+  to the input length, so the gate never fires; an invalid one sets
+  `utf8_invalid_seen`, so every run is checked. The dead `check_utf8`
+  field removed; **A-keep** keeps it (set, never read).
+- **V2:** `check_utf8 && end > utf8_valid_to` (the byte flag first).
+- **V3:** the gate exactly as in `8c1edef` (`if (p->check_utf8)`), the
+  range compare moved into `usfm__check_utf8`.
+- **V4:** V3 with the chunked start out of line (`usfm__utf8_start`):
+  the parse start is `8c1edef`'s two lines plus one branch.
+- **V4c:** V4 with the chunk functions `__attribute__((cold))`, to move
+  them out of the hot functions' address range.
+
+### AVX2, shape A, threshold × chunk
+
+Cycle change against `8c1edef` (first row: M cycles). Round starts
+55–64 °C (ALB900a 52–60 °C).
+
+| Variant | WEB | WEB-STRONGS | GRC-BYZ | HBO-WLC | ARB-VD | CMN-CUV | 01DFM | ALB900a |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8c1edef | 17.82 | 143.14 | 28.88 | 8.32 | 12.34 | 19.83 | 3.88 | 140.27 |
+| T 256 KiB, 8 KiB | +3.92% | +0.08% | −0.09% | +1.11% | +0.66% | +2.47% | +0.36% | −23.0% |
+| T 256 KiB, 16 KiB | +1.84% | −0.08% | −0.09% | +0.79% | +1.52% | +1.87% | +0.44% | −18.3% |
+| T 256 KiB, 64 KiB | +4.07% | +0.19% | −0.20% | +0.70% | +1.05% | +2.68% | +0.83% | −17.5% |
+| T 1 MiB, 8 KiB | +2.10% | +0.46% | −0.10% | +0.55% | +0.42% | +2.24% | +0.39% | −22.7% |
+| T 1 MiB, 16 KiB | +1.89% | +0.21% | −0.09% | +1.06% | +0.60% | +2.19% | +0.31% | −18.2% |
+| T 1 MiB, 64 KiB | +1.62% | +0.49% | −0.21% | +0.96% | +1.48% | +1.83% | +0.26% | −17.5% |
+| T 2 MiB, 8 KiB | +2.03% | +0.32% | −0.22% | +0.95% | +0.63% | +2.70% | +0.34% | −22.0% |
+| T 2 MiB, 16 KiB | +3.81% | +0.33% | −0.09% | +0.91% | +0.57% | +2.41% | +0.21% | −17.8% |
+| T 2 MiB, 64 KiB | +2.16% | +0.35% | −0.05% | +1.32% | +0.15% | +2.02% | +0.28% | −17.1% |
+| A-keep, T 1 MiB, 8 KiB | +3.37% | +0.09% | −0.32% | +1.00% | +1.48% | +0.75% | +0.59% | −22.6% |
+| V2, T 1 MiB, 8 KiB | +0.69% | +0.86% | +0.72% | +0.32% | +1.19% | +1.30% | +0.15% | −22.8% |
+| `3b02f55` (64 KiB, no T) | +0.11% | −0.26% | −0.62% | +0.18% | +1.25% | +1.04% | +1.06% | −17.7% |
+
+### Scalar, shape A, threshold × chunk
+
+Round starts 55–56 °C (ALB900a 53–57 °C).
+
+| Variant | WEB | WEB-STRONGS | GRC-BYZ | HBO-WLC | ARB-VD | CMN-CUV | 01DFM | ALB900a |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8c1edef | 28.79 | 186.50 | 42.73 | 24.98 | 35.11 | 32.38 | 4.71 | 608.84 |
+| base2 | −0.04% | +0.04% | −0.13% | −0.56% | +0.02% | +0.14% | +0.00% | +0.1% |
+| T 256 KiB, 8 KiB | +2.42% | −0.22% | −0.37% | +0.39% | +1.12% | +0.98% | +3.50% | −4.3% |
+| T 256 KiB, 16 KiB | +2.23% | −0.32% | −0.23% | +0.07% | +0.99% | +0.94% | +3.65% | −2.2% |
+| T 256 KiB, 64 KiB | +2.19% | −0.32% | −0.44% | +0.39% | +0.93% | +1.09% | +3.27% | −1.0% |
+| T 1 MiB, 8 KiB | +2.19% | −0.44% | −0.62% | +0.23% | +0.95% | +0.95% | +2.72% | −4.2% |
+| T 1 MiB, 16 KiB | +2.33% | −0.43% | −0.56% | +0.14% | +0.93% | +0.84% | +3.44% | −2.2% |
+| T 1 MiB, 64 KiB | +2.31% | −0.28% | −0.57% | +0.31% | +0.89% | +1.00% | +3.22% | −1.0% |
+| T 2 MiB, 8 KiB | +2.31% | −0.32% | −0.51% | +0.13% | +0.93% | +1.07% | +3.29% | −4.0% |
+| T 2 MiB, 16 KiB | +2.29% | −0.38% | −0.56% | +0.18% | +0.90% | +1.00% | +3.44% | −2.1% |
+| T 2 MiB, 64 KiB | +2.11% | −0.46% | −0.40% | +0.33% | +0.98% | +1.03% | +3.01% | −1.0% |
+
+### The other shapes, T = 1 MiB
+
+AVX2 (each block against its own `8c1edef`; round starts 48–61 °C):
+
+| Variant | WEB | WEB-STRONGS | GRC-BYZ | HBO-WLC | ARB-VD | CMN-CUV | 01DFM | ALB900a |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| V3, 8 KiB | +1.40% | +0.55% | +0.62% | +0.88% | +1.05% | +0.81% | +0.65% | −22.8% |
+| V3, 16 KiB | +1.25% | +0.48% | +0.44% | +0.95% | +0.57% | +1.91% | +1.01% | −18.2% |
+| V4, 8 KiB | +2.87% | +0.84% | +0.44% | +1.62% | +2.58% | +2.60% | +2.71% | −22.6% |
+| V4c, 8 KiB | +1.31% | +0.44% | +0.06% | −0.28% | +0.94% | −0.19% | −0.08% | −23.0% |
+| V4c, 8 KiB (repeat) | +1.34% | +0.45% | +0.26% | −0.02% | +0.49% | +0.60% | −0.36% | −23.4% |
+| V4c, 16 KiB (repeat) | +1.09% | +0.43% | +0.41% | −0.07% | +0.87% | +0.83% | +0.21% | −18.9% |
+| base2 (same block) | +0.45% | +0.01% | +0.13% | −0.04% | +0.49% | +0.19% | +0.10% | +0.1% |
+
+Scalar (round starts 47–54 °C, ALB900a 51–59 °C):
+
+| Variant | WEB | WEB-STRONGS | GRC-BYZ | HBO-WLC | ARB-VD | CMN-CUV | 01DFM | ALB900a |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8c1edef | 28.86 | 187.08 | 42.60 | 24.86 | 35.19 | 32.41 | 4.71 | 608.28 |
+| base2 | −0.17% | +0.13% | +0.19% | −0.41% | −0.05% | +0.02% | −0.13% | +0.0% |
+| A, 8 KiB | +2.24% | −0.54% | −0.16% | +0.41% | +1.54% | +0.98% | +2.89% | −4.1% |
+| A-keep, 8 KiB | +0.96% | −0.18% | +0.15% | −0.14% | +0.43% | +0.70% | +1.10% | −4.2% |
+| V3, 8 KiB | +2.08% | +0.42% | +0.82% | +0.07% | +0.73% | +1.77% | +1.63% | −4.1% |
+| V4c, 8 KiB | +3.39% | +0.27% | +0.31% | +0.78% | +1.41% | +2.92% | +1.95% | −4.0% |
+
+### Findings
+
+- **ALB900a passes easily on AVX2** in every shape: −22% to −23% at
+  8 KiB chunks, −18% at 16 KiB, −17% at 64 KiB. Scalar gains only 1–4%
+  (the scalar DFA, not memory, is the cost there).
+- **The normal corpora fail on every shape.** Shape A is +1.6% to
+  +4.1% on AVX2 WEB and +2.1% to +3.7% on scalar WEB and 01DFM, at every T and
+  chunk size. The best AVX2 shape, V4c at 8 KiB, is within 0.5% on six
+  of seven corpora but +1.3% on WEB in both blocks; the same code on
+  scalar is +3.4% on WEB and +2.9% on CMN-CUV. No variant is within
+  0.5% everywhere on both builds.
+- **It is code layout, not work.** The extra instructions are small:
+  shape A's gate (add and 32-bit compare instead of a byte test) adds
+  0.3–0.6%; V3, V4 and V4c run 0.1–0.2% *fewer* instructions than
+  `8c1edef` on every normal corpus and are still slower. `perf stat` on
+  WEB and CMN-CUV, V3 against `8c1edef`: `frontend_retired.dsb_miss`
+  1.2M → 1.4–1.5M, `idq.mite_uops` 20–25M → 23–31M; V4c on WEB: DSB
+  misses equal, branch misses +6%. Every hot function after
+  `USFM_Ast_ParseOpts` moves, and their alignment decides 1–3%. Variants
+  that differ only in the T constant differ by up to 1.9% on WEB.
+- **T = 256 KiB costs the mid-size books** with the V3/V4 gate (one call
+  per token while chunking): WEB-STRONGS +8.9%, GRC-BYZ +7.6%. Shape A
+  avoids that but still fails WEB and CMN-CUV.
+- **Removing the dead `check_utf8` field** (shape A against A-keep, T
+  1 MiB, 8 KiB): AVX2 CMN-CUV +2.24% vs +0.75%, WEB +2.10% vs +3.37%,
+  ARB-VD +0.42% vs +1.48%; scalar WEB +2.24% vs +0.96%, 01DFM +2.89% vs
+  +1.10%. Mixed, ±1.5%: layout again, with no consistent direction.
+- **Correctness** (shape A, T 1 MiB, 8 KiB, before the revert): AVX2
+  and scalar unit tests passed (15,449,331 checks), comparing a normal
+  parse and chunks forced at 1, 2, 3, 4, 7, 64, 8 KiB and 64 KiB with
+  the reference.
+
+### What was reverted, what was kept
+
+- **Reverted** (`eba7f8b`): `d8bf02e` and `3b02f55`, with the white-box
+  chunk-cut test. `USFM_Ast_ParseOpts` is again `8c1edef`'s: the AVX2 and
+  scalar bench builds are byte-identical to `8c1edef`'s with `-DNDEBUG`,
+  and with asserts their `objdump -d` is identical (only the `__FILE__`
+  strings differ).
+- **Kept** (`e597980`): the always-per-run reference mode
+  (`USFM__ParseHooks.utf8_reference`) and its comparison with a normal
+  parse, now `check_utf8_reference`, for every unit-test tree, every
+  corpus book (`UTF-8 reference differences`) and every fuzz input. The
+  boundary cases moved to `tests/test_utf8_reference.c`; their offsets
+  61–68 straddle the SIMD validators' 32- and 64-byte steps.
+- **Dropped:** the chunk-size hook and its loops; byte 0 of a fuzz input
+  again picks only the version.
+- **Checks after the revert:** `./build.sh test`, `test-neon`,
+  `test-wasm` and `release` exit 0 with no warnings; every path and
+  corpus has 0 scanner, classifier, fast-path and UTF-8 reference
+  differences and the usual checksums. Under Intel SDE, `test-avx512`
+  passes (15,448,764 checks). Mutants: a whole-input pass that turns the
+  per-run checks off even for invalid input fails 1,196 checks; a
+  reference that checks nothing fails 591. Fuzzing 10 minutes
+  (`setarch -R taskset -c 0-3`, `-fork=4`, the dictionary, a scratch
+  corpus): 704,178 runs, 0 crashes, timeouts or OOMs.
+- If large inputs matter later, the gain is real (about 23% on AVX2) but
+  needs a change that leaves the hot functions' layout alone, or a
+  layout-stable build (e.g. aligned functions) to judge it by.
