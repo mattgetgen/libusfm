@@ -91,10 +91,9 @@ extern "C" {
  *   validation off. Input starting with a UTF-16 or UTF-32 byte-order
  *   mark returns NULL with USFM_ERR_UNSUPPORTED_ENCODING, even with
  *   validation off. UTF-16 or UTF-32 without a byte-order mark is not
- *   detected. The input is validated in 64 KiB chunks just ahead of the
- *   parser (SIMD builds: see SIMD); runs are re-checked one by one only
- *   after a chunk is found invalid. The results are the same on every
- *   build.
+ *   detected. SIMD builds (see SIMD) validate the whole input in one
+ *   pass and re-check runs only if it is invalid; the results are the
+ *   same on every build.
  *
  * Failure semantics
  *   NULL                          -> failed, nothing to free; err.code
@@ -163,15 +162,14 @@ extern "C" {
  *
  * UTF-8 validation uses a Keiser-Lemire validator on the same targets:
  * AVX-512BW (64 bytes per step), AVX2 (32), SSSE3 (16), NEON and wasm
- * simd128 (16). USFM_Ast_ParseOpts validates the input in chunks just
- * ahead of the parser; only after an invalid chunk are the runs checked
- * one by one, so diagnostics and flags are identical everywhere. SSE2
- * without SSSE3 and scalar builds (USFM_SIMD_NONE, targets with no SIMD)
- * validate the chunks with a scalar DFA. A plain x86-64 build gets SSE2
- * for the scanner but no SIMD UTF-8 validation; enable SSSE3 (-mssse3,
- * -march=x86-64-v2, -march=native) for it. MSVC has no SSSE3-only switch:
- * MSVC x64 builds use the scalar DFA unless built with /arch:AVX2 (AVX2
- * validator) or /arch:AVX512 (AVX-512BW validator). */
+ * simd128 (16). USFM_Ast_ParseOpts validates the whole input once; only if
+ * it is invalid are the runs checked one by one, so diagnostics and
+ * flags are identical everywhere. SSE2 without SSSE3 and scalar builds
+ * (USFM_SIMD_NONE, targets with no SIMD) validate per run. A plain
+ * x86-64 build gets SSE2 for the scanner but no SIMD UTF-8 validation;
+ * enable SSSE3 (-mssse3, -march=x86-64-v2, -march=native) for it. MSVC
+ * has no SSSE3-only switch: MSVC x64 builds validate per run unless built
+ * with /arch:AVX2 (AVX2 validator) or /arch:AVX512 (AVX-512BW validator). */
 
 #define USFM_NIL 0xFFFFFFFFu            /* "no node" index */
 
@@ -2294,17 +2292,11 @@ typedef struct USFM_Parser {
     uint8_t          version_auto;      /* config said AUTO */
     uint8_t          chapter_open;      /* a \c is open: set by \c, cleared
                                            by \id and \periph */
-    uint8_t          check_utf8;        /* validation is on and the input
-                                           not yet covered (cleared once
-                                           utf8_valid_to reaches the end) */
+    uint8_t          check_utf8;        /* validate TEXT, ARGUMENT and
+                                           ATTRIBUTES runs */
     uint8_t          fast;              /* use the character-span fast path
                                            (0 only in tests, as the reference) */
-    uint8_t          utf8_invalid_seen; /* a validation chunk was invalid:
-                                           runs past utf8_valid_to are
-                                           checked one by one */
-    uint32_t         utf8_valid_to;     /* input[0, utf8_valid_to) is known
-                                           valid UTF-8; 0xFFFFFFFF with
-                                           validation off */
+    uint8_t          reserved[1];
 #if defined(USFM_TEST_SCAN_REFERENCE)
     uint8_t          utf8_reference;    /* test-only hooks: see */
     uint32_t         utf8_chunk;        /* USFM__ParseHooks */
@@ -2530,9 +2522,8 @@ static uint32_t usfm__utf8_check(const char *s, uint32_t n, uint32_t *bad)
     USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF
 #define USFM__U8_FF16 USFM__U8_FF13, USFM__U8_FF, USFM__U8_FF, USFM__U8_FF
 
-/* Chunk validators: usfm__utf8_valid_simd on SIMD builds,
- * usfm__utf8_valid_input otherwise. Both take any start and length, and
- * treat s[n] as the end of the input. */
+/* Whole-input validation is SIMD-only: on scalar builds a separate DFA
+ * pass is slower than checking runs while parsing (see the spec). */
 #if !defined(USFM_SIMD_NONE) && defined(__AVX512BW__)
 #  include <immintrin.h>
 #  define USFM__UTF8_SIMD 1
@@ -2816,8 +2807,8 @@ static int usfm__utf8_valid_simd(const char *s, uint32_t n)
 #else
 #  define USFM__UTF8_SIMD 0
 #  define USFM__UTF8_SIMD_PATH "none"
-/* usfm__utf8_valid for a validation chunk (scalar builds): the ASCII
- * skip tests 32 bytes at a time. In CJK or Arabic text the
+/* usfm__utf8_valid for a whole input (the scalar build's one pass):
+ * the ASCII skip tests 32 bytes at a time. In CJK or Arabic text the
  * short ASCII markup between runs then rarely fills a whole step, so the
  * test stays predictable; mostly-ASCII text still skips. */
 static int usfm__utf8_valid_input(const char *s, uint32_t n)
@@ -2854,120 +2845,17 @@ static void usfm__diag(USFM_Parser *p, uint16_t code, USFM_Span span, USFM_Marke
 #  define USFM__NOINLINE
 #endif
 
-/* Default UTF-8 validation chunk: big enough to amortize the call, small
- * enough that the parser reads a chunk while it is still in cache. */
-#define USFM__UTF8_CHUNK (64u * 1024u)
-
-#if defined(USFM_TEST_SCAN_REFERENCE)
-#define USFM__UTF8_CHUNK_SIZE(p) ((p)->utf8_chunk != 0 ? (p)->utf8_chunk : USFM__UTF8_CHUNK)
-#else
-#define USFM__UTF8_CHUNK_SIZE(p) USFM__UTF8_CHUNK
-#endif
-
-/* Is the chunk s[0, n) valid UTF-8, with s[n] taken as the end of the
- * input? */
-static int usfm__utf8_valid_chunk(const char *s, uint32_t n)
-{
-#if USFM__UTF8_SIMD
-    return usfm__utf8_valid_simd(s, n);
-#else
-    return usfm__utf8_valid_input(s, n);
-#endif
-}
-
-static int usfm__utf8_is_cont(uint8_t b) { return (b & 0xC0u) == 0x80u; }
-
-/* End of the next validation chunk, which starts at `from` < n: about
- * `chunk` bytes on, moved to a character boundary (a byte that is not a
- * continuation byte, or n) so that the chunks are all valid exactly when
- * the input is. It moves back over at most 3 continuation bytes; if that
- * would reach `from` (a chunk shorter than one character), forward over
- * at most 3. If neither finds a boundary, there are 4 or more
- * continuation bytes in a row, so the input is invalid, and the cut stays:
- * the next chunk starts with a stray continuation byte and fails. */
-static uint32_t usfm__utf8_cut(const uint8_t *u, uint32_t n, uint32_t from, uint32_t chunk)
-{
-    uint32_t cut = n - from > chunk ? from + chunk : n;
-    uint32_t k;
-    USFM_ASSERT(from < n && chunk >= 1u && cut > from);
-    if (cut == n || !usfm__utf8_is_cont(u[cut])) return cut;
-    for (k = 1; k <= 3u; k++) {         /* bounded: 3 */
-        if (cut - k <= from) break;
-        if (!usfm__utf8_is_cont(u[cut - k])) return cut - k;
-    }
-    if (k <= 3u) {                      /* reached `from`: go forward */
-        for (k = 1; k <= 3u; k++) {     /* bounded: 3 */
-            if (cut + k >= n) return n;
-            if (!usfm__utf8_is_cont(u[cut + k])) return cut + k;
-        }
-    }
-    return cut;
-}
-
-/* Validates chunks ahead until input[0, end) is covered or a chunk is
- * invalid. Returns 1 if input[0, end) is now known valid. Once the
- * whole input is covered (utf8_valid_to == n), no token passes
- * USFM__UTF8_GATE again: the rest of the parse runs as for an input
- * validated up front. */
-static int usfm__utf8_cover(USFM_Parser *p, uint32_t end)
-{
-    const uint8_t *u = (const uint8_t *)p->ast->input;
-    uint32_t n = p->ast->input_length;
-    uint32_t chunk = USFM__UTF8_CHUNK_SIZE(p);
-    uint32_t guard;
-    USFM_ASSERT(end <= n);
-    /* bounded: each pass moves utf8_valid_to forward by at least 1 byte
-     * or sets utf8_invalid_seen, so at most n + 1 passes. */
-    for (guard = 0; guard <= n; guard++) {
-        uint32_t from = p->utf8_valid_to, cut;
-        int valid;
-        if (p->utf8_invalid_seen || from >= end) break;
-        cut = usfm__utf8_cut(u, n, from, chunk);
-        USFM_ASSERT(cut > from && cut <= n);
-        valid = usfm__utf8_valid_chunk((const char *)u + from, cut - from);
-        if (!valid) {
-            p->utf8_invalid_seen = 1;
-            break;
-        }
-        p->utf8_valid_to = cut;
-    }
-    USFM_ASSERT(p->utf8_invalid_seen || p->utf8_valid_to >= end);
-    if (p->utf8_valid_to == n) p->check_utf8 = 0;
-    return end <= p->utf8_valid_to;
-}
-
-/* Branch hint for a rare condition. */
-#if defined(__GNUC__) || defined(__clang__)
-#  define USFM__UNLIKELY(x) __builtin_expect((x), 0)
-#else
-#  define USFM__UNLIKELY(x) (x)
-#endif
-
-/* Does a token just scanned need usfm__check_utf8? Only if it ends past
- * the prefix known valid: one compare in the token loop, and never true
- * with validation off (utf8_valid_to is 0xFFFFFFFF) or once the whole
- * input is covered. In reference mode (tests) utf8_valid_to stays 0, so
- * every non-empty token goes to usfm__check_utf8. The hint matters: it
- * keeps the call off the fall-through path (measured: WEB-STRONGS 0.8%
- * fewer cycles). */
-#define USFM__UTF8_GATE(p, t) \
-    USFM__UNLIKELY((t)->tok.span.offset + (t)->tok.span.length > (p)->utf8_valid_to)
-
-/* Validates a TEXT, ARGUMENT or ATTRIBUTES token just scanned whose end
- * is past utf8_valid_to (see USFM__UTF8_GATE): first validates chunks
- * ahead; if that cannot cover the token (a chunk was invalid), checks
- * the token on its own. On invalid bytes, sets USFM_TF_INVALID_UTF8 on
- * the token and reports one diagnostic for the run, spanning its first
- * invalid sequence. Not inlined on purpose: measured, inlining it slowed
- * tag-dense parsing ~5% even with validation off. */
+/* Validates a TEXT, ARGUMENT or ATTRIBUTES token just scanned: on
+ * invalid bytes, sets USFM_TF_INVALID_UTF8 on the token and reports one
+ * diagnostic for the run, spanning its first invalid sequence. Not inlined
+ * on purpose: measured, inlining it slowed tag-dense parsing ~5% even with
+ * validation off. */
 USFM__NOINLINE static void usfm__check_utf8(USFM_Parser *p, USFM_ScanToken *t)
 {
     uint32_t at, bad;
     USFM_Marker context = USFM_M_NONE;
     if (t->tok.kind != USFM_TOK_TEXT && t->tok.kind != USFM_TOK_ARGUMENT &&
         t->tok.kind != USFM_TOK_ATTRIBUTES) return;
-    if (!USFM__UTF8_REFERENCE(p) &&
-        usfm__utf8_cover(p, t->tok.span.offset + t->tok.span.length)) return;
     if (usfm__utf8_valid(p->ast->input + t->tok.span.offset, t->tok.span.length)) return;
     at = usfm__utf8_check(p->ast->input + t->tok.span.offset, t->tok.span.length, &bad);
     USFM_ASSERT(at < t->tok.span.length && bad >= 1 && bad <= 3);
@@ -2988,7 +2876,7 @@ static int usfm__next(USFM_Parser *p, USFM_ScanToken *t)
     p->scan.pipe_is_attr = (uint8_t)(top == USFM_AST_CHAR || top == USFM_AST_MILESTONE ||
                                      top == USFM_AST_FIGURE || top == USFM_AST_PERIPHERAL);
     if (!usfm__scan_next(&p->scan, t)) return 0;
-    if (USFM__UTF8_GATE(p, t)) usfm__check_utf8(p, t);
+    if (p->check_utf8) usfm__check_utf8(p, t);
     return 1;
 }
 
@@ -3789,7 +3677,7 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
         s->pipe_is_attr = (uint8_t)(top == USFM_AST_CHAR);
         if (in[pos] == '|' && s->pipe_is_attr) {
             usfm__scan_attributes(s, &t, USFM__USE_BLOCKS);
-            if (USFM__UTF8_GATE(p, &t)) usfm__check_utf8(p, &t);
+            if (p->check_utf8) usfm__check_utf8(p, &t);
             usfm__append(p, USFM_AST_ATTRIBUTES, t.tok.span, USFM_M_NONE,
                          (uint8_t)(t.tok.level_flags & USFM_TF_INVALID_UTF8));
             USFM_ASSERT(s->position > pos);
@@ -3797,7 +3685,7 @@ static void usfm__char_body_fast(USFM_Parser *p, uint32_t open_offset, uint32_t 
         }
         if (in[pos] == '/' && pos + 1 < len && in[pos + 1] == '/') return;
         usfm__scan_text(s, &t, USFM__USE_BLOCKS);
-        if (USFM__UTF8_GATE(p, &t)) usfm__check_utf8(p, &t);
+        if (p->check_utf8) usfm__check_utf8(p, &t);
         /* usfm__on_text for a PARA, CELL, NOTE or CHAR top frame: no blank
          * skip, and no implied paragraph. */
         node = usfm__append(p, USFM_AST_TEXT, t.tok.span, USFM_M_NONE,
@@ -4179,26 +4067,29 @@ static USFM_Ast *usfm__parse_opts_impl(const char *input, uint32_t input_length,
     p.ast = ast;
     p.version_auto = version == USFM_VERSION_AUTO;
     p.fast = (uint8_t)(hooks == NULL || hooks->fast != 0);
-    /* UTF-8: validated in chunks just ahead of the parser (usfm__check_utf8
-     * via USFM__UTF8_GATE), so the validator and the parser read each
-     * chunk while it is in cache. A valid prefix means every run in it is
-     * valid: bytes outside runs are ASCII (or the UTF-8 BOM) and no
-     * sequence contains an ASCII byte. After an invalid chunk, runs are
-     * checked one by one, so diagnostics match on every build. */
     p.check_utf8 = (flags & USFM_PARSE_NO_UTF8_CHECK) == 0;
-    p.utf8_valid_to = p.check_utf8 ? 0u : 0xFFFFFFFFu;
-    p.utf8_invalid_seen = 0;
 #if defined(USFM_TEST_SCAN_REFERENCE)
     if (hooks != NULL) {
         p.utf8_reference = hooks->utf8_reference;
         p.utf8_chunk = hooks->utf8_chunk;
     }
 #endif
-    /* The first chunk now, as the whole-input pass did: an input of one
-     * chunk (most books) then parses with validation already done. */
-    if (p.utf8_valid_to == 0 && input_length > 0 && !USFM__UTF8_REFERENCE(&p)) {
-        (void)usfm__utf8_cover(&p, 1u);
+#if USFM__UTF8_SIMD
+    /* Valid as a whole means every run is valid: bytes outside runs are
+     * ASCII (or the UTF-8 BOM) and no sequence contains an ASCII byte. So
+     * one SIMD pass replaces the per-run checks; on invalid input every
+     * run is still checked, and diagnostics match the scalar build. */
+    if (p.check_utf8 && !USFM__UTF8_REFERENCE(&p) && usfm__utf8_valid_simd(text, input_length)) {
+        p.check_utf8 = 0;
     }
+#else
+    /* The same whole-input pass with the scalar validator: one long loop
+     * instead of one short loop per run, whose trip counts (run length,
+     * 8-byte words, tail bytes) mispredict. */
+    if (p.check_utf8 && !USFM__UTF8_REFERENCE(&p) && usfm__utf8_valid_input(text, input_length)) {
+        p.check_utf8 = 0;
+    }
+#endif
     p.version = p.version_auto ? (uint8_t)USFM_VERSION_3_1 : version;
     p.text_node = USFM_NIL;
     usfm__scan_init(&p.scan, text, input_length);
